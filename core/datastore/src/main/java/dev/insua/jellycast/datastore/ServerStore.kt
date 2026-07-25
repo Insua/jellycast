@@ -60,6 +60,20 @@ data class ServerListSurrogate(val servers: List<ServerSurrogate>) {
     }
 }
 
+/**
+ * 更新已有服务器时**就地替换**,新服务器才追加到末尾。
+ *
+ * 复审的 Minor 项:原实现是 `filterNot { it.id == server.id } + server`,于是编辑一台已有服务器
+ * (改名、确认证书指纹)会把它挪到列表末尾——列表顺序是用户的心理地图,不该因为一次编辑而抖动。
+ *
+ * 纯函数,离线可单测(DataStore 本身需要 Android Context)。
+ */
+internal fun upsertServer(list: List<Server>, server: Server): List<Server> {
+    val index = list.indexOfFirst { it.id == server.id }
+    if (index < 0) return list + server
+    return list.toMutableList().also { it[index] = server }
+}
+
 private val Context.serverDataStore by preferencesDataStore("servers")
 private val KEY_SERVERS = stringPreferencesKey("servers_json")
 private val KEY_ACTIVE = stringPreferencesKey("active_server_id")
@@ -79,9 +93,7 @@ class ServerStore(private val context: Context) {
 
     val activeServerId: Flow<String?> = context.serverDataStore.data.map { it[KEY_ACTIVE] }
 
-    suspend fun upsert(server: Server) = write { list ->
-        list.filterNot { it.id == server.id } + server
-    }
+    suspend fun upsert(server: Server) = write { list -> upsertServer(list, server) }
 
     suspend fun delete(id: String) = write { list -> list.filterNot { it.id == id } }
 

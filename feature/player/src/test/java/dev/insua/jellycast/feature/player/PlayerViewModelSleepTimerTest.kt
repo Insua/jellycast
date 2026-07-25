@@ -55,6 +55,8 @@ class PlayerViewModelSleepTimerTest {
         every { store.rewindSeconds } returns flowOf(15)
         every { store.forwardSeconds } returns flowOf(30)
         every { store.preferredSubtitleLanguage } returns flowOf(null)
+        // 复审 Minor 6 之后 PlayerViewModel 会订阅歌词开关(此前这个偏好没有任何读取方)。
+        every { store.lyricsEnabled } returns flowOf(true)
         return store
     }
 

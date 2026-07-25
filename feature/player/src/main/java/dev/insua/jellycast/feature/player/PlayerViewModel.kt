@@ -122,6 +122,8 @@ data class PlayerUiState(
     val selectedSubtitleTrackIndex: Int? = null,
     val audioTracks: List<AudioTrack> = emptyList(),
     val sleepTimerOption: SleepTimerOption? = null,
+    /** 设置里的「歌词式字幕」开关(复审 Minor 6:此前这个开关是死的,播放页从不查它)。 */
+    val lyricsEnabled: Boolean = true,
 )
 
 /**
@@ -241,6 +243,11 @@ class PlayerViewModel @Inject constructor(
         }
         viewModelScope.launch {
             preferencesStore.forwardSeconds.collectLatest { seconds -> _uiState.update { it.copy(forwardSeconds = seconds) } }
+        }
+        // 复审 Minor 6:歌词开关。字幕照常拉取解析(它已经是"任何失败都降级为空 timeline"的,
+        // 关掉开关只影响渲染),这样用户在播放中打开开关就能立刻看到歌词,不用退出重进。
+        viewModelScope.launch {
+            preferencesStore.lyricsEnabled.collectLatest { enabled -> _uiState.update { it.copy(lyricsEnabled = enabled) } }
         }
     }
 

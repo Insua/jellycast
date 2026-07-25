@@ -49,9 +49,21 @@ object LyricsViewTestTags {
  * [PlayerScreen] 用它决定"加载中"要不要直接显示 spinner(不复用 [LyricsView] 内部的占位态,
  * 语义不同:加载中 vs. 确认没有可用字幕);[LyricsView] 内部只关心 PLACEHOLDER/CONTENT 这一半。
  */
-enum class LyricsDisplayState { LOADING, PLACEHOLDER, CONTENT }
+enum class LyricsDisplayState { DISABLED, LOADING, PLACEHOLDER, CONTENT }
 
-fun lyricsDisplayState(isLoading: Boolean, timeline: SubtitleTimeline): LyricsDisplayState = when {
+/**
+ * [lyricsEnabled] 是设置里的「歌词式字幕」开关(复审 Minor 6:它此前只被 `SettingsViewModel` 读来
+ * 显示开关状态,`PlayerScreen`/[LyricsView] 从不查它——关掉照样滚字幕)。
+ *
+ * 关掉时优先级最高:既不显示歌词,也不显示"此内容无文本字幕"占位(那是"片源没有字幕"的意思,
+ * 和"用户自己关掉了"是两件事,混在一起会让用户以为片源有问题),也不显示加载转圈。
+ */
+fun lyricsDisplayState(
+    isLoading: Boolean,
+    timeline: SubtitleTimeline,
+    lyricsEnabled: Boolean = true,
+): LyricsDisplayState = when {
+    !lyricsEnabled -> LyricsDisplayState.DISABLED
     isLoading -> LyricsDisplayState.LOADING
     timeline.lines.isEmpty() -> LyricsDisplayState.PLACEHOLDER
     else -> LyricsDisplayState.CONTENT

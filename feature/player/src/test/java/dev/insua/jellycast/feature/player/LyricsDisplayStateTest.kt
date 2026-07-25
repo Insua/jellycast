@@ -27,4 +27,34 @@ class LyricsDisplayStateTest {
     @Test fun `非加载态且 timeline 有内容显示歌词内容`() {
         assertEquals(LyricsDisplayState.CONTENT, lyricsDisplayState(isLoading = false, timeline = nonEmptyTimeline))
     }
+
+    // ---- 复审 Minor 6:设置里的「歌词式字幕」开关此前只被 SettingsViewModel 读来显示,
+    // PlayerScreen/LyricsView 从不查它——关了照样滚字幕。现在它是显示状态的一部分。----
+
+    @Test fun `关掉歌词开关时不显示歌词,也不显示"此内容无文本字幕"的占位`() {
+        assertEquals(
+            LyricsDisplayState.DISABLED,
+            lyricsDisplayState(isLoading = false, timeline = nonEmptyTimeline, lyricsEnabled = false),
+        )
+    }
+
+    /** 用户主动关掉 ≠ 这一集没有字幕:两种情况的文案不能混,否则用户会以为是片源没字幕。 */
+    @Test fun `关掉歌词开关且没有字幕时仍报 DISABLED,不报 PLACEHOLDER`() {
+        assertEquals(
+            LyricsDisplayState.DISABLED,
+            lyricsDisplayState(isLoading = false, timeline = emptyTimeline, lyricsEnabled = false),
+        )
+    }
+
+    /** 关掉开关时连"加载中"的转圈都不该出现——这一格根本不显示歌词。 */
+    @Test fun `关掉歌词开关时加载态也不显示 loading`() {
+        assertEquals(
+            LyricsDisplayState.DISABLED,
+            lyricsDisplayState(isLoading = true, timeline = emptyTimeline, lyricsEnabled = false),
+        )
+    }
+
+    @Test fun `开关默认是开的,已有调用点行为不变`() {
+        assertEquals(LyricsDisplayState.CONTENT, lyricsDisplayState(isLoading = false, timeline = nonEmptyTimeline))
+    }
 }
