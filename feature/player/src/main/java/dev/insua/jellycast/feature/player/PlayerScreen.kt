@@ -149,6 +149,8 @@ fun PlayerScreen(
             onCycleSpeed = viewModel::onCycleSpeed,
             onSetSleepTimer = viewModel::onSetSleepTimer,
             onCycleSubtitleTrack = viewModel::onCycleSubtitleTrack,
+            onCycleAudioTrack = viewModel::onCycleAudioTrack,
+            onSkipToNext = viewModel::onSkipToNext,
         )
         Spacer(Modifier.height(12.dp))
     }
@@ -292,6 +294,8 @@ private fun ToolbarRow(
     onCycleSpeed: () -> Unit,
     onSetSleepTimer: (SleepTimerOption?) -> Unit,
     onCycleSubtitleTrack: () -> Unit,
+    onCycleAudioTrack: () -> Unit,
+    onSkipToNext: () -> Unit,
 ) {
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
         ToolbarAction(icon = Icons.Filled.Speed, label = "${playbackSpeed}x", onClick = onCycleSpeed)
@@ -300,12 +304,9 @@ private fun ToolbarRow(
             label = sleepTimerLabel(sleepTimerOption),
             onClick = { onSetSleepTimer(nextSleepTimerOption(sleepTimerOption)) },
         )
-        // 音轨切换需要在 ExoPlayer TrackSelector 上做覆盖选择,超出本 Task 范围(见任务报告),
-        // 这里先保留入口位置,点击暂不生效。
-        ToolbarAction(icon = Icons.Filled.Queue, label = "音轨", onClick = {})
+        ToolbarAction(icon = Icons.Filled.Queue, label = "音轨", onClick = onCycleAudioTrack)
         ToolbarAction(icon = Icons.Filled.ClosedCaption, label = "字幕", onClick = onCycleSubtitleTrack)
-        // "下一集"依赖 Task 22 才会接上的真实播放队列,这里同样只保留入口。
-        ToolbarAction(icon = Icons.Filled.SkipNext, label = "下一集", onClick = {})
+        ToolbarAction(icon = Icons.Filled.SkipNext, label = "下一集", onClick = onSkipToNext)
     }
 }
 

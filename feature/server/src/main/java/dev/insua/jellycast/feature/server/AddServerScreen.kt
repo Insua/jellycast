@@ -26,7 +26,9 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import dev.insua.jellycast.model.EndpointHealth
@@ -77,6 +79,10 @@ fun AddServerScreen(
                     onValueChange = { viewModel.onEndpointUrlChange(index, it) },
                     label = { Text("URL") },
                     placeholder = { Text("http://192.168.1.10:8096") },
+                    // URL 是 ASCII 协议地址,不是自然语言——即使系统输入法当前是中文拼音,
+                    // KeyboardType.Uri 也会让输入法按地址栏语境工作(不做全角标点转换/联想候选),
+                    // 这样 "." ":" 这类字符才能所见即所得地录入。
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                     modifier = Modifier.weight(2f),
                 )
                 OutlinedTextField(

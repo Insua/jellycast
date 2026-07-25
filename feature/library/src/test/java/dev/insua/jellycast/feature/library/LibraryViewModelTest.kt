@@ -3,6 +3,7 @@ package dev.insua.jellycast.feature.library
 import dev.insua.jellycast.network.JellyfinApi
 import dev.insua.jellycast.network.dto.BaseItemDto
 import dev.insua.jellycast.network.dto.ItemsResponseDto
+import dev.insua.jellycast.network.session.JellyfinSession
 import io.mockk.coEvery
 import io.mockk.mockk
 import kotlinx.coroutines.Dispatchers
@@ -48,6 +49,12 @@ class LibraryViewModelTest {
         return api
     }
 
+    private fun fakeSession(userId: String = "user-1"): JellyfinSession {
+        val session = mockk<JellyfinSession>()
+        coEvery { session.userId() } returns userId
+        return session
+    }
+
     // ---- 修正 §1 场景 1:点击某集时把整季作为队列传出,自动连播依赖它 ----
 
     @Test
@@ -62,7 +69,7 @@ class LibraryViewModelTest {
         )
         coEvery { api.episodes("series-1", "season-1", "user-1") } returns ItemsResponseDto(items = episodes)
 
-        val viewModel = LibraryViewModel(api, "user-1")
+        val viewModel = LibraryViewModel(api, fakeSession())
         viewModel.openSeries("series-1")
         advanceUntilIdle()
 
@@ -87,7 +94,7 @@ class LibraryViewModelTest {
         )
         coEvery { api.episodes(any(), any(), any()) } returns ItemsResponseDto()
 
-        val viewModel = LibraryViewModel(api, "user-1")
+        val viewModel = LibraryViewModel(api, fakeSession())
         viewModel.openSeries("series-1")
         advanceUntilIdle()
 
@@ -105,7 +112,7 @@ class LibraryViewModelTest {
         coEvery { api.items("user-1", "Movie", any(), any(), any(), any()) } returns
             ItemsResponseDto(items = listOf(movieDto("movie-1")))
 
-        val viewModel = LibraryViewModel(api, "user-1")
+        val viewModel = LibraryViewModel(api, fakeSession())
         advanceUntilIdle()
 
         assertEquals(listOf("series-1"), viewModel.uiState.value.series.map { it.id })

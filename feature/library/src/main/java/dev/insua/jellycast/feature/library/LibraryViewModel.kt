@@ -6,6 +6,7 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import dev.insua.jellycast.model.MediaItem
 import dev.insua.jellycast.network.JellyfinApi
 import dev.insua.jellycast.network.mapper.toMediaItem
+import dev.insua.jellycast.network.session.JellyfinSession
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -41,13 +42,14 @@ data class LibraryUiState(
  * 那一集开始的子列表——[LibraryScreen]/[SeriesDetailScreen] 在 onPlay 回调里必须把它原样传出去
  * (`onPlay(item, allEpisodesInSeason)`),交给 :core:player 的播放队列做自动连播。
  *
- * [api] / [userId] 目前直接构造注入,尚未接入"当前激活服务器"的会话解析(Task 22 导航装配的
- * 职责);:feature:library 现在还没有被 :app 引用,不影响 Hilt 全图校验。
+ * [api] 是 :app 提供的会话代理(见 `dev.insua.jellycast.network.session.SessionJellyfinApi`),
+ * 内部按需解析"当前应该用哪个 endpoint";`userId` 同样是运行时可变的会话状态(修正 §8d)——
+ * 不再作为裸 `String` 构造参数注入,改成注入 [JellyfinSession] 并在每次真正发请求前取当前值。
  */
 @HiltViewModel
 class LibraryViewModel @Inject constructor(
     private val api: JellyfinApi,
-    private val userId: String,
+    private val session: JellyfinSession,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(LibraryUiState())
@@ -60,6 +62,8 @@ class LibraryViewModel @Inject constructor(
     fun loadLibrary() {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
+
+            val userId = session.userId()
 
             val seriesDeferred = async {
                 runCatching { api.items(userId, types = "Series").items.mapNotNull { it.toMediaItem() } }
@@ -83,6 +87,7 @@ class LibraryViewModel @Inject constructor(
     fun openSeries(seriesId: String) {
         _uiState.update { it.copy(detail = SeriesDetailUiState(seriesId = seriesId, isLoading = true)) }
         viewModelScope.launch {
+            val userId = session.userId()
             val seasons = runCatching {
                 api.seasons(seriesId, userId).items.mapNotNull { it.toMediaItem() }
             }.getOrDefault(emptyList()).sortedBy { it.seasonNumber ?: Int.MAX_VALUE }
@@ -102,6 +107,7 @@ class LibraryViewModel @Inject constructor(
             state.copy(detail = state.detail?.copy(selectedSeasonId = seasonId, isLoading = true))
         }
         viewModelScope.launch {
+            val userId = session.userId()
             val episodes = runCatching {
                 api.episodes(seriesId, seasonId, userId).items.mapNotNull { it.toMediaItem() }
             }.getOrDefault(emptyList())

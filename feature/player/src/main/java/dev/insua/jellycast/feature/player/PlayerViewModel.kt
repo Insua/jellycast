@@ -2,7 +2,9 @@ package dev.insua.jellycast.feature.player
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.media3.common.C
 import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionOverride
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dev.insua.jellycast.datastore.PreferencesStore
 import dev.insua.jellycast.model.AudioTrack
@@ -59,6 +61,15 @@ interface PlayerConnection {
      * 这件事发生在队列真正推进之前,而不是等 UI 层在收到结束事件后再手忙脚乱地补一个 pause()。
      */
     fun setStopAfterCurrentEpisode(armed: Boolean)
+
+    /**
+     * 「下一集」工具栏按钮的落地接缝(修正 §8f):把"跳到播放队列的下一项并开始播放"这件事委派
+     * 给真实实现——真实实现操作的是 `:core:player` 的 `PlayQueue` + `AudioPlaybackEngine`,
+     * 这里刻意不直接依赖那两个类型,保持 `:feature:player` 不认识具体播放引擎细节的边界。
+     * 队列已耗尽(没有下一项)时什么都不做,不崩溃、不报错——和自动连播队列耗尽时的"静默不连播"
+     * 是同一个产品语义,只是这里是用户手动触发。
+     */
+    fun skipToNext()
 }
 
 /** 睡眠定时器的可选模式:固定分钟数(墙钟倒计时)或「播完本集」(见设计文档 §3.5)。 */
@@ -220,6 +231,34 @@ class PlayerViewModel @Inject constructor(
         val next = SPEED_STEPS.firstOrNull { it > current + SPEED_EPSILON } ?: SPEED_STEPS.first()
         player.setPlaybackSpeed(next)
         viewModelScope.launch { preferencesStore.setPlaybackSpeed(next) }
+    }
+
+    /**
+     * 音轨切换(修正 §8f):在 [Player.getCurrentTracks] 报告的音频轨道组里循环切换选中项,用
+     * Media3 现代 API [Player.trackSelectionParameters] 的 [TrackSelectionOverride] 覆盖选择,
+     * 不触碰底层 ExoPlayer 内部状态。
+     *
+     * 诚实说明:L1(`/Audio/{id}/universal`)是服务端已经转码/remux 成的单一音频输出,通常只报告
+     * 一条音轨,此时这里是 no-op(`audioGroups.size <= 1` 直接返回)——这是符合预期的行为,不是
+     * bug。多音轨切换真正生效的场景是降级到 L3(`/Videos/{id}/stream?static=true`,直通原始容器)
+     * 时,原始文件里保留的多条音轨才会出现在 [Player.getCurrentTracks] 里。
+     */
+    fun onCycleAudioTrack() {
+        val player = connection.player.value ?: return
+        val audioGroups = player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
+        if (audioGroups.size <= 1) return
+
+        val currentIndex = audioGroups.indexOfFirst { group -> (0 until group.length).any { group.isTrackSelected(it) } }
+        val next = audioGroups[(currentIndex + 1).mod(audioGroups.size)]
+
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+            .setOverrideForType(TrackSelectionOverride(next.mediaTrackGroup, 0))
+            .build()
+    }
+
+    /** 「下一集」工具栏按钮(修正 §8f):转发给 [PlayerConnection.skipToNext]。 */
+    fun onSkipToNext() {
+        connection.skipToNext()
     }
 
     /** 字幕语言:在已知的文本字幕轨里循环切换到下一条,重新拉取解析,并记住偏好供下次默认选中。 */

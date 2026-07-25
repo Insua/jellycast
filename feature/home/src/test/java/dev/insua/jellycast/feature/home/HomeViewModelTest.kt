@@ -3,6 +3,7 @@ package dev.insua.jellycast.feature.home
 import dev.insua.jellycast.network.JellyfinApi
 import dev.insua.jellycast.network.dto.BaseItemDto
 import dev.insua.jellycast.network.dto.ItemsResponseDto
+import dev.insua.jellycast.network.session.JellyfinSession
 import io.mockk.coEvery
 import io.mockk.mockk
 import kotlinx.coroutines.Dispatchers
@@ -39,6 +40,11 @@ class HomeViewModelTest {
 
     private fun episodeDto(id: String) = BaseItemDto(id = id, name = id, type = "Episode")
     private fun movieDto(id: String) = BaseItemDto(id = id, name = id, type = "Movie")
+    private fun fakeSession(userId: String = "user-1"): JellyfinSession {
+        val session = mockk<JellyfinSession>()
+        coEvery { session.userId() } returns userId
+        return session
+    }
 
     // ---- 修正 §1 场景 1:三个分区并发加载互不阻塞 ----
     // 三个接口各自耗时 100ms(虚拟时间)。如果 HomeViewModel 串行 await 它们,总耗时会是 300ms;
@@ -60,7 +66,7 @@ class HomeViewModelTest {
             ItemsResponseDto(items = listOf(movieDto("recent-1")))
         }
 
-        val viewModel = HomeViewModel(api, "user-1")
+        val viewModel = HomeViewModel(api, fakeSession())
         advanceUntilIdle()
 
         assertEquals(100L, currentTime, "三个分区应并发发起,总耗时应约等于单个请求耗时而非三者相加")
@@ -77,7 +83,7 @@ class HomeViewModelTest {
         coEvery { api.items(any(), any(), any(), any(), any(), any()) } returns
             ItemsResponseDto(items = listOf(movieDto("recent-1")))
 
-        val viewModel = HomeViewModel(api, "user-1")
+        val viewModel = HomeViewModel(api, fakeSession())
         advanceUntilIdle()
 
         val sections = viewModel.uiState.value.sections
@@ -96,7 +102,7 @@ class HomeViewModelTest {
         coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto(items = listOf(episodeDto("next-1")))
         coEvery { api.items(any(), any(), any(), any(), any(), any()) } returns ItemsResponseDto(items = emptyList())
 
-        val viewModel = HomeViewModel(api, "user-1")
+        val viewModel = HomeViewModel(api, fakeSession())
         advanceUntilIdle()
 
         val sections = viewModel.uiState.value.sections
