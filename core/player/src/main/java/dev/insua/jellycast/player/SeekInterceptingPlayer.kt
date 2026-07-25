@@ -115,8 +115,20 @@ class SeekInterceptingPlayer(
         seekRouter.seekTo(target)
     }
 
+    /**
+     * 复审 Minor:上界钳制不能省。`PlayerViewModel.onSkipForward()` 一直有 `coerceAtMost(durationMs)`,
+     * 这一层却没有——于是锁屏/通知栏/蓝牙耳机的快进键在快结尾处按一下,会请求一个**超过条目结尾**的
+     * `startTimeTicks`,服务端只能给出一条空流或直接失败。两条路现在一致了。
+     *
+     * 上界取本类覆写的 [getDuration](权威值来自 Jellyfin 元数据 `runTimeMs`)。它可能是"未知"——
+     * 元数据缺失时会回退到底层 `duration`,而 chunked AAC 转码流的 `duration` 常是 `C.TIME_UNSET`
+     * (一个很大的负数)。所以只有在 `> 0` 时才钳制,否则照常快进,绝不会因为"不知道多长"就把目标
+     * 位置钳成 0。
+     */
     override fun seekForward() {
-        seekRouter.seekTo(currentPosition + seekForwardIncrement)
+        val target = currentPosition + seekForwardIncrement
+        val durationMs = duration
+        seekRouter.seekTo(if (durationMs > 0L) target.coerceAtMost(durationMs) else target)
     }
 
     override fun seekToPrevious() {

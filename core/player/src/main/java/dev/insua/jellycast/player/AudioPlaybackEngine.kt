@@ -71,6 +71,23 @@ interface AudioPlaybackEngine {
 
     suspend fun play(itemId: String, userId: String, startPositionMs: Long = 0L)
     suspend fun seekTo(positionMs: Long)
+
+    /**
+     * 播放宿主(`PlaybackService`)销毁、播放器已被 `stop()` + `clearMediaItems()` 之后调用:
+     * 把"当前这条流"的一切痕迹清干净——流基准、当前条目/用户、[state] 一律复位。
+     *
+     * ⚠️ 复审 Finding 2:没有这个方法之前,Service 销毁后引擎会**继续声称自己是 `Ready`**,而播放器
+     * 其实已经被清空了。后果有两个:
+     * 1. [absolutePositionMs] 衰减成"那条流的起始位置 + 0",也就是一个几分钟前的旧值,谁读它都错;
+     * 2. Service 重建后重新订阅 [state],那个陈旧的 `Ready` 被 `StateFlow` 重放进来,进度协调器把它
+     *    当成一次新的播放开始,给一个**根本没在播的条目**发 `Sessions/Playing`(服务端因此 `PlayCount`
+     *    +1、`Played` 被置回 false、留下一个等不到 stop 的幽灵会话)。
+     *
+     * 和 [release] 的区别:[release] 会放掉播放器本身,而这个播放器是 `@Singleton`、比 Service 活得久
+     * (见 `PlaybackService.onDestroy` 的 KDoc),销毁 Service 时**不能**放掉它。
+     */
+    fun reset()
+
     fun release()
 }
 
@@ -180,6 +197,14 @@ class AudioPlaybackEngineImpl(
         } catch (e: Exception) {
             _state.value = PlaybackEngineState.Error(itemId)
         }
+    }
+
+    /** 见 [AudioPlaybackEngine.reset]。刻意**不**碰 [playerControl]:那个播放器是 `@Singleton`。 */
+    override fun reset() {
+        currentItemId = null
+        currentUserId = null
+        currentStartPositionMs = null
+        _state.value = PlaybackEngineState.Idle
     }
 
     override fun release() {

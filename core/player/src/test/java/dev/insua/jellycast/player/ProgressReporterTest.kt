@@ -135,4 +135,48 @@ class ProgressReporterTest {
         coVerify(exactly = 0) { api.reportProgress(match { it.itemId == "b1" }) }
         assertEquals(listOf("b1"), dao.store.map { it.itemId })
     }
+
+    // ---- 复审 Minor:补报必须有失败上限,不能让一行毒记录永远占着队列 ----
+
+    /**
+     * 缺陷现场:`flushPending` 只删除**成功**的行。一条永远失败的记录(最典型的是条目已在服务端
+     * 被删除 → 404)会永久留在队列里,而 `flushPending` 是"每次源就绪"都调的 —— 也就是**每次 seek
+     * 都重试一遍**,而且顺带拖慢每一次 seek。
+     *
+     * 修正:补报是"尽力而为"。连续失败达到上限就丢弃这一行。为什么这个上限是安全的:
+     * `flushPending` 只在一次 resolve **成功**之后被调用,也就是"服务器此刻可达"已经被证明过了 ——
+     * 在服务器可达的前提下连着失败 3 次,基本只能是这条记录本身有问题,不是网络问题。
+     */
+    @Test fun `连续失败达到上限后丢弃该补报记录,不再无限重试`() = runTest {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.reportProgress(any()) } throws java.io.IOException("item deleted")
+        val dao = FakeProgressReportDao()
+        dao.enqueue(
+            ProgressReportEntity(
+                id = 0, serverId = "s1", itemId = "gone", playSessionId = null,
+                positionMs = 1000, kind = "progress", createdAt = 1
+            )
+        )
+        val reporter = ProgressReporter(api, dao, "s1")
+
+        reporter.flushPending()
+        assertEquals(1, dao.store.size)     // 第 1 次失败:留着,可能只是一次网络抖动
+        reporter.flushPending()
+        assertEquals(1, dao.store.size)     // 第 2 次失败:还留着
+        reporter.flushPending()
+        assertEquals(0, dao.store.size)     // 第 3 次失败:放弃,别再拖累后面每一次 seek
+
+        coVerify(exactly = 3) { api.reportProgress(any()) }
+        reporter.flushPending()
+        coVerify(exactly = 3) { api.reportProgress(any()) }   // 已经不在队列里了,不会再重试
+    }
+
+    /** 铁律:进度上报失败绝不打断播放。`dao` 本身抛异常(数据库损坏/迁移失败)也不得向上抛。 */
+    @Test fun `flushPending 在 dao 抛异常时不向上抛错`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        val dao = mockk<ProgressReportDao>()
+        coEvery { dao.pending(any(), any()) } throws IllegalStateException("database corrupted")
+
+        ProgressReporter(api, dao, "s1").flushPending()   // 不应抛出
+    }
 }

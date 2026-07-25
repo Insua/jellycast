@@ -161,6 +161,41 @@ class SeekInterceptingPlayerTest {
         verify(exactly = 0) { underlying.seekForward() }
     }
 
+    /**
+     * 复审 Minor:`seekForward()` 没有上界钳制,而 `PlayerViewModel.onSkipForward()` 有
+     * (`coerceAtMost(durationMs)`)。两条路必须一致——锁屏/蓝牙耳机的快进键走的是这一条,
+     * 在快结尾处按一下就会请求一个**超过条目结尾**的 `startTimeTicks`,服务端拿到它只能给出一条
+     * 空流或直接失败。上界取权威总时长(Jellyfin 元数据 `runTimeMs`),不是底层 `duration`
+     * (chunked AAC 转码流常是 `C.TIME_UNSET`)。
+     */
+    @Test fun `seekForward 钳制到条目总时长,不会请求超过结尾的位置`() {
+        val underlying = mockk<Player>(relaxed = true)
+        every { underlying.seekForwardIncrement } returns 30_000L
+        val seen = mutableListOf<Long>()
+        val timeline = object : AbsoluteTimeline {
+            override fun absolutePositionMs(): Long = 1_490_000L      // 距结尾只剩 10 秒
+            override fun absoluteDurationMs(): Long = 1_500_000L
+        }
+        val sessionPlayer = SeekInterceptingPlayer(underlying, SeekRouter { seen += it }, timeline)
+
+        sessionPlayer.seekForward()
+
+        assertEquals(listOf(1_500_000L), seen)
+    }
+
+    /** 总时长未知时(元数据缺失 + 转码流 `duration` 是 `C.TIME_UNSET`)不能钳制成 0,照常快进。 */
+    @Test fun `总时长未知时 seekForward 不做钳制`() {
+        val underlying = mockk<Player>(relaxed = true)
+        every { underlying.seekForwardIncrement } returns 30_000L
+        every { underlying.duration } returns androidx.media3.common.C.TIME_UNSET
+        val seen = mutableListOf<Long>()
+        val sessionPlayer = SeekInterceptingPlayer(underlying, SeekRouter { seen += it }, absoluteTimeline(20_000L))
+
+        sessionPlayer.seekForward()
+
+        assertEquals(listOf(50_000L), seen)
+    }
+
     /** 没有接绝对时间轴时(默认 [AbsoluteTimeline.Unknown])必须安全回退到底层 player,而不是报 0。 */
     @Test fun `未接绝对时间轴时回退到底层 player 的位置,不至于把起点当成 0`() {
         val underlying = mockk<Player>(relaxed = true)

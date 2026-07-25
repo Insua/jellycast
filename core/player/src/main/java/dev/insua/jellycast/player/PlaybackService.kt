@@ -173,6 +173,9 @@ class PlaybackService : MediaSessionService() {
      * 1. **新源就绪** —— 引擎每进入 `Ready` 就是"首播 / 换集 / seek 后重新 resolve"三者之一。
      *    [PlaybackProgressCoordinator] 负责区分该发 start / progress / stop+start,并顺带调
      *    `flushPending()` 排空离线积压的补报队列(会话刚 resolve 成功,说明服务器此刻可达)。
+     *    ⚠️ 复审 Finding 2:必须经 [playbackReadyEvents] 而不是直接 `collect` —— 本 Service 是**新建**
+     *    的,`StateFlow` 会先把"上一条命留下的状态"重放给它,那不是一次新的播放开始,当成 start 报
+     *    出去就会给一个没在播的条目开一个幽灵会话。
      * 2. **10 秒心跳** —— 设计文档 §7 的"每 10s 或 seek 时"。只在真正在播时上报:暂停期间反复上报
      *    同一个位置没有意义,还会白耗电和流量。
      *
@@ -181,10 +184,8 @@ class PlaybackService : MediaSessionService() {
      */
     private fun observeProgressReporting() {
         serviceScope.launch {
-            playbackEngine.state.collect { state ->
-                if (state is PlaybackEngineState.Ready) {
-                    progressCoordinator.onSourceReady(state.source, state.startPositionMs)
-                }
+            playbackEngine.state.playbackReadyEvents().collect { event ->
+                progressCoordinator.onSourceReady(event.source, event.startPositionMs, event.trigger)
             }
         }
         serviceScope.launch {
@@ -251,6 +252,12 @@ class PlaybackService : MediaSessionService() {
         // 停止取流、放掉解码器与缓冲,但**不** release() —— 见上面的决定。
         exoPlayer.stop()
         exoPlayer.clearMediaItems()
+
+        // ⚠️ 复审 Finding 2:播放器刚被清空,引擎手里那个 `startPositionMs` 流基准和 `Ready` 状态就都
+        // 过期了。不清掉的话:(a) `absolutePositionMs` 会衰减成"旧流起始位置 + 0",一个几分钟前的值;
+        // (b) Service 重建后订阅 `state` 会被重放到那个陈旧的 `Ready`,进度协调器把它当成新的播放开始,
+        // 给一个根本没在播的条目发 `Sessions/Playing`。位置已经在本方法开头取好了,这里清是安全的。
+        playbackEngine.reset()
 
         mediaSession?.release()
         mediaSession = null

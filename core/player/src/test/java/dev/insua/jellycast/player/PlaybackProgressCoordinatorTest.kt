@@ -2,6 +2,9 @@ package dev.insua.jellycast.player
 
 import dev.insua.jellycast.model.AudioDeliveryLevel
 import dev.insua.jellycast.model.PlaybackSource
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
@@ -86,24 +89,101 @@ class PlaybackProgressCoordinatorTest {
         )
     }
 
-    /**
-     * Service 被销毁后重建,会重新订阅到引擎那个仍然 `Ready` 的 StateFlow —— 同一条目又"就绪"一次。
-     * 此时用户可能已经在这条流里多听了几分钟,若按 `startPositionMs` 上报就会把 Jellyfin 里的进度
-     * **往回**冲(比不上报更糟)。必须以实时绝对位置为准。
-     */
-    @Test fun `同一条目的重复就绪按实时绝对位置上报,不会把进度往回冲`() = runTest {
-        val sink = RecordingSink()
-        var position = 480_000L
-        val c = coordinator(sink) { position }
+    // ---- 复审 Finding 2:状态重放绝不能被当成一次新的播放开始 ----
 
+    /**
+     * 缺陷现场:`Service.onDestroy` 调 `onPlaybackStopped()` 清掉了 [currentItemId],但引擎那边
+     * 仍然是 `Ready`(旧实现没有 `reset()`)。Service 重建后重新订阅引擎状态流,那个陈旧的 `Ready`
+     * 被重放进来,撞上"previousItemId == null → start"这条分支,于是给一个**根本没在播的条目**
+     * 发了 `Sessions/Playing`,位置还比刚刚报出去的 stop 落后好几分钟。服务端后果:`PlayCount` +1、
+     * `Played` 被置回 false、留下一个永远等不到 stop 的幽灵会话。
+     *
+     * 修正后的不变量:**只有真的开始播放才报 start**。重放只可能来自"播放器已经被
+     * `stop()` + `clearMediaItems()` 过"的 Service 重建路径,那时什么都没在播,所以一个字节都不该发。
+     */
+    @Test fun `状态重放的就绪不上报任何东西,也不排空补报队列`() = runTest {
+        val sink = RecordingSink()
+        val c = coordinator(sink) { 480_000L }
+
+        c.onSourceReady(source("ep12"), startPositionMs = 480_000L, trigger = PlaybackReadyTrigger.STATE_REPLAY)
+
+        assertEquals(emptyList<String>(), sink.calls)
+        // 重放不是一次新的 resolve,它不证明服务器此刻可达,不该拿它当排空补报队列的时机。
+        assertEquals(0, sink.flushCount)
+    }
+
+    /** 重放之后用户真的点了播放:那才是一次全新的 start,不能因为重放"占了位"而退化成 progress。 */
+    @Test fun `状态重放之后真正开始播放仍然报 start`() = runTest {
+        val sink = RecordingSink()
+        val c = coordinator(sink) { 0L }
+
+        c.onSourceReady(source("ep12"), startPositionMs = 480_000L, trigger = PlaybackReadyTrigger.STATE_REPLAY)
         c.onSourceReady(source("ep12"), startPositionMs = 480_000L)
-        position = 900_000L                             // 用户又听了 7 分钟
-        c.onSourceReady(source("ep12"), startPositionMs = 480_000L)
+
+        assertEquals(listOf("start ep12 session-ep12 480000"), sink.calls)
+    }
+
+    /** 重放不得把自己登记成"当前在播条目",否则紧接着的心跳会给一个没在播的条目发 progress。 */
+    @Test fun `状态重放之后的心跳什么都不上报`() = runTest {
+        val sink = RecordingSink()
+        val c = coordinator(sink) { 480_000L }
+
+        c.onSourceReady(source("ep12"), startPositionMs = 480_000L, trigger = PlaybackReadyTrigger.STATE_REPLAY)
+        c.onTick()
+
+        assertEquals(emptyList<String>(), sink.calls)
+    }
+
+    // ---- playbackReadyEvents:"这是重放还是真的开始播了"的判定 ----
+
+    /**
+     * `StateFlow` 的订阅者一上来就会收到当前值。对一个**新建的** Service 来说,这第一个值就是
+     * "上一条命留下的状态",不是一次新发生的播放开始——这正是 Finding 2 的入口。这里把这条判定
+     * 做成纯 Flow 适配器,于是它可以离线单测(项目铁律 6),而 `PlaybackService` 里只剩接线。
+     */
+    @Test fun `订阅时就已经是 Ready 的那个值被标成状态重放`() = runTest {
+        val state = MutableStateFlow<PlaybackEngineState>(PlaybackEngineState.Ready(source("ep12"), 480_000L))
+        val seen = mutableListOf<PlaybackReadyEvent>()
+        val job = launch { state.playbackReadyEvents().collect { seen += it } }
+        runCurrent()
+
+        state.value = PlaybackEngineState.Ready(source("ep13"), 0L)
+        runCurrent()
+        job.cancel()
 
         assertEquals(
-            listOf("start ep12 session-ep12 480000", "progress ep12 session-ep12 900000"),
-            sink.calls,
+            listOf(PlaybackReadyTrigger.STATE_REPLAY, PlaybackReadyTrigger.NEW_PLAYBACK),
+            seen.map { it.trigger },
         )
+        assertEquals(listOf("ep12", "ep13"), seen.map { it.source.itemId })
+        assertEquals(listOf(480_000L, 0L), seen.map { it.startPositionMs })
+    }
+
+    /** 正常冷启动:第一个值是 Idle(不产生事件),之后的 Ready 是真正的播放开始。 */
+    @Test fun `冷启动时第一个 Ready 是真正的播放开始,不会被误判成重放`() = runTest {
+        val state = MutableStateFlow<PlaybackEngineState>(PlaybackEngineState.Idle)
+        val seen = mutableListOf<PlaybackReadyEvent>()
+        val job = launch { state.playbackReadyEvents().collect { seen += it } }
+        runCurrent()
+
+        state.value = PlaybackEngineState.Ready(source("ep12"), 0L)
+        runCurrent()
+        job.cancel()
+
+        assertEquals(listOf(PlaybackReadyTrigger.NEW_PLAYBACK), seen.map { it.trigger })
+    }
+
+    @Test fun `非 Ready 状态不产生就绪事件`() = runTest {
+        val state = MutableStateFlow<PlaybackEngineState>(PlaybackEngineState.Idle)
+        val seen = mutableListOf<PlaybackReadyEvent>()
+        val job = launch { state.playbackReadyEvents().collect { seen += it } }
+        runCurrent()
+
+        state.value = PlaybackEngineState.Error("ep12")
+        runCurrent()
+        job.cancel()
+
+        assertEquals(emptyList<PlaybackReadyEvent>(), seen)
     }
 
     @Test fun `onDestroy 传入的位置优先于实时位置(主线程已经先把位置取好了)`() = runTest {

@@ -1,6 +1,8 @@
 package dev.insua.jellycast.player
 
 import dev.insua.jellycast.model.PlaybackSource
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
 
 /**
  * 进度上报的窄接口。生产实现是 [ProgressReporter](它同时负责失败入队与补报),这里抽出接口只为了
@@ -12,6 +14,61 @@ interface ProgressSink {
     suspend fun progress(itemId: String, sessionId: String?, positionMs: Long)
     suspend fun stop(itemId: String, sessionId: String?, positionMs: Long)
     suspend fun flushPending()
+}
+
+/**
+ * 一次"源就绪"到底是什么(复审 Finding 2)。
+ *
+ * 靠"当前有没有条目在播"([PlaybackProgressCoordinator] 的 `currentItemId` 是不是 null)去**猜**
+ * 这件事是不够的:Service 销毁时 `onPlaybackStopped()` 把它清成了 null,于是 Service 重建后被
+ * `StateFlow` 重放进来的那个陈旧 `Ready` 会撞进"null → 这是一次新播放 → 发 start"的分支,给一个
+ * 根本没在播的条目开一个幽灵会话。所以调用方必须**明确说明**这次就绪是哪一种。
+ */
+enum class PlaybackReadyTrigger {
+    /** 真的有一条新流被 prepare 了:首播 / 换集 / seek 后重新 resolve。 */
+    NEW_PLAYBACK,
+
+    /**
+     * 只是 `StateFlow` 把"上一条命留下的状态"重放给了新的订阅者(Service 重建)。此刻播放器已经被
+     * `stop()` + `clearMediaItems()` 过,什么都没在播。
+     */
+    STATE_REPLAY,
+}
+
+/** 一次值得上报的"源就绪"事件,由 [playbackReadyEvents] 从引擎状态流里提炼出来。 */
+data class PlaybackReadyEvent(
+    val source: PlaybackSource,
+    val startPositionMs: Long,
+    val trigger: PlaybackReadyTrigger,
+)
+
+/**
+ * 把引擎状态流转成进度上报要的就绪事件流,并把"这是重放还是真的开始播了"这件事判定出来
+ * (复审 Finding 2)。
+ *
+ * 判定规则:`StateFlow` 的新订阅者一上来就会收到**当前值**。对一个刚创建的 `PlaybackService` 来说,
+ * 这第一个值必然是"上一条命留下的状态",不是订阅之后新发生的播放开始 —— 所以第一个值一律标成
+ * [PlaybackReadyTrigger.STATE_REPLAY],之后的每一次转换才是 [PlaybackReadyTrigger.NEW_PLAYBACK]。
+ *
+ * 为什么"第一个值是 Ready"不可能是一次真播放:Service 一定在播放开始**之前**就存在了——
+ * `AppSessionViewModel.play()` 先 `startForegroundService(...)` 才调 `engine.play(...)`,而
+ * `engine.play` 中间还夹着 `PlaybackInfo` 请求与 L1 探测两次网络往返;并且 `PlaybackService.onDestroy`
+ * 一定会 `stop()` + `clearMediaItems()`,所以被重放的 `Ready` 背后从来没有正在响的音频。
+ * (再加一层保险:`onDestroy` 现在还会调 `AudioPlaybackEngine.reset()`,连这个陈旧的 `Ready` 都不会
+ * 留下来——见该方法 KDoc。)
+ *
+ * 做成 `Flow` 适配器而不是写在 `PlaybackService` 里,是为了让这条判定可以离线单测(项目铁律 6):
+ * Service 本身在 JVM 单测里造不出来。
+ */
+fun Flow<PlaybackEngineState>.playbackReadyEvents(): Flow<PlaybackReadyEvent> = flow {
+    var isFirstValue = true
+    collect { state ->
+        val trigger = if (isFirstValue) PlaybackReadyTrigger.STATE_REPLAY else PlaybackReadyTrigger.NEW_PLAYBACK
+        isFirstValue = false
+        if (state is PlaybackEngineState.Ready) {
+            emit(PlaybackReadyEvent(state.source, state.startPositionMs, trigger))
+        }
+    }
 }
 
 /**
@@ -49,7 +106,22 @@ class PlaybackProgressCoordinator(
     private var currentSessionId: String? = null
     private var lastKnownPositionMs: Long = 0L
 
-    suspend fun onSourceReady(source: PlaybackSource, startPositionMs: Long) {
+    /**
+     * [trigger] 默认是 [PlaybackReadyTrigger.NEW_PLAYBACK] —— "有人告诉我一条新流就绪了"的常态。
+     * 生产调用方([PlaybackService])用 [playbackReadyEvents] 提供准确的 trigger。
+     */
+    suspend fun onSourceReady(
+        source: PlaybackSource,
+        startPositionMs: Long,
+        trigger: PlaybackReadyTrigger = PlaybackReadyTrigger.NEW_PLAYBACK,
+    ) {
+        // 复审 Finding 2 的不变量:**只有真的开始播放才上报**。状态重放背后没有任何音频在响
+        // (播放器早已 stop() + clearMediaItems(),见 PlaybackReadyTrigger.STATE_REPLAY),所以这里
+        // 一个字节都不发,也刻意**不**登记 currentItemId —— 否则紧接着的心跳会给一个没在播的条目
+        // 发 progress,而之后用户真的点播这一集时又会退化成 progress、拿不到 start。
+        // 也不调 flushPending():重放不是一次新的 resolve,它不证明服务器此刻可达。
+        if (trigger == PlaybackReadyTrigger.STATE_REPLAY) return
+
         val previousItemId = currentItemId
         val previousSessionId = currentSessionId
         val previousPositionMs = lastKnownPositionMs
@@ -65,10 +137,15 @@ class PlaybackProgressCoordinator(
                 lastKnownPositionMs = startPositionMs
                 sink.start(source.itemId, source.playSessionId, startPositionMs)
             }
-            // 同一条目再次就绪:正常情况是一次 seek(此时绝对位置 == 新流的起始位置)。也可能是
-            // Service 重建后重新订阅到引擎那个仍然 Ready 的 StateFlow —— 那时用户可能已经在这条流里
-            // 又听了几分钟,报 startPositionMs 会把 Jellyfin 里的进度**往回**冲。所以这里读实时的
-            // 绝对位置,两种情形都不会把用户的记录改坏。
+            // 同一条目再次就绪 == 一次 seek(转码流 `Accept-Ranges: none`,seek 只能重新起流)。
+            // 发 progress 而不是再发一次 Sessions/Playing —— 后者会被 Jellyfin 当成新的播放会话。
+            //
+            // ⚠️ 这里读的是**实时**绝对位置,不是 startPositionMs。复审指出旧注释拿"Service 重建后的
+            // 状态重放"当理由,而那条路径根本走不到这个分支(重建时 currentItemId 已被
+            // onPlaybackStopped 清空,而且现在重放会被 STATE_REPLAY 直接挡掉),那个理由已经删掉。
+            // 留着读实时位置的真实理由:seek 刚完成时它就等于新流的起始位置,而如果观察到这次就绪
+            // 之前播放器已经又走了一点,它比 startPositionMs 更准。两者永远不会更早,不可能把用户在
+            // Jellyfin 里的记录往回冲。
             source.itemId -> {
                 val positionMs = absolutePositionMs()
                 lastKnownPositionMs = positionMs

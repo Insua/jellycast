@@ -97,6 +97,62 @@ class AudioPlaybackEngineTest {
         assertTrue(control.preparedUrls.isEmpty())
     }
 
+    // ---- 复审 Finding 2:播放宿主销毁后,引擎必须承认"什么都没在播" ----
+
+    /**
+     * `PlaybackService.onDestroy` 会 `stop()` + `clearMediaItems()`(但刻意**不** release 那个
+     * `@Singleton` ExoPlayer,见该方法 KDoc)。此后引擎手里的两样东西全都过期了:
+     * - `currentStartPositionMs` 这个流基准 —— 播放器位置已归零,绝对位置会衰减成一个几分钟前的值;
+     * - `Ready` 状态 —— Service 重建后重新订阅时,它会被 `StateFlow` 重放成"看起来在播",
+     *   进度协调器于是给一个没在播的条目发 `Sessions/Playing`(Finding 2 的幽灵会话)。
+     *
+     * [AudioPlaybackEngine.reset] 就是"把这两样都清干净"。
+     */
+    @Test fun `reset 之后状态回到 Idle,不会把陈旧的 Ready 重放给重建后的 Service`() = runTest {
+        val control = RecordingPlayerControl()
+        val engine = AudioPlaybackEngineImpl(PlaybackSourceProvider { _, _, pos -> source(pos) }, control)
+        engine.play(ITEM_ID, USER_ID, startPositionMs = 480_000L)
+
+        engine.reset()
+
+        assertEquals(PlaybackEngineState.Idle, engine.state.value)
+    }
+
+    @Test fun `reset 之后绝对位置归零,不再报那个已经过期的流基准`() = runTest {
+        val control = RecordingPlayerControl()
+        val engine = AudioPlaybackEngineImpl(PlaybackSourceProvider { _, _, pos -> source(pos) }, control)
+        engine.play(ITEM_ID, USER_ID, startPositionMs = 480_000L)
+        control.currentPositionMs = 0L      // clearMediaItems() 之后播放器位置归零
+
+        engine.reset()
+
+        assertEquals(0L, engine.absolutePositionMs)
+    }
+
+    /** reset 之后没有"当前条目"可言,迟到的 seek(锁屏残留的命令)必须安全地什么都不做。 */
+    @Test fun `reset 之后的 seekTo 不会凭空起一条新流`() = runTest {
+        val control = RecordingPlayerControl()
+        val engine = AudioPlaybackEngineImpl(PlaybackSourceProvider { _, _, pos -> source(pos) }, control)
+        engine.play(ITEM_ID, USER_ID, startPositionMs = 0L)
+
+        engine.reset()
+        engine.seekTo(90_000L)
+
+        assertEquals(1, control.preparedUrls.size)
+        assertEquals(PlaybackEngineState.Idle, engine.state.value)
+    }
+
+    /** reset **不是** release:那个播放器是 `@Singleton`,比 Service 活得久,不能被放掉。 */
+    @Test fun `reset 不会释放播放器`() = runTest {
+        val control = RecordingPlayerControl()
+        val engine = AudioPlaybackEngineImpl(PlaybackSourceProvider { _, _, pos -> source(pos) }, control)
+        engine.play(ITEM_ID, USER_ID, startPositionMs = 0L)
+
+        engine.reset()
+
+        assertTrue(!control.released)
+    }
+
     @Test fun `release 委托给 PlayerControl`() {
         val control = RecordingPlayerControl()
         val engine = AudioPlaybackEngineImpl(PlaybackSourceProvider { _, _, pos -> source(pos) }, control)

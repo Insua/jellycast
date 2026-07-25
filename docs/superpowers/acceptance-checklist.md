@@ -57,8 +57,9 @@
 
 `PlaybackService` 现在驱动 `PlaybackProgressCoordinator`(源就绪 → start / 换集 → stop+start /
 seek → progress / 每 10s 心跳 / STATE_ENDED 与 onDestroy → stop,每次源就绪顺带 `flushPending()`),
-上报的位置取 `AudioPlaybackEngine.absolutePositionMs`(绝对位置)。这条链路上"什么时候上报什么"
-由 11 个离线单测覆盖。
+上报的位置取 `AudioPlaybackEngine.absolutePositionMs`(绝对位置)。**Service 重建时被 `StateFlow`
+重放的那个陈旧 `Ready` 不算一次播放开始**,不上报(复审 Finding 2:否则会给一个没在播的条目开一个
+幽灵会话)。这条链路上"什么时候上报什么"由 `PlaybackProgressCoordinatorTest` 的 17 个离线单测覆盖。
 
 **但仍然待真机 + 凭据人工验收(见文末清单):**
 
