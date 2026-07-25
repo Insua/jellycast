@@ -83,6 +83,25 @@ interface PlayerConnection {
     fun skipToNext()
 }
 
+/**
+ * 倍速档位表。复审 Important 5:原来是 1.0–2.0,而设计文档 §3.5 明确写的是 **0.5x – 3.0x**。
+ * 听不懂的段落要能放慢,这是"把剧当播客听"这个场景的基本诉求,不是可选项。
+ * 设置页的滑块也是 0.5–3.0(`SettingsScreen` 的 `valueRange`),两处现在一致了。
+ */
+internal val playbackSpeedSteps: List<Float> =
+    listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f, 2.5f, 3.0f)
+
+/**
+ * 循环到严格大于 [current] 的下一档,到顶回到最慢档。
+ *
+ * 容差不能省:倍速是 float 落盘再读回来的,1.25 可能变成 1.2500001——不留容差的话
+ * "下一档"会把 1.25 自己算成候选,按一下没反应。
+ */
+internal fun nextPlaybackSpeed(current: Float): Float =
+    playbackSpeedSteps.firstOrNull { it > current + PLAYBACK_SPEED_EPSILON } ?: playbackSpeedSteps.first()
+
+private const val PLAYBACK_SPEED_EPSILON = 0.001f
+
 /** 睡眠定时器的可选模式:固定分钟数(墙钟倒计时)或「播完本集」(见设计文档 §3.5)。 */
 sealed interface SleepTimerOption {
     data class Minutes(val value: Int) : SleepTimerOption
@@ -257,10 +276,14 @@ class PlayerViewModel @Inject constructor(
         onSeek(target.coerceAtMost(duration))
     }
 
+    /**
+     * 倍速切换。除了立刻作用到当前播放器,还要写回偏好——`PlaybackService` 订阅
+     * `PreferencesStore.playbackSpeed` 并应用到播放器(复审 Important 5),所以这个写入既是
+     * "记住上次设置",也是让设置页与播放页两条路最终收敛到同一个值。
+     */
     fun onCycleSpeed() {
         val player = connection.player.value ?: return
-        val current = _uiState.value.playbackSpeed
-        val next = SPEED_STEPS.firstOrNull { it > current + SPEED_EPSILON } ?: SPEED_STEPS.first()
+        val next = nextPlaybackSpeed(_uiState.value.playbackSpeed)
         player.setPlaybackSpeed(next)
         viewModelScope.launch { preferencesStore.setPlaybackSpeed(next) }
     }
@@ -345,7 +368,5 @@ class PlayerViewModel @Inject constructor(
 
     private companion object {
         const val POSITION_POLL_INTERVAL_MS = 500L
-        const val SPEED_EPSILON = 0.001f
-        val SPEED_STEPS = listOf(1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
     }
 }
