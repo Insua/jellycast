@@ -29,9 +29,10 @@ kotlin {
 }
 
 dependencies {
-    // 后续 Task 引入的模块(:core:model / :core:network / :core:player / :core:designsystem /
+    // 后续 Task 引入的模块(:core:model / :core:network / :core:designsystem /
     // :feature:server / :feature:home / :feature:library / :feature:player / :feature:settings)
-    // 尚未创建,Task 1 只构建 :app,故不在此声明。
+    // 尚未创建,故不在此声明。:core:player 在 Task 9/10 引入,因为 PlaybackService 需要注册到本模块的 Manifest。
+    implementation(project(":core:player"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime)
