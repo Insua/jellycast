@@ -35,6 +35,9 @@ import kotlinx.serialization.Serializable
     @SerialName("RunTimeTicks") val runTimeTicks: Long? = null,
     @SerialName("UserData") val userData: UserDataDto? = null,
     @SerialName("MediaStreams") val mediaStreams: List<MediaStreamDto> = emptyList(),
+    // key 是 ImageType(如 "Primary"),value 是缓存 tag。核对 docs/jellyfin-openapi.json
+    // BaseItemDto.properties.ImageTags:object,additionalProperties: string。
+    @SerialName("ImageTags") val imageTags: Map<String, String>? = null,
 )
 
 @Serializable data class UserDataDto(
