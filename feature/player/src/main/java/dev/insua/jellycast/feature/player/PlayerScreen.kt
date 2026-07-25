@@ -112,7 +112,8 @@ fun PlayerScreen(
         Spacer(Modifier.height(16.dp))
         // 字幕加载中显示 loading,不复用 LyricsView 的"无字幕"占位文案——两者语义不同
         // (加载中 vs. 确认没有可用字幕),铁律要求字幕失败/加载都绝不打断播放,这里只是换一种展示。
-        if (uiState.isSubtitleLoading) {
+        // lyricsDisplayState 结构上没有 ERROR 分支,加载/空 timeline 都不会被渲染成错误提示。
+        if (lyricsDisplayState(uiState.isSubtitleLoading, uiState.subtitleTimeline) == LyricsDisplayState.LOADING) {
             Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator()
             }
