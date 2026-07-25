@@ -25,7 +25,15 @@
 **41 倍实时速度**(15 秒内取得 619 秒音频)。源音轨本就是 AAC,J4125 做音频转码/copy 无压力。
 **无需为 CPU 做任何降级设计。**
 
-## 3. 进度双向同步 —— ✅ 实测确认
+## 3. 进度双向同步 —— ⚠️ 只验证了服务端契约,**没有验证 App**(已更正)
+
+> **这一节原来写的是"✅ 实测确认",那个结论站不住,在此更正。**
+> 当时的验证是用 `curl` 手工打服务端接口做的,**全程没有经过 App**。而全支线复审(Critical 2)
+> 查明:`ProgressReporter` 当时没有任何生产调用方(全仓零非 DI 引用),App **一次进度都没上报过**。
+> 也就是说,原表格证明的是"Jellyfin 这几个接口按文档工作",不是"JellyCast 能同步进度"。
+> 只有读方向(启动时从 `UserData.PlaybackPositionTicks` 续播)是真的在工作。
+
+### 已验证(用 `curl` 直接打服务端,与 App 无关)
 
 | 步骤 | 结果 |
 |---|---|
@@ -34,7 +42,29 @@
 | ticks→ms 换算 | `500000 ms` = 8 分 20 秒,**精确无误** |
 | 出现在「继续收听」 | ✅ `GET /UserItems/Resume` 返回该集 |
 
-**ticks 换算端到端正确。** 手机听到的位置能被电视端 Jellyfin 读到。
+结论仅限于:**服务端接口契约与 ticks 换算公式(`ms = ticks / 10_000`)是对的**,请求体字段名与
+大小写核对 `docs/jellyfin-openapi.json` 无误。
+
+### 未验证 / 当时根本不成立
+
+| 项 | 状态 |
+|---|---|
+| App 真的发出 `POST /Sessions/Playing` / `/Progress` / `/Stopped` | ❌ 当时**完全没有**:`ProgressReporter` 没有生产调用方 |
+| Room 补报队列被排空 | ❌ 当时 `flushPending()` 从没被调用,队列只进不出 |
+| 成功标准 #3(手机听到 8:00,换电视接着看) | ❌ 当时不成立 |
+
+### 修正后的状态(本次修复)
+
+`PlaybackService` 现在驱动 `PlaybackProgressCoordinator`(源就绪 → start / 换集 → stop+start /
+seek → progress / 每 10s 心跳 / STATE_ENDED 与 onDestroy → stop,每次源就绪顺带 `flushPending()`),
+上报的位置取 `AudioPlaybackEngine.absolutePositionMs`(绝对位置)。这条链路上"什么时候上报什么"
+由 11 个离线单测覆盖。
+
+**但仍然待真机 + 凭据人工验收(见文末清单):**
+
+- [ ] 用 App 播一集到 8:00,在 Jellyfin Web 端看到相同进度(端到端写方向)
+- [ ] 断网播一段 → 恢复网络 → 确认 Room 补报队列被排空、进度补上
+- [ ] 上报的位置是绝对位置(seek/续播之后不会把进度往回冲)
 
 ## 4. 模拟器 → Tailscale 可达性 —— ✅ 实测确认
 
@@ -59,7 +89,7 @@
 
 | 项 | 结果 |
 |---|---|
-| `./gradlew test` | **BUILD SUCCESSFUL,179 个 JVM 单测全绿** |
+| `./gradlew test` | **BUILD SUCCESSFUL,229 个 JVM 单测全绿**(全支线复审修正前是 179) |
 | `:core:database:connectedDebugAndroidTest` | 4 个 Room 测试真机全绿 |
 | `:core:designsystem:connectedDebugAndroidTest` | 5 个 Compose UI 测试真机全绿 |
 | `:app:assembleDebug` | 成功 |
@@ -85,6 +115,13 @@
 - [ ] 手动滚动歌词后 3 秒恢复自动跟随
 - [ ] 倍速、睡眠定时(含**「播完本集」**模式)生效
 - [ ] 自动连播下一集,且连播后**锁屏 seek 仍指向新的一集**(引擎状态同步)
+- [ ] 自动连播换集后**封面不变空白**(复审 Important 4:NextUp 补充的条目要带 `imageTag`)
+- [ ] **从中途续播一集,歌词第一帧就对准当前音频**(复审 Critical 1:绝对位置)
+- [ ] 续播后按快进 30s 是往前 30 秒,不是跳回开头附近(播放页按钮 + 锁屏 + 蓝牙三条路各验一次)
+- [ ] 播放页进度条显示的总时长是这一集的真实时长(不是钉在 100%)
+- [ ] 暂停 → 从最近任务划掉 App → 再打开 → **还能正常播放**(复审 Important 3:播放器没被释放)
+- [ ] 设置里改倍速,正在播放的内容**立刻变速**;杀进程重开后倍速被记住(复审 Important 5)
+- [ ] 设置里关掉「歌词式字幕」,播放页不再滚字幕(复审 Minor 6)
 - [ ] 从家里 WiFi 切到移动网络,自动切 endpoint 且续播
 - [ ] `android:exported="false"` 是否影响系统媒体发现(若失效则改回 `true`)
 
@@ -109,4 +146,8 @@ Spike-3 未完成 —— 缺 DDNS 域名。Tailscale 侧 8920 端口不可达。
 | 音频码率 / serverId 在 DI 建图时快照 | 改动需重启进程 |
 | 自签证书信任表为启动时快照 | 新确认的证书对 Coil / 字幕需重启生效(API 路径不受影响) |
 | 自动连播时 `resolve()` 被调两次 | 每次切集多一次网络请求,换取引擎状态强一致 |
+| `@Singleton ExoPlayer` 不随 Service 释放 | 复审 Important 3 的决定:Service 销毁只 `stop()` + `clearMediaItems()` + 释放 MediaSession,不 `release()` 播放器。宁可留一个空闲播放器,也不要留一个已释放的死对象(否则重开 App 必崩在 prepare 上,还被静默转成「该条目无法播放」)。真正回收交给进程结束 |
+| 进程被系统直接杀掉时最后一次 `stop` 上报会丢 | 10 秒心跳保证 Jellyfin 里的进度最多落后 10 秒 |
+| 每次 seek 都重新 resolve → 服务端起一次新转码 | `Accept-Ranges: none` 下没有别的选择;拖动进度条已经做成"只在松手时 seek 一次"来抑制抖动 |
+| 音轨选择在 L1 不可用 | `/Audio/{itemId}/universal` 没有 `audioStreamIndex` 参数(已核对 OpenAPI),见设计文档 §3.5 的边界说明。不为了这个功能默认降级到 L3 |
 | TOFU 残余风险 | 若攻击者恰在用户确认证书的那一刻 MITM,其证书会被固定。UI 已显示指纹与 URL 供用户核对 |

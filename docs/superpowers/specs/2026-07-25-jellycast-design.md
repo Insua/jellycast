@@ -120,8 +120,28 @@ Server(一台 Jellyfin 服务器)
 | 倍速 | 0.5x – 3.0x,记忆上次设置 |
 | 快退 / 快进 | 15s / 30s(可在设置中调整) |
 | 睡眠定时 | 15/30/45/60 分钟 + "播完本集" |
-| 音轨选择 | 支持(多语言音轨) |
-| 进度同步 | 双向同步回 Jellyfin |
+| 音轨选择 | **仅 L3 路径支持**(见下方说明) |
+| 进度同步 | 双向同步回 Jellyfin(客户端每 10s 上报一次 + seek 时立即上报,失败入队补报) |
+
+#### 音轨选择的真实边界(v1 已知限制)
+
+原表格写的是"支持(多语言音轨)",这是**无条件承诺,与 API 事实不符**,在此更正:
+
+- **L1(`GET /Audio/{itemId}/universal`)不支持选音轨。** 核对 `docs/jellyfin-openapi.json`:该端点的
+  查询参数只有 `container / mediaSourceId / deviceId / userId / audioCodec / maxAudioChannels /
+  transcodingAudioChannels / maxStreamingBitrate / audioBitRate / startTimeTicks / transcodingContainer /
+  transcodingProtocol / maxAudioSampleRate / maxAudioBitDepth / enableRemoteMedia /
+  enableAudioVbrEncoding / breakOnNonKeyFrames / enableRedirection` —— **没有 `audioStreamIndex`**。
+  服务端输出的是它自己挑好的单一音轨,客户端无从指定;`Player.getCurrentTracks()` 也就只会报一条音轨。
+- **L3(`GET /Videos/{itemId}/stream?static=true`)支持。** 直通原始容器,原文件里的多条音轨都在流里,
+  用 Media3 的 `TrackSelectionOverride` 正常切换(`PlayerViewModel.onCycleAudioTrack`)。
+
+因此播放页的"音轨"按钮在 L1 下是 no-op(`audioGroups.size <= 1` 直接返回),这是**符合 API 事实的
+预期行为,不是缺陷**。而 L1 是本产品的核心价值路径(流量省 40 倍),绝不会为了让音轨切换可用而
+默认降级到 L3。
+
+> 若将来要在纯音频路径上支持选音轨,唯一可行方向是改用带 `audioStreamIndex` 参数的
+> `/Videos/{itemId}/stream` 系列端点并要求服务端只转码音频轨——那是 v2 的事,需要重新做 Spike。
 
 ---
 
@@ -304,7 +324,7 @@ Server(一台 Jellyfin 服务器)
 
 ## 11. v1 范围边界
 
-**做:** 多服务器 + 多接入地址自动选路 / 剧集 + 电影 / 纯音频播放(三级降级)/ 歌词式字幕 / 后台播放与锁屏控制 / 倍速 · 睡眠定时 · 快进快退 / 自动连播 / 音轨选择 / 进度双向同步
+**做:** 多服务器 + 多接入地址自动选路 / 剧集 + 电影 / 纯音频播放(实际两级降级 L1+L3,L2 经 Spike 证实永不可达)/ 歌词式字幕 / 后台播放与锁屏控制 / 倍速 · 睡眠定时 · 快进快退 / 自动连播 / **音轨选择(仅 L3,见 §3.5 的边界说明)** / 进度双向同步
 
 **明确不做:**
 - ❌ 离线下载(v2)
