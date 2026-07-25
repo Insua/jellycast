@@ -1,5 +1,7 @@
 plugins {
     alias(libs.plugins.android.library)
+    alias(libs.plugins.hilt)
+    alias(libs.plugins.ksp)
 }
 // 注意:AGP 9 内置 Kotlin 支持,不 apply kotlin-android 插件。
 
@@ -23,6 +25,11 @@ dependencies {
     implementation(project(":core:network"))
 
     implementation(libs.kotlinx.coroutines)
+    implementation(libs.media3.exoplayer)
+    implementation(libs.media3.exoplayer.hls)
+    implementation(libs.media3.session)
+    implementation(libs.hilt.android)
+    ksp(libs.hilt.compiler)
 
     testImplementation(libs.junit.jupiter)
     testRuntimeOnly(libs.junit.platform.launcher)
