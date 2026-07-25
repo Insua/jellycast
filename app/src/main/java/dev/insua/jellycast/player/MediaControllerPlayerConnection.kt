@@ -88,6 +88,18 @@ class MediaControllerPlayerConnection @Inject constructor(
         )
     }
 
+    /**
+     * 复审 Critical 1:位置的唯一权威是 [AudioPlaybackEngine.absolutePositionMs](条目内绝对位置),
+     * 不是 [MediaController.getCurrentPosition](那是转码流内的相对位置,每次 seek/续播归零)。
+     *
+     * 走引擎而不是 MediaController 还顺带避免了 `MediaController` 对位置的外推(它按上次上报的位置
+     * + 经过的真实时间 × 倍速估算),歌词定位对这点抖动是敏感的。
+     *
+     * 线程:调用方是 ViewModel 的 `viewModelScope`(Dispatchers.Main),而引擎内部读的是
+     * `ExoPlayer.currentPosition`——必须在 ExoPlayer 的 application thread(本项目即主线程)上读。
+     */
+    override fun absolutePositionMs(): Long = audioPlaybackEngine.absolutePositionMs
+
     override fun setStopAfterCurrentEpisode(armed: Boolean) {
         // 修正 §8g:真正的停止决策在 AutoPlayNextController(core:player),这里只转发。
         if (armed) autoPlayNextController.armStopAfterCurrentEpisode() else autoPlayNextController.disarmStopAfterCurrentEpisode()

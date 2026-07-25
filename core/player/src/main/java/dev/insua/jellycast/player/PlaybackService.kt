@@ -55,6 +55,9 @@ class PlaybackService : MediaSessionService() {
     lateinit var autoPlayNextController: AutoPlayNextController
 
     @Inject
+    lateinit var playQueue: PlayQueue
+
+    @Inject
     lateinit var jellyfinSession: JellyfinSession
 
     @Inject
@@ -74,7 +77,16 @@ class PlaybackService : MediaSessionService() {
         val router = SeekRouter { positionMs ->
             engine?.let { e -> serviceScope.launch { e.seekTo(positionMs) } }
         }
-        val sessionPlayer = SeekInterceptingPlayer(exoPlayer, router)
+        // 复审 Critical 1:交给 MediaSession 的这个 Player 必须报**条目内绝对位置**和**元数据总时长**。
+        // 锁屏/通知栏/蓝牙的进度条与快进快退全部读它;底层 ExoPlayer 报的是转码流内的相对位置
+        // (每次 seek/续播归零)和常为 C.TIME_UNSET 的时长,两个都不能直接用。
+        // 时长取自 PlayQueue 当前项的 runTimeMs —— PlayQueue 只认识 :core:model 的 MediaItem,
+        // 这里没有引入任何 Jellyfin DTO 依赖(设计文档 §5 的模块边界)。
+        val sessionPlayer = SeekInterceptingPlayer(
+            exoPlayer,
+            router,
+            playbackEngine.asAbsoluteTimeline { playQueue.current.value?.runTimeMs },
+        )
         mediaSession = MediaSession.Builder(this, sessionPlayer).build()
 
         // 修正 §1(a):真正的生产调用方——没有这一行,锁屏/通知栏/蓝牙拖进度条会被

@@ -65,7 +65,32 @@ class EngineSeekRouter(
 class SeekInterceptingPlayer(
     player: Player,
     private val seekRouter: SeekRouter,
+    private val absoluteTimeline: AbsoluteTimeline = AbsoluteTimeline.Unknown,
 ) : ForwardingPlayer(player) {
+
+    /**
+     * 全支线复审 Critical 1:底层 `currentPosition` 是**流内相对位置**,每次 seek/续播换流都从 0
+     * 重新开始。锁屏进度条、蓝牙"快进 30 秒"、`MediaController` 报给 UI 的位置全都读这个方法,
+     * 所以这里必须改报 [AbsoluteTimeline] 给的条目内绝对位置——否则从 8:00 续播时锁屏显示 0:00,
+     * 按一下快进键会往回跳 7 分半。
+     *
+     * 下面 [seekBack] / [seekForward] 用的 `currentPosition` 也就是这个覆写(虚方法分派),
+     * 于是"所有 seek 起点都过绝对位置"这件事在这一层是结构性的,不靠调用方自觉。
+     */
+    override fun getCurrentPosition(): Long = absoluteTimeline.absolutePositionMs() ?: super.getCurrentPosition()
+
+    /** 本项目没有广告插播,内容位置恒等于播放位置;`MediaSession` 读的是这个,一并覆写保持一致。 */
+    override fun getContentPosition(): Long = absoluteTimeline.absolutePositionMs() ?: super.getContentPosition()
+
+    /**
+     * 转码流是 chunked AAC,底层 `duration` 往往是 `C.TIME_UNSET`——锁屏/通知栏拿它当总时长会
+     * 让进度条钉在 100%,一拖就把当前集从头开始(复审 Critical 1 的第四条)。权威总时长是
+     * Jellyfin 元数据的 `runTimeMs`,由 [AbsoluteTimeline] 提供。
+     */
+    override fun getDuration(): Long = absoluteTimeline.absoluteDurationMs()?.takeIf { it > 0L } ?: super.getDuration()
+
+    override fun getContentDuration(): Long =
+        absoluteTimeline.absoluteDurationMs()?.takeIf { it > 0L } ?: super.getContentDuration()
 
     override fun seekToDefaultPosition() {
         seekRouter.seekTo(0L)
@@ -83,6 +108,8 @@ class SeekInterceptingPlayer(
         seekRouter.seekTo(positionMs)
     }
 
+    // 注意:下面两个方法里的 `currentPosition` 是本类覆写的那个(绝对位置),不是底层 player 的
+    // 流内相对位置。这是复审 Critical 1 的修正点——锁屏与蓝牙耳机的快进快退走的就是这条路。
     override fun seekBack() {
         val target = (currentPosition - seekBackIncrement).coerceAtLeast(0L)
         seekRouter.seekTo(target)

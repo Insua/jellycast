@@ -51,6 +51,7 @@ class SeekInterceptingPlayerTest {
         }
         val preparedUrls = mutableListOf<String>()
         val playerControl = object : PlayerControl {
+            override val currentPositionMs: Long = 0L
             override fun setMediaItemAndPrepare(url: String) { preparedUrls += url }
             override fun release() {}
         }
@@ -72,7 +73,7 @@ class SeekInterceptingPlayerTest {
     @Test fun `seekTo(long) 路由给 SeekRouter,不落到底层 player`() {
         val underlying = mockk<Player>(relaxed = true)
         val seen = mutableListOf<Long>()
-        val sessionPlayer = SeekInterceptingPlayer(underlying) { seen += it }
+        val sessionPlayer = SeekInterceptingPlayer(underlying, SeekRouter { seen += it })
 
         sessionPlayer.seekTo(12_345L)
 
@@ -83,7 +84,7 @@ class SeekInterceptingPlayerTest {
     @Test fun `seekTo(mediaItemIndex, positionMs) 路由给 SeekRouter,不落到底层 player`() {
         val underlying = mockk<Player>(relaxed = true)
         val seen = mutableListOf<Long>()
-        val sessionPlayer = SeekInterceptingPlayer(underlying) { seen += it }
+        val sessionPlayer = SeekInterceptingPlayer(underlying, SeekRouter { seen += it })
 
         sessionPlayer.seekTo(0, 7_000L)
 
@@ -94,7 +95,7 @@ class SeekInterceptingPlayerTest {
     @Test fun `seekToDefaultPosition 家族路由为 seek 到 0,不落到底层 player`() {
         val underlying = mockk<Player>(relaxed = true)
         val seen = mutableListOf<Long>()
-        val sessionPlayer = SeekInterceptingPlayer(underlying) { seen += it }
+        val sessionPlayer = SeekInterceptingPlayer(underlying, SeekRouter { seen += it })
 
         sessionPlayer.seekToDefaultPosition()
         sessionPlayer.seekToDefaultPosition(0)
@@ -104,12 +105,30 @@ class SeekInterceptingPlayerTest {
         verify(exactly = 0) { underlying.seekToDefaultPosition(any()) }
     }
 
-    @Test fun `seekBack 用底层当前进度和回退步长算出目标位置再路由,不调用底层 seekBack`() {
+    /**
+     * 只提供绝对位置、不提供总时长的假 [AbsoluteTimeline]。
+     *
+     * ⚠️ **重新基线说明(全支线复审 Critical 1)**:下面三个 seekBack/seekForward 测试原来把
+     * `underlying.currentPosition` 打桩成 20_000 / 5_000,并断言目标位置由**底层 player 的位置**
+     * 算出。那个断言把缺陷写死成了规格:底层 `currentPosition` 是"当前这条转码流里播了多久",
+     * 每次 seek/续播换流都从 0 重新开始,不是条目内绝对位置。以它为快进快退起点,从 8:00 续播后
+     * 按一下快进就会跳到 0:30(往回 7 分半)。
+     *
+     * 现在断言的期望值一个都没放松(仍然是 5_000 / 0 / 50_000),但**位置的来源换成了权威的
+     * 绝对时间轴**,并且把 `underlying.currentPosition` 打桩成一个明显不同的值——如果实现回退去读
+     * 底层位置,这三个测试立刻变红。
+     */
+    private fun absoluteTimeline(positionMs: Long) = object : AbsoluteTimeline {
+        override fun absolutePositionMs(): Long = positionMs
+        override fun absoluteDurationMs(): Long? = null
+    }
+
+    @Test fun `seekBack 用绝对位置和回退步长算出目标位置再路由,不读底层流内相对位置,不调用底层 seekBack`() {
         val underlying = mockk<Player>(relaxed = true)
-        every { underlying.currentPosition } returns 20_000L
+        every { underlying.currentPosition } returns 3_000L      // 流内相对位置:不该被用到
         every { underlying.seekBackIncrement } returns 15_000L
         val seen = mutableListOf<Long>()
-        val sessionPlayer = SeekInterceptingPlayer(underlying) { seen += it }
+        val sessionPlayer = SeekInterceptingPlayer(underlying, SeekRouter { seen += it }, absoluteTimeline(20_000L))
 
         sessionPlayer.seekBack()
 
@@ -119,27 +138,40 @@ class SeekInterceptingPlayerTest {
 
     @Test fun `seekBack 不会算出负数位置`() {
         val underlying = mockk<Player>(relaxed = true)
-        every { underlying.currentPosition } returns 5_000L
+        every { underlying.currentPosition } returns 999_000L     // 流内相对位置:不该被用到
         every { underlying.seekBackIncrement } returns 15_000L
         val seen = mutableListOf<Long>()
-        val sessionPlayer = SeekInterceptingPlayer(underlying) { seen += it }
+        val sessionPlayer = SeekInterceptingPlayer(underlying, SeekRouter { seen += it }, absoluteTimeline(5_000L))
 
         sessionPlayer.seekBack()
 
         assertEquals(listOf(0L), seen)
     }
 
-    @Test fun `seekForward 用底层当前进度和快进步长算出目标位置再路由,不调用底层 seekForward`() {
+    @Test fun `seekForward 用绝对位置和快进步长算出目标位置再路由,不读底层流内相对位置,不调用底层 seekForward`() {
         val underlying = mockk<Player>(relaxed = true)
-        every { underlying.currentPosition } returns 20_000L
+        every { underlying.currentPosition } returns 3_000L       // 流内相对位置:不该被用到
         every { underlying.seekForwardIncrement } returns 30_000L
         val seen = mutableListOf<Long>()
-        val sessionPlayer = SeekInterceptingPlayer(underlying) { seen += it }
+        val sessionPlayer = SeekInterceptingPlayer(underlying, SeekRouter { seen += it }, absoluteTimeline(20_000L))
 
         sessionPlayer.seekForward()
 
         assertEquals(listOf(50_000L), seen)
         verify(exactly = 0) { underlying.seekForward() }
+    }
+
+    /** 没有接绝对时间轴时(默认 [AbsoluteTimeline.Unknown])必须安全回退到底层 player,而不是报 0。 */
+    @Test fun `未接绝对时间轴时回退到底层 player 的位置,不至于把起点当成 0`() {
+        val underlying = mockk<Player>(relaxed = true)
+        every { underlying.currentPosition } returns 20_000L
+        every { underlying.seekForwardIncrement } returns 30_000L
+        val seen = mutableListOf<Long>()
+        val sessionPlayer = SeekInterceptingPlayer(underlying, SeekRouter { seen += it })
+
+        sessionPlayer.seekForward()
+
+        assertEquals(listOf(50_000L), seen)
     }
 
     /**
@@ -161,6 +193,7 @@ class SeekInterceptingPlayerTest {
         }
         val preparedUrls = mutableListOf<String>()
         val playerControl = object : PlayerControl {
+            override val currentPositionMs: Long = 0L
             override fun setMediaItemAndPrepare(url: String) { preparedUrls += url }
             override fun release() {}
         }

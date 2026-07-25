@@ -37,6 +37,20 @@ data class MiniPlayerUiState(
 )
 
 /**
+ * 迷你条进度比例。纯函数,可离线单测(项目铁律 6)。
+ *
+ * 复审 Critical 1:[positionMs] 必须是 `AudioPlaybackEngine.absolutePositionMs` 给的**绝对**位置,
+ * [durationMs] 必须是元数据 `MediaItem.runTimeMs` —— 转码流的 `Player.currentPosition` 每次 seek/
+ * 续播归零、`Player.duration` 常是 `C.TIME_UNSET`,两个都不能用。
+ *
+ * 时长未知(null / <= 0)时返回 0f 而不是除零或钉在 100%。
+ */
+internal fun miniPlayerProgress(positionMs: Long, durationMs: Long?): Float {
+    if (durationMs == null || durationMs <= 0L) return 0f
+    return (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+}
+
+/**
  * [JellyCastNavHost] 顶层需要、但不属于任何单一 `:feature` 模块的会话/播放启动状态:
  * - 起点判定([startDestination]):有已登录服务器 → `home`,否则 → `servers`(修正 §9)。
  * - 常驻迷你播放条的数据源([miniPlayer])。
@@ -98,13 +112,16 @@ class AppSessionViewModel @Inject constructor(
                 val posterUrl = baseUrl.value.takeIf { it.isNotBlank() }?.let { info.mediaItem.posterUrl(it) }
                 while (currentCoroutineContext().isActive) {
                     val player = playerConnection.player.value
-                    val duration = player?.duration?.takeIf { it > 0L }
                     _miniPlayer.value = MiniPlayerUiState(
                         title = info.mediaItem.name,
                         subtitle = info.mediaItem.displaySubtitle,
                         posterUrl = posterUrl,
                         isPlaying = player?.isPlaying == true,
-                        progress = if (duration != null) (player.currentPosition.toFloat() / duration) else 0f,
+                        // 复审 Critical 1:位置走引擎的绝对位置、时长走元数据 runTimeMs。
+                        progress = miniPlayerProgress(
+                            positionMs = audioPlaybackEngine.absolutePositionMs,
+                            durationMs = info.mediaItem.runTimeMs,
+                        ),
                     )
                     delay(MINI_PLAYER_POLL_INTERVAL_MS)
                 }

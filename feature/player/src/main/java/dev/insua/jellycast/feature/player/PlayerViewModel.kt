@@ -53,6 +53,17 @@ interface PlayerConnection {
     val nowPlaying: StateFlow<NowPlayingInfo?>
 
     /**
+     * **条目内绝对播放位置(ms)**,由 `:core:player` 的 `AudioPlaybackEngine.absolutePositionMs`
+     * 提供(全支线复审 Critical 1)。
+     *
+     * 为什么不直接读 `player.currentPosition`:Spike 实测转码流 `Accept-Ranges: none`,seek 与续播
+     * 都实现成"重新 resolve 一条从目标位置开始的新流",于是 `Player.currentPosition` 每换一条流就
+     * 从 0 重新开始——它回答的是"这条流里播了多久",不是"这一集听到第几分钟"。字幕时间戳是绝对的,
+     * 快进快退的起点也必须是绝对的,所以位置只有这一个权威来源。
+     */
+    fun absolutePositionMs(): Long
+
+    /**
      * 「播完本集」睡眠定时模式(Finding 1)的落地接缝:真正决定"下一集要不要开始播放"的地方是
      * `:core:player` 的 `AutoPlayNextController.onPlaybackEnded()`(在收到 `STATE_ENDED` 时被调用),
      * 不是这个 ViewModel。这里只负责把用户的选择转发出去——Task 22 提供的真实实现必须把 [armed]
@@ -126,6 +137,8 @@ class PlayerViewModel @Inject constructor(
                 _uiState.update {
                     it.copy(
                         mediaItem = info?.mediaItem,
+                        // 元数据总时长是权威(见 resolveDurationMs);换集时立刻生效,不等下一次轮询。
+                        durationMs = info?.mediaItem?.runTimeMs?.coerceAtLeast(0L) ?: 0L,
                         audioTracks = info?.audioTracks.orEmpty(),
                         subtitleTracks = info?.subtitleTracks.orEmpty(),
                         isSubtitleLoading = info != null,
@@ -170,6 +183,15 @@ class PlayerViewModel @Inject constructor(
      * 同步进 [uiState]。用 collectLatest 绑定到具体的 player 实例——一旦 [PlayerConnection.player]
      * 发出新值(重连/置空),旧的轮询协程自动取消,不会有两个轮询并存。
      */
+    /**
+     * 位置与时长的来源(全支线复审 Critical 1):
+     * - `positionMs` 读 [PlayerConnection.absolutePositionMs] —— **不是** `player.currentPosition`
+     *   (那是转码流内的相对位置,每次 seek/续播归零,见该方法 KDoc)。歌词定位、进度条、快进快退
+     *   全部基于这个值,所以三者不可能互相矛盾。
+     * - `durationMs` 以元数据 [MediaItem.runTimeMs] 为权威,只在元数据缺失时才回退到
+     *   `player.duration`;chunked AAC 转码流的 `duration` 常常是 `C.TIME_UNSET`(负数),
+     *   直接用会让进度条钉在 100%、一拖就从头播。
+     */
     private fun observePlaybackState() {
         viewModelScope.launch {
             connection.player.collectLatest { player ->
@@ -178,8 +200,8 @@ class PlayerViewModel @Inject constructor(
                     _uiState.update {
                         it.copy(
                             isPlaying = player.isPlaying,
-                            positionMs = player.currentPosition.coerceAtLeast(0L),
-                            durationMs = player.duration.coerceAtLeast(0L),
+                            positionMs = connection.absolutePositionMs().coerceAtLeast(0L),
+                            durationMs = resolveDurationMs(it.mediaItem, player),
                             playbackSpeed = player.playbackParameters.speed,
                         )
                     }
@@ -187,6 +209,11 @@ class PlayerViewModel @Inject constructor(
                 }
             }
         }
+    }
+
+    private fun resolveDurationMs(mediaItem: MediaItem?, player: Player): Long {
+        mediaItem?.runTimeMs?.takeIf { it > 0L }?.let { return it }
+        return player.duration.takeIf { it != C.TIME_UNSET && it > 0L } ?: 0L
     }
 
     private fun observePreferences() {
@@ -212,16 +239,21 @@ class PlayerViewModel @Inject constructor(
         connection.player.value?.seekTo(positionMs.coerceAtLeast(0L))
     }
 
+    /**
+     * 快退/快进的起点是**绝对位置**(复审 Critical 1)。用 `player.currentPosition` 的旧实现在
+     * 从 8:00 续播后会算出 0:30——往回跳 7 分半;钳制上界也必须用元数据总时长,不是
+     * `player.duration`(转码流常为 `C.TIME_UNSET`)。
+     */
     fun onSkipBack() {
-        val player = connection.player.value ?: return
-        val target = player.currentPosition - _uiState.value.rewindSeconds * 1000L
+        if (connection.player.value == null) return
+        val target = connection.absolutePositionMs() - _uiState.value.rewindSeconds * 1000L
         onSeek(target.coerceAtLeast(0L))
     }
 
     fun onSkipForward() {
-        val player = connection.player.value ?: return
-        val duration = player.duration.takeIf { it > 0 } ?: Long.MAX_VALUE
-        val target = player.currentPosition + _uiState.value.forwardSeconds * 1000L
+        if (connection.player.value == null) return
+        val duration = _uiState.value.durationMs.takeIf { it > 0L } ?: Long.MAX_VALUE
+        val target = connection.absolutePositionMs() + _uiState.value.forwardSeconds * 1000L
         onSeek(target.coerceAtMost(duration))
     }
 

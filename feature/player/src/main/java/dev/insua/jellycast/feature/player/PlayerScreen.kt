@@ -223,24 +223,28 @@ private fun TitleBlock(mediaItem: MediaItem?) {
 @Composable
 private fun ProgressSection(positionMs: Long, durationMs: Long, onSeek: (Long) -> Unit) {
     var draggingFraction by remember { mutableStateOf<Float?>(null) }
-    val safeDuration = durationMs.coerceAtLeast(1L)
-    val playedFraction = (positionMs.toFloat() / safeDuration.toFloat()).coerceIn(0f, 1f)
+    // 复审 Critical 1 第四条:总时长未知时**不能**把它钳成 1L —— 那样进度条永远显示 100%,
+    // 用户一拖就 onSeek(≈0) 把这一集从头开始。总时长权威来自元数据 runTimeMs(见 PlayerViewModel);
+    // 真的拿不到时(接口没返回 RunTimeTicks)就禁用滑块、时长显示 --:--,而不是给一个会误伤的假进度。
+    val hasDuration = durationMs > 0L
+    val playedFraction = if (hasDuration) (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f) else 0f
     val displayedFraction = draggingFraction ?: playedFraction
 
     Column(modifier = Modifier.fillMaxWidth()) {
         Slider(
             value = displayedFraction,
+            enabled = hasDuration,
             onValueChange = { draggingFraction = it },
             onValueChangeFinished = {
                 val fraction = draggingFraction ?: return@Slider
-                onSeek((fraction * safeDuration).toLong())
+                if (hasDuration) onSeek((fraction * durationMs).toLong())
                 draggingFraction = null
             },
         )
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text(formatTimestamp(positionMs), style = MaterialTheme.typography.labelMedium)
             Text(
-                "已听 ${formatTimestamp(positionMs)} / ${formatTimestamp(durationMs)}",
+                "已听 ${formatTimestamp(positionMs)} / ${if (hasDuration) formatTimestamp(durationMs) else "--:--"}",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
