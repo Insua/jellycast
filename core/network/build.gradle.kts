@@ -1,6 +1,8 @@
 plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.kotlin.serialization)
+    alias(libs.plugins.hilt)
+    alias(libs.plugins.ksp)
 }
 // 注意:AGP 9 内置 Kotlin 支持,不 apply kotlin-android 插件。
 
@@ -21,12 +23,17 @@ kotlin {
 
 dependencies {
     implementation(project(":core:model"))
+    // TrustAwareHttpClientModule 需要 ServerStore 读取每个 endpoint 已确认的自签证书指纹
+    // 白名单(Finding 2:这个 provider 从 :app 挪过来,详见该文件 KDoc)。
+    implementation(project(":core:datastore"))
 
     implementation(libs.retrofit)
     implementation(libs.retrofit.serialization)
     implementation(libs.okhttp)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.kotlinx.coroutines)
+    implementation(libs.hilt.android)
+    ksp(libs.hilt.compiler)
 
     testImplementation(libs.junit.jupiter)
     testRuntimeOnly(libs.junit.platform.launcher)

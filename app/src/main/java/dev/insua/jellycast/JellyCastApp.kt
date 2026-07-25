@@ -6,7 +6,7 @@ import coil3.PlatformContext
 import coil3.SingletonImageLoader
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import dagger.hilt.android.HiltAndroidApp
-import dev.insua.jellycast.di.TrustAwareHttpClient
+import dev.insua.jellycast.network.di.TrustAwareHttpClient
 import okhttp3.OkHttpClient
 import javax.inject.Inject
 

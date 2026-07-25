@@ -13,6 +13,7 @@ import dev.insua.jellycast.database.buildJellyCastDatabase
 import dev.insua.jellycast.datastore.PreferencesStore
 import dev.insua.jellycast.datastore.ServerStore
 import dev.insua.jellycast.network.JellyfinApi
+import dev.insua.jellycast.network.di.TrustAwareHttpClient
 import dev.insua.jellycast.network.session.JellyfinSession
 import dev.insua.jellycast.player.AudioPlaybackEngine
 import dev.insua.jellycast.player.AudioPlaybackEngineImpl
@@ -44,12 +45,17 @@ import javax.inject.Singleton
 @InstallIn(SingletonComponent::class)
 object PlayerModule {
 
-    /** 只用于 [HttpStreamProbe] 探测流的 Content-Type,不需要认证 token,普通 client 即可。 */
+    /**
+     * ⚠️ Finding 2(已闭合):[HttpStreamProbe] 探测的是 L1 候选 URL 本身——如果这条 URL 挂在一个
+     * 自签证书的 endpoint 上,用不认得该证书的裸 `OkHttpClient()` 探测必定
+     * `SSLHandshakeException`,而 [PlaybackSourceResolver] 把探测异常静默当"不是纯音频"处理、
+     * 直接退化到 L3(全量视频流,~42 倍带宽)——这是本产品要不惜代价避免的"用户毫无感知的
+     * 最坏降级"。改用 [TrustAwareHttpClient],和 Coil/字幕共用同一份"系统信任优先、白名单里
+     * 用户确认过的指纹兜底"的证书策略(`:core:network` 的 `trustPinnedSelfSigned`),不新增任何
+     * TrustManager/HostnameVerifier。
+     */
     @Provides
-    fun provideStreamProbeOkHttpClient(): OkHttpClient = OkHttpClient()
-
-    @Provides
-    fun provideStreamProbe(client: OkHttpClient): StreamProbe = HttpStreamProbe(client)
+    fun provideStreamProbe(@TrustAwareHttpClient client: OkHttpClient): StreamProbe = HttpStreamProbe(client)
 
     /**
      * [PlaybackSourceResolver] 的 `baseUrlProvider`/`tokenProvider` 是同步 lambda(见接口 KDoc),

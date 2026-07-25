@@ -5,6 +5,7 @@ import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
 import dev.insua.jellycast.feature.player.PlayerConnection
+import dev.insua.jellycast.network.di.TrustAwareHttpClient
 import dev.insua.jellycast.network.session.JellyfinSession
 import dev.insua.jellycast.player.MediaControllerPlayerConnection
 import dev.insua.jellycast.subtitle.SubtitleRepository
