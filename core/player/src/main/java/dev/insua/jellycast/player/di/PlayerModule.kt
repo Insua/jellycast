@@ -20,6 +20,7 @@ import dev.insua.jellycast.player.AudioPlaybackEngineImpl
 import dev.insua.jellycast.player.AutoPlayNextController
 import dev.insua.jellycast.player.ExoPlayerControl
 import dev.insua.jellycast.player.HttpStreamProbe
+import dev.insua.jellycast.player.PlaybackProgressCoordinator
 import dev.insua.jellycast.player.PlaybackSourceProvider
 import dev.insua.jellycast.player.PlaybackSourceResolver
 import dev.insua.jellycast.player.PlayQueue
@@ -136,6 +137,7 @@ object PlayerModule {
      * 不会更新这个值(本地补报队列的分区键),需要重启进程才会用新服务器的 id。记录在任务报告里。
      */
     @Provides
+    @Singleton
     fun provideProgressReporter(
         api: JellyfinApi,
         dao: ProgressReportDao,
@@ -144,4 +146,24 @@ object PlayerModule {
         val serverId = runBlocking { serverStore.activeServerId.first() } ?: "unknown-server"
         return ProgressReporter(api, dao, serverId)
     }
+
+    /**
+     * 闭合复审 Critical 2:[ProgressReporter] 此前只被 provide、没有任何注入点,进度上报的写方向
+     * 根本不存在。真正的驱动方是 `PlaybackService`(见其 `observeProgressReporting`),决策逻辑在
+     * 这个已单测的协调器里。
+     *
+     * 必须是 `@Singleton`,而且必须和 `PlaybackService` 的生命周期解耦:Service 可能被销毁后重建
+     * (划掉最近任务、系统回收),而 `AudioPlaybackEngine` 是单例、它的 `state` 是 StateFlow ——
+     * Service 重建后会立刻重放当前那个 `Ready`。协调器留着"上一次报的是哪个条目"这份状态,才能把
+     * 这次重放识别成"同一条目"而发 progress,不会重复发一次 `Sessions/Playing` 凭空多出一个播放会话。
+     *
+     * 位置 lambda 接的是绝对位置权威(复审 Critical 1)。
+     */
+    @Provides
+    @Singleton
+    fun providePlaybackProgressCoordinator(
+        reporter: ProgressReporter,
+        engine: AudioPlaybackEngine,
+    ): PlaybackProgressCoordinator =
+        PlaybackProgressCoordinator(reporter) { engine.absolutePositionMs }
 }

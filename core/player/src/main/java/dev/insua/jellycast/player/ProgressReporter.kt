@@ -29,7 +29,7 @@ class ProgressReporter(
     private val api: JellyfinApi,
     private val dao: ProgressReportDao,
     private val serverId: String,
-) {
+) : ProgressSink {
     /**
      * [ProgressReportDao.pending] 没有取走/加锁标记:如果 [flushPending] 被并发触发(例如两次
      * 网络恢复回调连续到达),两次调用会读到重叠的行、重复上报。用 [Mutex] 把 flushPending 串行
@@ -37,7 +37,7 @@ class ProgressReporter(
      */
     private val flushMutex = Mutex()
 
-    suspend fun start(itemId: String, sessionId: String?, positionMs: Long) {
+    override suspend fun start(itemId: String, sessionId: String?, positionMs: Long) {
         reportOrEnqueue(KIND_START, itemId, sessionId, positionMs) {
             api.reportStart(
                 PlaybackStartInfoDto(
@@ -49,7 +49,7 @@ class ProgressReporter(
         }
     }
 
-    suspend fun progress(itemId: String, sessionId: String?, positionMs: Long) {
+    override suspend fun progress(itemId: String, sessionId: String?, positionMs: Long) {
         reportOrEnqueue(KIND_PROGRESS, itemId, sessionId, positionMs) {
             api.reportProgress(
                 PlaybackProgressInfoDto(
@@ -61,7 +61,7 @@ class ProgressReporter(
         }
     }
 
-    suspend fun stop(itemId: String, sessionId: String?, positionMs: Long) {
+    override suspend fun stop(itemId: String, sessionId: String?, positionMs: Long) {
         reportOrEnqueue(KIND_STOP, itemId, sessionId, positionMs) {
             api.reportStop(
                 PlaybackStopInfoDto(
@@ -73,7 +73,7 @@ class ProgressReporter(
         }
     }
 
-    suspend fun flushPending(): Unit = flushMutex.withLock {
+    override suspend fun flushPending(): Unit = flushMutex.withLock {
         val pending = dao.pending(serverId)
         if (pending.isEmpty()) return@withLock
 
