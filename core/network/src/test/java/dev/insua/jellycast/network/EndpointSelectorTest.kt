@@ -67,4 +67,34 @@ class EndpointSelectorTest {
         // toString() must render the host back in bracket form, never a bare/garbled IPv6 literal.
         assertEquals("https://[240e::1]:8920/System/Info/Public", url.toString())
     }
+
+    // Finding 3: a throwing EndpointProbe implementation must degrade to "that endpoint failed",
+    // not take down the whole selection (or crash probeAll's diagnostic sweep).
+    @Test fun `某个 endpoint 探测抛异常时不影响其它 endpoint,select 仍能选出可用地址`() = runTest {
+        val throwing = object : EndpointProbe {
+            override suspend fun probe(endpoint: Endpoint): EndpointHealth {
+                if (endpoint.url == "http://boom") throw RuntimeException("kaboom")
+                delay(50)
+                return EndpointHealth(endpoint, true, 50)
+            }
+        }
+        val selector = EndpointSelector(throwing)
+        val chosen = selector.select(listOf(ep("http://boom", 1), ep("http://good", 2)))
+        assertEquals("http://good", chosen?.endpoint?.url)
+    }
+
+    @Test fun `probeAll 中某个 endpoint 探测抛异常时记为不可达而不是向上传播`() = runTest {
+        val throwing = object : EndpointProbe {
+            override suspend fun probe(endpoint: Endpoint): EndpointHealth {
+                if (endpoint.url == "http://boom") throw RuntimeException("kaboom")
+                return EndpointHealth(endpoint, true, 10)
+            }
+        }
+        val selector = EndpointSelector(throwing)
+        val all = selector.probeAll(listOf(ep("http://boom", 1), ep("http://good", 2)))
+        assertEquals(2, all.size)
+        val boomResult = all.first { it.endpoint.url == "http://boom" }
+        assertFalse(boomResult.reachable)
+        assertEquals(true, all.first { it.endpoint.url == "http://good" }.reachable)
+    }
 }

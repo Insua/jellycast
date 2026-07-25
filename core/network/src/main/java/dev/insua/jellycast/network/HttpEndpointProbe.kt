@@ -3,13 +3,18 @@ package dev.insua.jellycast.network
 import dev.insua.jellycast.model.Endpoint
 import dev.insua.jellycast.model.EndpointHealth
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.suspendCancellableCoroutine
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
+import java.io.IOException
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 /**
  * 构造健康检查请求 URL:`<baseUrl>/System/Info/Public`。
@@ -26,18 +31,25 @@ internal fun buildHealthCheckUrl(baseUrl: String): HttpUrl =
 /**
  * 不认识 Jellyfin 的完整 API,只探测"这个地址此刻是否可达、多快"。
  * 传入的 [baseClient] 由调用方构造好信任链(证书白名单等是 Task 5 的事,这里绝不自建/全局关闭 TLS 校验)。
+ *
+ * [timeoutMs] 是这一次探测请求自己的连接 + 读超时,默认取 [DEFAULT_TIMEOUT_MS]。它与
+ * [EndpointSelector] 的 `timeoutMs` 概念不同、来源不同——见 [EndpointSelector.select] 的 KDoc。
  */
-class HttpEndpointProbe(baseClient: OkHttpClient) : EndpointProbe {
+class HttpEndpointProbe(
+    baseClient: OkHttpClient,
+    timeoutMs: Long = DEFAULT_TIMEOUT_MS,
+) : EndpointProbe {
     private val client = baseClient.newBuilder()
-        .connectTimeout(3, TimeUnit.SECONDS)
-        .readTimeout(3, TimeUnit.SECONDS)
+        .connectTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+        .readTimeout(timeoutMs, TimeUnit.MILLISECONDS)
         .build()
 
-    override suspend fun probe(endpoint: Endpoint): EndpointHealth = withContext(Dispatchers.IO) {
+    override suspend fun probe(endpoint: Endpoint): EndpointHealth {
         val start = System.currentTimeMillis()
-        try {
+        return try {
             val request = Request.Builder().url(buildHealthCheckUrl(endpoint.url)).get().build()
-            client.newCall(request).execute().use { response ->
+            val call = client.newCall(request)
+            call.await().use { response ->
                 if (response.isSuccessful) {
                     EndpointHealth(endpoint, true, System.currentTimeMillis() - start)
                 } else {
@@ -51,5 +63,39 @@ class HttpEndpointProbe(baseClient: OkHttpClient) : EndpointProbe {
         } catch (e: Exception) {
             EndpointHealth(endpoint, false, null, e.javaClass.simpleName + ": " + (e.message ?: ""))
         }
+    }
+
+    companion object {
+        /**
+         * 单次探测请求的连接 + 读超时,毫秒。产品设计要求 3s 探测超时,这里作为唯一权威来源——
+         * [EndpointSelector] 的整体超时默认值也引用这个常量,避免两处各写一份字面量、改一处忘另一处。
+         */
+        const val DEFAULT_TIMEOUT_MS = 3000L
+    }
+}
+
+/**
+ * 把 OkHttp 的异步 [Call.enqueue] 包成可挂起、可取消的调用。
+ *
+ * 关键点是 [kotlinx.coroutines.CancellableContinuation.invokeOnCancellation] 里真的调用了
+ * [Call.cancel]——协程取消(比如 [EndpointSelector.select] 淘汰掉落选的探测)会让底层 HTTP 调用
+ * 立刻中止(关闭连接/从 OkHttp 调度队列移除),而不是只在协程层面记账、底层请求继续跑到自己的
+ * connect/read 超时才收尾。这样落选探测不会占着 socket 不放,select() 的收尾也不必等它。
+ */
+private suspend fun Call.await(): Response = suspendCancellableCoroutine { continuation ->
+    enqueue(object : Callback {
+        override fun onResponse(call: Call, response: Response) {
+            continuation.resume(response)
+        }
+
+        override fun onFailure(call: Call, e: IOException) {
+            // Call.cancel() from invokeOnCancellation below surfaces here as an IOException; the
+            // continuation is already cancelled by then, so resuming it would throw. Just drop it.
+            if (continuation.isCancelled) return
+            continuation.resumeWithException(e)
+        }
+    })
+    continuation.invokeOnCancellation {
+        cancel()
     }
 }
