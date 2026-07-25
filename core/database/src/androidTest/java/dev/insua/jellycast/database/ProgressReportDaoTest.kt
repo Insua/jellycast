@@ -46,7 +46,7 @@ class ProgressReportDaoTest {
                 positionMs = 1000, kind = "progress", createdAt = 10
             )
         )
-        val pending = dao.pending()
+        val pending = dao.pending(serverId = "s")
         assertEquals(listOf("a", "b"), pending.map { it.itemId })
     }
 
@@ -65,9 +65,49 @@ class ProgressReportDaoTest {
                 positionMs = 2000, kind = "progress", createdAt = 2
             )
         )
-        val pending = dao.pending()
+        val pending = dao.pending(serverId = "s")
         dao.delete(pending.map { it.id })
-        assertEquals(0, dao.pending().size)
+        assertEquals(0, dao.pending(serverId = "s").size)
+    }
+
+    /**
+     * 复审发现(Task 11/12 review Finding 2):[ProgressReportEntity] 带 serverId,但
+     * `pending()`/`delete()` 都不按 serverId 过滤。多服务器是 v1 明确支持的场景——一旦配置了
+     * 第二台服务器,`ProgressReporter.flushPending()` 就会读到*所有*服务器的补报记录,拿着自己
+     * 手里那台服务器的 api 去重放,把 A 服务器的播放位置发到 B 服务器。这里用真实 Room 验证:
+     * `pending(serverId)` 只返回该服务器自己的行,删除该服务器返回的 id 之后,另一台服务器的行
+     * 原封不动。
+     */
+    @Test
+    fun `pending按serverId过滤_delete只删除传入的id不影响其他server的记录`() = runBlocking {
+        val dao = db.progressReportDao()
+        dao.enqueue(
+            ProgressReportEntity(
+                serverId = "sA", itemId = "a1", playSessionId = null,
+                positionMs = 1000, kind = "progress", createdAt = 10
+            )
+        )
+        dao.enqueue(
+            ProgressReportEntity(
+                serverId = "sA", itemId = "a2", playSessionId = null,
+                positionMs = 2000, kind = "progress", createdAt = 20
+            )
+        )
+        dao.enqueue(
+            ProgressReportEntity(
+                serverId = "sB", itemId = "b1", playSessionId = null,
+                positionMs = 3000, kind = "progress", createdAt = 30
+            )
+        )
+
+        val pendingA = dao.pending(serverId = "sA")
+        assertEquals(listOf("a1", "a2"), pendingA.map { it.itemId })
+
+        dao.delete(pendingA.map { it.id })
+
+        assertEquals(0, dao.pending(serverId = "sA").size)
+        val pendingB = dao.pending(serverId = "sB")
+        assertEquals(listOf("b1"), pendingB.map { it.itemId })
     }
 
     @Test
@@ -94,7 +134,7 @@ class ProgressReportDaoTest {
                 positionMs = 1000, kind = "progress", createdAt = 10
             )
         )
-        val pending = dao.pending(limit = 2)
+        val pending = dao.pending(serverId = "s", limit = 2)
         assertEquals(listOf("a", "b"), pending.map { it.itemId })
     }
 }

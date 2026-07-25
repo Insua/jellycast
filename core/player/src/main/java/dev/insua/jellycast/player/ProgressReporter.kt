@@ -74,7 +74,7 @@ class ProgressReporter(
     }
 
     suspend fun flushPending(): Unit = flushMutex.withLock {
-        val pending = dao.pending()
+        val pending = dao.pending(serverId)
         if (pending.isEmpty()) return@withLock
 
         val succeededIds = mutableListOf<Long>()

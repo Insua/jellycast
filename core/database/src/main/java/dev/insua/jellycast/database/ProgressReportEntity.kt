@@ -26,8 +26,8 @@ interface ProgressReportDao {
     @Insert
     suspend fun enqueue(e: ProgressReportEntity)
 
-    @Query("SELECT * FROM progress_report ORDER BY createdAt ASC LIMIT :limit")
-    suspend fun pending(limit: Int = 100): List<ProgressReportEntity>
+    @Query("SELECT * FROM progress_report WHERE serverId = :serverId ORDER BY createdAt ASC LIMIT :limit")
+    suspend fun pending(serverId: String, limit: Int = 100): List<ProgressReportEntity>
 
     @Query("DELETE FROM progress_report WHERE id IN (:ids)")
     suspend fun delete(ids: List<Long>)
