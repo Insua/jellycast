@@ -64,3 +64,37 @@ import kotlinx.serialization.Serializable
     @SerialName("SupportsDirectStream") val supportsDirectStream: Boolean = false,
     @SerialName("MediaStreams") val mediaStreams: List<MediaStreamDto> = emptyList(),
 )
+
+// 以下三个 DTO 对应 POST Sessions/Playing(started) / Sessions/Playing/Progress /
+// Sessions/Playing/Stopped 的请求体,字段名与 docs/jellyfin-openapi.json 中
+// PlaybackStartInfo / PlaybackProgressInfo / PlaybackStopInfo 的 properties 逐字核对。
+// 三个 schema 的 `required` 均为空,唯一非 nullable 的业务字段是 ItemId,其余按本项目
+// 需要(播放会话定位 + 进度上报)取子集:PlaySessionId、PositionTicks(单位:ticks,
+// 1 tick = 100ns,换算由调用方在 DTO↔Model 映射层完成,这里保持原始 ticks)、IsPaused。
+// 故意不建模:Item(冗余,已用 ItemId 引用)、SessionId(Jellyfin 会话 id,非
+// PlaySessionId,本项目不做多会话管理)、MediaSourceId/AudioStreamIndex/
+// SubtitleStreamIndex/PlayMethod(转码相关,不在本项目职责内)、
+// IsMuted/VolumeLevel/Brightness/AspectRatio/PlaybackStartTimeTicks(客户端 UI 状态,
+// Jellyfin 服务端不消费)、RepeatMode/PlaybackOrder/NowPlayingQueue/PlaylistItemId
+// (队列管理,v1 不做)、LiveStreamId(直播,不适用)、CanSeek(非 required,发或不发
+// 不影响进度上报语义)、Failed/NextMediaType(Stop 的失败上报,v1 不需要)。
+
+@Serializable data class PlaybackStartInfoDto(
+    @SerialName("ItemId") val itemId: String,
+    @SerialName("PlaySessionId") val playSessionId: String? = null,
+    @SerialName("PositionTicks") val positionTicks: Long? = null,
+    @SerialName("IsPaused") val isPaused: Boolean = false,
+)
+
+@Serializable data class PlaybackProgressInfoDto(
+    @SerialName("ItemId") val itemId: String,
+    @SerialName("PlaySessionId") val playSessionId: String? = null,
+    @SerialName("PositionTicks") val positionTicks: Long? = null,
+    @SerialName("IsPaused") val isPaused: Boolean = false,
+)
+
+@Serializable data class PlaybackStopInfoDto(
+    @SerialName("ItemId") val itemId: String,
+    @SerialName("PlaySessionId") val playSessionId: String? = null,
+    @SerialName("PositionTicks") val positionTicks: Long? = null,
+)

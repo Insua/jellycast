@@ -60,11 +60,11 @@ interface JellyfinApi {
     ): PlaybackInfoResponseDto
 
     @POST("Sessions/Playing")
-    suspend fun reportStart(@Body body: Map<String, @JvmSuppressWildcards Any>)
+    suspend fun reportStart(@Body body: PlaybackStartInfoDto)
 
     @POST("Sessions/Playing/Progress")
-    suspend fun reportProgress(@Body body: Map<String, @JvmSuppressWildcards Any>)
+    suspend fun reportProgress(@Body body: PlaybackProgressInfoDto)
 
     @POST("Sessions/Playing/Stopped")
-    suspend fun reportStop(@Body body: Map<String, @JvmSuppressWildcards Any>)
+    suspend fun reportStop(@Body body: PlaybackStopInfoDto)
 }
