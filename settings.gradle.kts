@@ -17,6 +17,7 @@ include(":core:subtitle")
 include(":core:designsystem")
 include(":feature:server")
 include(":feature:home")
+include(":feature:library")
 
 // 后续 Task 逐步 include(目录尚不存在):
-// include(":feature:library", ":feature:player", ":feature:settings")
+// include(":feature:player", ":feature:settings")
