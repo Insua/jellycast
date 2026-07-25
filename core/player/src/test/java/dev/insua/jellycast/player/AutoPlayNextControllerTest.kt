@@ -101,6 +101,59 @@ class AutoPlayNextControllerTest {
         assertNull(result)
     }
 
+    // ---- 全支线复审 Important 4:NextUp 补充队列必须走 :core:network 的共享 mapper ----
+
+    /**
+     * 本类原来有一份私有的 `BaseItemDto.toMediaItem()`,漏掉了 `imageTag`(和 Season/Episode 的
+     * IndexNumber 分流)。后果:自动连播换集之后,迷你条和全屏播放页的封面**变成空白**——因为
+     * `MediaItem.posterUrl()` 拿不到 tag 就返回 null。这也是设计文档 §5 的模块边界问题:
+     * `:core:player` 本不该自己解析 Jellyfin DTO。
+     */
+    @Test fun `NextUp 补充的条目保留封面 tag 与季集号,连播后封面不会变空白`() = runTest {
+        val queue = PlayQueue().apply { setQueue(listOf(ep("1")), 0) }
+        val api = mockk<JellyfinApi>()
+        coEvery { api.nextUp("u1") } returns ItemsResponseDto(
+            items = listOf(
+                BaseItemDto(
+                    id = "9",
+                    name = "第 9 集",
+                    type = "Episode",
+                    seriesName = "银魂",
+                    seasonNumber = 1,          // ParentIndexNumber
+                    episodeNumber = 9,         // IndexNumber
+                    runTimeTicks = 15_000_000_000L,
+                    imageTags = mapOf("Primary" to "cover-tag-9"),
+                )
+            )
+        )
+        val provider = PlaybackSourceProvider { id, _, _ -> source(id) }
+        val controller = AutoPlayNextController(queue, provider, api, flowOf(true))
+
+        controller.onPlaybackEnded("u1")
+
+        val refilled = queue.current.value
+        assertEquals("cover-tag-9", refilled?.imageTag)
+        assertEquals("银魂", refilled?.seriesName)
+        assertEquals(1, refilled?.seasonNumber)
+        assertEquals(9, refilled?.episodeNumber)
+        assertEquals(1_500_000L, refilled?.runTimeMs)     // ticks / 10_000,只在 mapper 里换算一次
+    }
+
+    /** 共享 mapper 对不认识的类型返回 null;这类条目必须被跳过,不能让一条陌生数据毒死整个队列。 */
+    @Test fun `NextUp 返回无法识别的类型时跳过该条,不连播到一个空条目`() = runTest {
+        val queue = PlayQueue().apply { setQueue(listOf(ep("1")), 0) }
+        val api = mockk<JellyfinApi>()
+        coEvery { api.nextUp("u1") } returns ItemsResponseDto(
+            items = listOf(BaseItemDto(id = "x", name = "某个音乐视频", type = "MusicVideo"))
+        )
+        val provider = PlaybackSourceProvider { id, _, _ -> source(id) }
+        val controller = AutoPlayNextController(queue, provider, api, flowOf(true))
+
+        val result = controller.onPlaybackEnded("u1")
+
+        assertNull(result)
+    }
+
     // ---- 「播完本集」睡眠定时模式(Finding 1):必须在真正决定"要不要连播"的这个类里拦截,
     // 而不是靠上层 UI 自己 pause——否则 Task 22 接上真实 STATE_ENDED 回调时,队列已经在这里被
     // 推进过、下一集已经开始解析播放,UI 层再暂停也晚了。----

@@ -2,10 +2,9 @@ package dev.insua.jellycast.player
 
 import dev.insua.jellycast.datastore.PreferencesStore
 import dev.insua.jellycast.model.MediaItem
-import dev.insua.jellycast.model.MediaKind
 import dev.insua.jellycast.model.PlaybackSource
 import dev.insua.jellycast.network.JellyfinApi
-import dev.insua.jellycast.network.dto.BaseItemDto
+import dev.insua.jellycast.network.mapper.toMediaItem
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -71,8 +70,19 @@ class AutoPlayNextController(
             .getOrNull()
     }
 
+    /**
+     * ⚠️ 复审 Important 4(已闭合):这里原来用的是本类自己的一份私有 `BaseItemDto.toMediaItem()`,
+     * 和 `:core:network` 的共享 mapper 是两份实现。那份私有实现漏掉了 `imageTag`(也漏掉了
+     * Season/Episode 的 IndexNumber 语义分流),于是**每次自动连播换集之后封面就变空白**——
+     * `MediaItem.posterUrl()` 拿不到 tag 只能返回 null,迷你条和全屏播放页都只剩占位背景。
+     *
+     * 现在统一用 `dev.insua.jellycast.network.mapper.toMediaItem()`:它是 DTO→领域模型、ticks→ms 的
+     * 唯一换算点(项目铁律),也顺手修掉了设计文档 §5 的边界问题——`:core:player` 不该自己解析
+     * Jellyfin DTO。共享 mapper 对不认识的类型返回 null,所以这里用 `mapNotNull` 跳过,不让一条
+     * 陌生类型的数据毒死整个连播队列。
+     */
     private suspend fun refillFromNextUp(userId: String): MediaItem? {
-        val fetched = runCatching { api.nextUp(userId).items.map { it.toMediaItem() } }
+        val fetched = runCatching { api.nextUp(userId).items.mapNotNull { it.toMediaItem() } }
             .getOrElse { e ->
                 if (e is CancellationException) throw e
                 emptyList()
@@ -80,26 +90,5 @@ class AutoPlayNextController(
         if (fetched.isEmpty()) return null
         queue.setQueue(fetched, 0)
         return queue.current.value
-    }
-
-    private fun BaseItemDto.toMediaItem() = MediaItem(
-        id = id,
-        // Shows/NextUp 恒返回 Episode 条目;其余类型值兜底映射,保持健壮。
-        kind = when (type) {
-            "Movie" -> MediaKind.MOVIE
-            "Series" -> MediaKind.SERIES
-            "Season" -> MediaKind.SEASON
-            else -> MediaKind.EPISODE
-        },
-        name = name,
-        seriesName = seriesName,
-        seasonNumber = seasonNumber,
-        episodeNumber = episodeNumber,
-        runTimeMs = runTimeTicks?.let { it / TICKS_PER_MS },
-        resumePositionMs = (userData?.positionTicks ?: 0L) / TICKS_PER_MS,
-    )
-
-    private companion object {
-        const val TICKS_PER_MS = 10_000L
     }
 }
