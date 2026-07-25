@@ -144,7 +144,7 @@ fun PlayerScreen(
         Spacer(Modifier.height(8.dp))
         ToolbarRow(
             playbackSpeed = uiState.playbackSpeed,
-            sleepTimerMinutesRemaining = uiState.sleepTimerMinutesRemaining,
+            sleepTimerOption = uiState.sleepTimerOption,
             onCycleSpeed = viewModel::onCycleSpeed,
             onSetSleepTimer = viewModel::onSetSleepTimer,
             onCycleSubtitleTrack = viewModel::onCycleSubtitleTrack,
@@ -287,17 +287,17 @@ private fun SkipButton(icon: androidx.compose.ui.graphics.vector.ImageVector, se
 @Composable
 private fun ToolbarRow(
     playbackSpeed: Float,
-    sleepTimerMinutesRemaining: Int?,
+    sleepTimerOption: SleepTimerOption?,
     onCycleSpeed: () -> Unit,
-    onSetSleepTimer: (Int?) -> Unit,
+    onSetSleepTimer: (SleepTimerOption?) -> Unit,
     onCycleSubtitleTrack: () -> Unit,
 ) {
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
         ToolbarAction(icon = Icons.Filled.Speed, label = "${playbackSpeed}x", onClick = onCycleSpeed)
         ToolbarAction(
             icon = Icons.Filled.Bedtime,
-            label = sleepTimerMinutesRemaining?.let { "${it}分" } ?: "定时",
-            onClick = { onSetSleepTimer(nextSleepTimerOption(sleepTimerMinutesRemaining)) },
+            label = sleepTimerLabel(sleepTimerOption),
+            onClick = { onSetSleepTimer(nextSleepTimerOption(sleepTimerOption)) },
         )
         // 音轨切换需要在 ExoPlayer TrackSelector 上做覆盖选择,超出本 Task 范围(见任务报告),
         // 这里先保留入口位置,点击暂不生效。
@@ -318,12 +318,22 @@ private fun ToolbarAction(icon: androidx.compose.ui.graphics.vector.ImageVector,
     }
 }
 
-private fun nextSleepTimerOption(current: Int?): Int? = when (current) {
-    null -> 15
-    15 -> 30
-    30 -> 45
-    45 -> 60
-    else -> null
+/** 睡眠定时选项循环:关闭 → 15 → 30 → 45 → 60 分钟 → 播完本集 → 关闭(设计文档 §3.5)。 */
+private fun nextSleepTimerOption(current: SleepTimerOption?): SleepTimerOption? = when (current) {
+    null -> SleepTimerOption.Minutes(15)
+    is SleepTimerOption.Minutes -> when (current.value) {
+        15 -> SleepTimerOption.Minutes(30)
+        30 -> SleepTimerOption.Minutes(45)
+        45 -> SleepTimerOption.Minutes(60)
+        else -> SleepTimerOption.EndOfEpisode
+    }
+    SleepTimerOption.EndOfEpisode -> null
+}
+
+private fun sleepTimerLabel(option: SleepTimerOption?): String = when (option) {
+    null -> "定时"
+    is SleepTimerOption.Minutes -> "${option.value}分"
+    SleepTimerOption.EndOfEpisode -> "播完本集"
 }
 
 private fun formatTimestamp(ms: Long): String {

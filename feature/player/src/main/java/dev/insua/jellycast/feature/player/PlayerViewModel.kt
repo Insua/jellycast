@@ -49,6 +49,22 @@ interface NowPlayingInfo {
 interface PlayerConnection {
     val player: StateFlow<Player?>
     val nowPlaying: StateFlow<NowPlayingInfo?>
+
+    /**
+     * 「播完本集」睡眠定时模式(Finding 1)的落地接缝:真正决定"下一集要不要开始播放"的地方是
+     * `:core:player` 的 `AutoPlayNextController.onPlaybackEnded()`(在收到 `STATE_ENDED` 时被调用),
+     * 不是这个 ViewModel。这里只负责把用户的选择转发出去——Task 22 提供的真实实现必须把 [armed]
+     * 转发到驱动当前播放会话的那个 `AutoPlayNextController` 实例的
+     * `armStopAfterCurrentEpisode()` / `disarmStopAfterCurrentEpisode()`,这样"下一集不开始播放"
+     * 这件事发生在队列真正推进之前,而不是等 UI 层在收到结束事件后再手忙脚乱地补一个 pause()。
+     */
+    fun setStopAfterCurrentEpisode(armed: Boolean)
+}
+
+/** 睡眠定时器的可选模式:固定分钟数(墙钟倒计时)或「播完本集」(见设计文档 §3.5)。 */
+sealed interface SleepTimerOption {
+    data class Minutes(val value: Int) : SleepTimerOption
+    data object EndOfEpisode : SleepTimerOption
 }
 
 data class PlayerUiState(
@@ -64,7 +80,7 @@ data class PlayerUiState(
     val subtitleTracks: List<SubtitleTrackRef> = emptyList(),
     val selectedSubtitleTrackIndex: Int? = null,
     val audioTracks: List<AudioTrack> = emptyList(),
-    val sleepTimerMinutesRemaining: Int? = null,
+    val sleepTimerOption: SleepTimerOption? = null,
 )
 
 /**
@@ -224,14 +240,30 @@ class PlayerViewModel @Inject constructor(
         }
     }
 
-    fun onSetSleepTimer(minutes: Int?) {
+    /**
+     * 睡眠定时器统一入口。固定分钟数模式的行为和之前一样——本地起一个墙钟倒计时协程,到点
+     * `pause()`。「播完本集」模式(Finding 1)完全不同路:不起协程、不等墙钟时间,而是立即把
+     * 武装信号转发给 [PlayerConnection.setStopAfterCurrentEpisode] ——真正的停止逻辑在
+     * `AutoPlayNextController` 里,见该接口方法的文档。
+     *
+     * 切换到任何新选项(包括关闭)都先无条件 disarm 一次「播完本集」,再按新选项决定要不要重新
+     * 武装/起新的倒计时——这样不会出现"选了播完本集又切回 15 分钟,但播完本集的武装还留着"的
+     * 状态泄漏。
+     */
+    fun onSetSleepTimer(option: SleepTimerOption?) {
         sleepTimerJob?.cancel()
-        _uiState.update { it.copy(sleepTimerMinutesRemaining = minutes) }
-        if (minutes == null) return
-        sleepTimerJob = viewModelScope.launch {
-            delay(minutes * 60_000L)
-            connection.player.value?.pause()
-            _uiState.update { it.copy(sleepTimerMinutesRemaining = null) }
+        connection.setStopAfterCurrentEpisode(false)
+        _uiState.update { it.copy(sleepTimerOption = option) }
+        when (option) {
+            null -> Unit
+            is SleepTimerOption.EndOfEpisode -> connection.setStopAfterCurrentEpisode(true)
+            is SleepTimerOption.Minutes -> {
+                sleepTimerJob = viewModelScope.launch {
+                    delay(option.value * 60_000L)
+                    connection.player.value?.pause()
+                    _uiState.update { it.copy(sleepTimerOption = null) }
+                }
+            }
         }
     }
 

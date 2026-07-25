@@ -8,6 +8,9 @@ import dev.insua.jellycast.network.JellyfinApi
 import dev.insua.jellycast.network.dto.BaseItemDto
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 
 /**
@@ -36,7 +39,31 @@ class AutoPlayNextController(
         preferencesStore: PreferencesStore,
     ) : this(queue, sourceProvider, api, preferencesStore.autoPlayNext)
 
+    /**
+     * 「播完本集」睡眠定时模式(设计文档 §3.5)落地处:一次性武装标志,武装后下一次
+     * [onPlaybackEnded] 立即消费掉它并直接返回 null——既不检查 `autoPlayNext` 偏好,也不摸队列,
+     * 保证"下一集不开始播放"这件事发生在真正决定连播与否的这一处,而不是靠上层 UI 在收到
+     * STATE_ENDED 之后再手忙脚乱地暂停(那时下一集可能已经在这里被解析、开始加载了)。
+     *
+     * 消费后自动清零(一次性):用户下次重新进入播放/手动切下一集,连播行为恢复正常,不需要
+     * 记得"回去关掉"这个开关。
+     */
+    private val stopAfterCurrentEpisode = MutableStateFlow(false)
+    val isStopAfterCurrentEpisodeArmed: StateFlow<Boolean> = stopAfterCurrentEpisode.asStateFlow()
+
+    fun armStopAfterCurrentEpisode() {
+        stopAfterCurrentEpisode.value = true
+    }
+
+    fun disarmStopAfterCurrentEpisode() {
+        stopAfterCurrentEpisode.value = false
+    }
+
     suspend fun onPlaybackEnded(userId: String): PlaybackSource? {
+        if (stopAfterCurrentEpisode.value) {
+            stopAfterCurrentEpisode.value = false
+            return null
+        }
         if (!autoPlayNext.first()) return null
 
         val next = queue.next() ?: refillFromNextUp(userId) ?: return null
