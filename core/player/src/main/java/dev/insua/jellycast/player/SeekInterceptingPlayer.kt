@@ -48,10 +48,19 @@ class EngineSeekRouter(
  * 这样锁屏/通知栏/蓝牙耳机按键发来的 seek,不管走 MediaSession 默认回调还是自定义回调,最终都
  * 只能落到这一层。
  *
- * 刻意不覆盖 `seekToNextMediaItem()` / `seekToPreviousMediaItem()` / `seekToNext()` /
- * `seekToPrevious()`:本项目不使用 ExoPlayer 自身的多条目播放列表(每次只 `setMediaItem`
- * 一个条目),集与集之间的连播由 [PlayQueue](Task 11)在播放器外部驱动、通过
- * [AudioPlaybackEngine.play] 重新准备下一条目,和"当前条目内 seek"是两件不同的事。
+ * `seekToPrevious()` **必须覆盖**(复审 Finding 1):对 media3-common 1.10.1 的 `BasePlayer`
+ * 字节码核实过——非直播、单条目场景下(本项目模型:没有上一条目),`seekToPrevious()` 总是走
+ * "没有上一条目 或 currentPosition > maxSeekToPreviousPosition"分支,调用
+ * `seekToCurrentItem(0, ...)`,即对**当前条目**做一次真正的位置 0 的 seek。这正是蓝牙/锁屏
+ * "上一曲"键通过 MediaSession 的 `SEEK_TO_PREVIOUS` 命令触发的路径——不覆盖的话它会绕开这一层,
+ * 直接落到裸 ExoPlayer。所以和 `seekToDefaultPosition()` 一样,路由为 seek 到 0。
+ *
+ * 刻意不覆盖 `seekToNextMediaItem()` / `seekToPreviousMediaItem()` / `seekToNext()`:本项目不使用
+ * ExoPlayer 自身的多条目播放列表(每次只 `setMediaItem` 一个条目),这三个方法在单条目、非直播
+ * 场景下要么是 no-op(没有上一个/下一个条目可切),要么(`seekToNext()`)会被 `BasePlayer` 转成对
+ * 当前条目的操作但**不会**触发真正的位置 seek(与 `seekToPrevious()` 的字节码路径不同)。
+ * 集与集之间的连播由 [PlayQueue](Task 11)在播放器外部驱动、通过 [AudioPlaybackEngine.play]
+ * 重新准备下一条目,和"当前条目内 seek"是两件不同的事。
  */
 class SeekInterceptingPlayer(
     player: Player,
@@ -81,5 +90,9 @@ class SeekInterceptingPlayer(
 
     override fun seekForward() {
         seekRouter.seekTo(currentPosition + seekForwardIncrement)
+    }
+
+    override fun seekToPrevious() {
+        seekRouter.seekTo(0L)
     }
 }

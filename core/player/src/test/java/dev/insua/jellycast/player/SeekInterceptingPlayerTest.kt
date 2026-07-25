@@ -141,4 +141,41 @@ class SeekInterceptingPlayerTest {
         assertEquals(listOf(50_000L), seen)
         verify(exactly = 0) { underlying.seekForward() }
     }
+
+    /**
+     * 复审发现(Task 11/12 review Finding 1):`ForwardingPlayer.seekToPrevious()` 未被覆写时,
+     * 对单条目非直播场景(本项目模型),`BasePlayer.seekToPrevious()`(media3-common 1.10.1
+     * 字节码核实)在"没有上一条目 或 currentPosition > maxSeekToPreviousPosition"时会调用
+     * `seekToCurrentItem(0, ...)`——对当前条目做一次真正的位置 0 的 seek,直接转发到底层裸
+     * ExoPlayer,完全绕开本类的拦截。这正是蓝牙/锁屏"上一曲"键通过 MediaSession 的
+     * SEEK_TO_PREVIOUS 命令触发的路径。用和核心验收测试一样的真实
+     * AudioPlaybackEngineImpl + 假 PlaybackSourceProvider/PlayerControl 编排,证明
+     * seekToPrevious() 也必须经过完整重新 resolve 链路,而不是落到底层 seekToPrevious()。
+     */
+    @Test fun `seekToPrevious 不落到底层 player seekToPrevious,而是路由为 seek 到 0 并触发完整重新 resolve 链路`() = runTest {
+        val underlying = mockk<Player>(relaxed = true)
+        val requestedPositions = mutableListOf<Long>()
+        val provider = PlaybackSourceProvider { _, _, startPositionMs ->
+            requestedPositions += startPositionMs
+            source(startPositionMs)
+        }
+        val preparedUrls = mutableListOf<String>()
+        val playerControl = object : PlayerControl {
+            override fun setMediaItemAndPrepare(url: String) { preparedUrls += url }
+            override fun release() {}
+        }
+        val engine = AudioPlaybackEngineImpl(provider, playerControl)
+        engine.play("ep1", "u1", startPositionMs = 90_000L)
+
+        val router = EngineSeekRouter(engine, this)
+        val sessionPlayer = SeekInterceptingPlayer(underlying, router)
+
+        sessionPlayer.seekToPrevious()
+        advanceUntilIdle()
+
+        verify(exactly = 0) { underlying.seekToPrevious() }
+        assertEquals(listOf(90_000L, 0L), requestedPositions)
+        assertTrue(preparedUrls.last().contains("startTimeTicks=0"), preparedUrls.last())
+        assertTrue(engine.state.value is PlaybackEngineState.Ready)
+    }
 }
