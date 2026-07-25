@@ -21,6 +21,76 @@
 
 ---
 
+## ⚠️ 实测修正记录(2026-07-25,执行期回填)
+
+本计划撰写时的接口签名与依赖版本均为**草稿**。以下修正来自对真实服务器与本机构建环境的**实测**,
+按 CLAUDE.md「Spike 结论与计划冲突 → 以 Spike 实测为准」处理。**以本节为准,下文正文中被本节
+覆盖的部分作废。**
+
+### 修正 1:Jellyfin 10.10.7 已移除 `/Users/{userId}/Items` 系列接口
+
+目标服务器实测为 **Jellyfin 10.10.7**(`docs/jellyfin-openapi.json`,319 个接口)。
+核对后发现 Task 3 的 `JellyfinApi` 中 3 个接口**在该版本不存在**:
+
+| 计划中(已失效) | 实际应使用 |
+|---|---|
+| `GET /Users/{userId}/Items` | `GET /Items?userId={userId}` |
+| `GET /Users/{userId}/Items/Resume` | `GET /UserItems/Resume?userId={userId}` |
+| `GET /Users/{userId}/Items/{itemId}` | `GET /Items/{itemId}?userId={userId}` |
+
+已核对**确认存在**的接口:`POST /Users/AuthenticateByName`、`GET /Shows/NextUp`、
+`GET /Shows/{seriesId}/Seasons`、`GET /Shows/{seriesId}/Episodes`、
+`GET|POST /Items/{itemId}/PlaybackInfo`、`POST /Sessions/Playing{,/Progress,/Stopped}`、
+`GET /System/Info/Public`。
+
+字幕接口实测路径为
+`GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/Stream.{format}`(与计划一致),
+另有带起始位置的变体 `.../Subtitles/{index}/{startPositionTicks}/Stream.{format}`。
+
+三级降级链的候选 URL 载体均存在:`/Videos/{itemId}/stream.{container}`(L1)、
+`/Videos/{itemId}/master.m3u8`(L2)、`/Audio/{itemId}/universal`(L1 备选)。
+**具体参数组合仍待 Task 0 Step 4 实测确定。**
+
+### 修正 2:工具链升级到 2026-07 当前稳定版
+
+计划正文 Task 1 钉的是 2024 年 9 月的版本组合,已升级。下表为**本机 clean 构建实测通过**
+的组合(单测确认真实执行、APK 确认产出):
+
+| 项 | 版本 | 备注 |
+|---|---|---|
+| Gradle | **9.5.0** | AGP 9.3.1 的最低要求,低于此报错 |
+| AGP | **9.3.1** | |
+| Kotlin | **2.4.10** | |
+| KSP | 2.3.10 | |
+| Hilt | 2.60.1 | **强制要求 AGP ≥ 9.0**,这是必须上 AGP 9 的原因 |
+| compose-bom | 2026.06.01 | |
+| media3 | 1.10.1 | |
+| JUnit Jupiter | 6.1.2 | |
+| compileSdk / targetSdk | **36** | minSdk 26 不变 |
+| core-ktx / lifecycle / hilt-navigation-compose | 1.18.0 / 2.10.0 / 1.3.0 | 各自最新版需 compileSdk 37,本机未安装,故降一档 |
+
+**三个必须遵守的构建约束(每一条都是实测踩坑得出):**
+
+1. **AGP 9.0+ 内置 Kotlin 支持,绝不可 apply `org.jetbrains.kotlin.android`** —— 会直接报错。
+   Android 模块的 jvmTarget 改用顶层 `kotlin { compilerOptions { ... } }`,不再有 `kotlinOptions { }`。
+2. **JUnit5 必须三件齐全**,否则单测**静默执行 0 个**:`junit-jupiter` 依赖 +
+   `testRuntimeOnly("org.junit.platform:junit-platform-launcher")` + `useJUnitPlatform()`。
+   AGP application 模块下 `tasks.test` 访问器不可用(它是 `DefaultTask` 聚合器),
+   须写 `tasks.withType<Test>().configureEach { useJUnitPlatform() }`。
+   验收标准:`build/test-results/**/TEST-*.xml` 中 `tests="N"` 的 N > 0。
+3. **`gradle.properties` 必须设 `org.gradle.jvmargs=-Xmx4g`** ——
+   默认堆下 `:app:mergeExtDexDebug` 会以 `DexArchiveMergerException` 失败。
+
+### 修正 3:本机环境注意事项
+
+- shell 有全局 `http_proxy=127.0.0.1:7890`。**访问 Tailscale 内网(含 Jellyfin)的 curl
+  必须带 `--noproxy '*'`**,否则请求被塞进代理并超时。Gradle 拉公网仓库不受影响。
+- Jellyfin 实际地址:`http://100.126.20.77:8096`(Tailscale `nas` 节点)。
+  **8920 (HTTPS) 端口不通** —— Spike-3 需按此调整。
+- 本机无 `gradle` 命令,只有 wrapper。跑 gradle 建议带 `--no-daemon`(内存较紧)。
+
+---
+
 ## 文件结构总览
 
 ```
