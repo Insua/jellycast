@@ -12,6 +12,7 @@ import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
+import io.mockk.slot
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.flowOf
@@ -19,6 +20,7 @@ import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import java.security.cert.X509Certificate
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
@@ -46,7 +48,15 @@ class ServerViewModelTest {
         Dispatchers.resetMain()
     }
 
-    private fun viewModel() = ServerViewModel(serverStore, endpointSelector, jellyfinApiFactory)
+    private fun viewModel(certificateFetcher: PeerCertificateFetcher = mockk(relaxed = true)) =
+        ServerViewModel(serverStore, endpointSelector, jellyfinApiFactory, certificateFetcher)
+
+    /** 构造一张可被 [sha256Fingerprint] 计算出确定性指纹的假证书,内容本身无所谓。 */
+    private fun fakeCertificate(seed: Byte): X509Certificate {
+        val cert = mockk<X509Certificate>()
+        every { cert.encoded } returns byteArrayOf(seed, 1, 2, 3)
+        return cert
+    }
 
     private fun lan(url: String = "http://192.168.1.10:8096") = Endpoint(url, "局域网", 0)
     private fun tailscale(url: String = "http://100.126.20.77:8096") = Endpoint(url, "Tailscale", 1)
@@ -171,5 +181,101 @@ class ServerViewModelTest {
         vm.testConnection()
 
         coVerify(exactly = 1) { endpointSelector.probeAll(listOf(endpoint)) }
+    }
+
+    // ---- 证书确认指纹必须落在被展示证书的那个 endpoint 上,而不是表单里靠位置数出来的行 ----
+    // 这条用例复现审查发现的 bug:diagnostics 是 validEndpoints() 压缩过的列表(空行被
+    // mapIndexedNotNull 丢弃),confirmCertificate() 原来却拿 diagnostics 的下标去索引未压缩的
+    // form.endpoints —— 只要目标地址前面有一行空白,两个下标就会错位。
+
+    @Test
+    fun `确认证书指纹应写入目标地址而不是前面的空行`() = runTest {
+        val certificateFetcher = mockk<PeerCertificateFetcher>()
+        every { certificateFetcher.fetch(any()) } returns fakeCertificate(1)
+
+        val targetUrl = "http://192.168.1.10:8096"
+        // 用 any() + captured 参数回填结果,而不是手写期望的 Endpoint(priority 取决于表单里的
+        // 原始下标,不是压缩后的下标,写死会让这条用例因为 mock 参数不匹配而误报,而不是真正
+        // 验证证书指纹落位是否正确)。
+        val probedEndpoints = slot<List<Endpoint>>()
+        coEvery { endpointSelector.probeAll(capture(probedEndpoints)) } answers {
+            probedEndpoints.captured.map { EndpointHealth(it, false, null, "SSLHandshakeException: self-signed certificate") }
+        }
+
+        val vm = viewModel(certificateFetcher)
+        // 表单默认就有一行空白(index 0);目标地址填在它后面的第二行(index 1)。
+        vm.addEndpointField()
+        vm.onEndpointUrlChange(1, targetUrl)
+        vm.onEndpointLabelChange(1, "局域网")
+        vm.testConnection()
+
+        // 压缩后 diagnostics 只有一条,对应表单里的第二行(空白行被过滤掉了)。
+        assertEquals(1, vm.uiState.value.diagnostics.size)
+
+        vm.onInspectCertificate(0)
+        val confirmation = vm.uiState.value.certConfirmation
+        assertNotNull(confirmation, "应该弹出证书确认对话框")
+
+        vm.confirmCertificate()
+
+        val endpoints = vm.uiState.value.form.endpoints
+        assertEquals(2, endpoints.size)
+        assertNull(endpoints[0].trustedCertSha256, "空白行不应该被写入指纹")
+        assertEquals(
+            confirmation!!.fingerprint,
+            endpoints[1].trustedCertSha256,
+            "指纹应该写入用户实际看到证书的那个地址行",
+        )
+    }
+
+    @Test
+    fun `确认证书指纹不影响其它地址行`() = runTest {
+        val certificateFetcher = mockk<PeerCertificateFetcher>()
+        every { certificateFetcher.fetch(any()) } returns fakeCertificate(2)
+
+        val e1 = lan()
+        val e2 = tailscale()
+        val e3 = public()
+        coEvery { endpointSelector.probeAll(listOf(e1, e2, e3)) } returns listOf(
+            EndpointHealth(e1, true, 10L),
+            EndpointHealth(e2, false, null, "SSLHandshakeException: self-signed certificate"),
+            EndpointHealth(e3, false, null, "UnknownHostException: xxx.ddns.net"),
+        )
+
+        val vm = viewModel(certificateFetcher)
+        vm.fillEndpoints(e1, e2, e3)
+        vm.testConnection()
+
+        vm.onInspectCertificate(1)
+        assertNotNull(vm.uiState.value.certConfirmation)
+        vm.confirmCertificate()
+
+        val endpoints = vm.uiState.value.form.endpoints
+        assertNull(endpoints[0].trustedCertSha256)
+        assertNotNull(endpoints[1].trustedCertSha256)
+        assertNull(endpoints[2].trustedCertSha256)
+    }
+
+    @Test
+    fun `取消证书确认不写入任何指纹`() = runTest {
+        val certificateFetcher = mockk<PeerCertificateFetcher>()
+        every { certificateFetcher.fetch(any()) } returns fakeCertificate(3)
+
+        val target = lan()
+        coEvery { endpointSelector.probeAll(listOf(target)) } returns listOf(
+            EndpointHealth(target, false, null, "SSLHandshakeException: self-signed certificate"),
+        )
+
+        val vm = viewModel(certificateFetcher)
+        vm.fillEndpoints(target)
+        vm.testConnection()
+
+        vm.onInspectCertificate(0)
+        assertNotNull(vm.uiState.value.certConfirmation)
+
+        vm.dismissCertificateConfirmation()
+
+        assertNull(vm.uiState.value.certConfirmation)
+        assertTrue(vm.uiState.value.form.endpoints.all { it.trustedCertSha256 == null })
     }
 }

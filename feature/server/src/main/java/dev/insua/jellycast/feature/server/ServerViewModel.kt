@@ -39,9 +39,17 @@ data class ServerListItem(
     val latencyMs: Long? = null,
 )
 
-/** 探测到自签证书、等待用户在弹窗里确认指纹后才写入 `Endpoint.trustedCertSha256`。 */
+/**
+ * 探测到自签证书、等待用户在弹窗里确认指纹后才写入 `Endpoint.trustedCertSha256`。
+ *
+ * 用 [endpointUrl](已规整化的地址字符串)而不是下标来标识目标 endpoint:`diagnostics` 是
+ * [ServerViewModel.validEndpoints] 压缩过的列表(`mapIndexedNotNull` 会丢掉空白/不合法的行),
+ * 而用户要写回的目标是 `form.endpoints`——原始、未压缩的表单行列表。这两个列表的下标不对齐
+ * (目标地址前面只要有一行空白或非法输入,下标就会错位),所以下标不是稳定的身份标识;
+ * 规整化后的 URL 在同一次表单里唯一标识"用户刚看过证书的那一行",落到 [confirmCertificate]
+ * 时按它匹配,而不是按位置去数第几行。
+ */
 data class CertConfirmation(
-    val endpointIndex: Int,
     val endpointUrl: String,
     val fingerprint: String,
 )
@@ -237,17 +245,23 @@ class ServerViewModel @Inject constructor(
                 return@launch
             }
             _uiState.update {
-                it.copy(certConfirmation = CertConfirmation(diagnosticIndex, diagnostic.endpoint.url, fingerprint))
+                it.copy(certConfirmation = CertConfirmation(diagnostic.endpoint.url, fingerprint))
             }
         }
     }
 
-    /** 用户在弹窗里确认了指纹——写回表单里对应那一行的 `trustedCertSha256`,仅对该 endpoint 生效。 */
+    /**
+     * 用户在弹窗里确认了指纹——写回表单里对应那一行的 `trustedCertSha256`,仅对该 endpoint 生效。
+     * 按规整化后的 URL 匹配(见 [CertConfirmation] 的注释),而不是按下标——`form.endpoints`
+     * 是未压缩的原始行列表,下标和 `diagnostics`/`certConfirmation` 不对齐。
+     */
     fun confirmCertificate() {
         val confirmation = _uiState.value.certConfirmation ?: return
         _uiState.update { state ->
-            val endpoints = state.form.endpoints.mapIndexed { i, e ->
-                if (i == confirmation.endpointIndex) e.copy(trustedCertSha256 = confirmation.fingerprint) else e
+            val endpoints = state.form.endpoints.map { e ->
+                if (normalizeEndpointUrl(e.url) == confirmation.endpointUrl) {
+                    e.copy(trustedCertSha256 = confirmation.fingerprint)
+                } else e
             }
             state.copy(form = state.form.copy(endpoints = endpoints), certConfirmation = null)
         }
