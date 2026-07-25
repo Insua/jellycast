@@ -11,3 +11,5 @@ captures/
 *.keystore
 *.jks
 .DS_Store
+
+.superpowers/
