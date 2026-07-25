@@ -2,10 +2,10 @@ package dev.insua.jellycast.player
 
 import android.content.ComponentName
 import android.content.Context
+import androidx.core.content.ContextCompat
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
-import com.google.common.util.concurrent.MoreExecutors
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dev.insua.jellycast.feature.player.NowPlayingInfo
 import dev.insua.jellycast.feature.player.PlayerConnection
@@ -55,14 +55,19 @@ private data class DefaultNowPlayingInfo(
  */
 @Singleton
 class MediaControllerPlayerConnection @Inject constructor(
-    @ApplicationContext context: Context,
+    @ApplicationContext private val context: Context,
     private val playQueue: PlayQueue,
     private val audioPlaybackEngine: AudioPlaybackEngine,
     private val autoPlayNextController: AutoPlayNextController,
     private val jellyfinSession: JellyfinSession,
 ) : PlayerConnection {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    /**
+     * `Main.immediate` 而不是 `Main`:controller 的全部状态变更([ControllerConnectionHolder] 的
+     * 线程契约)都在这个 scope 里发生,用 immediate 时"已经在主线程上"的调用会同步执行,不会被
+     * 排到下一个消息循环——省掉一次"命令下发时 controller 还没被发布出去"的时间窗。
+     */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     private val _player = MutableStateFlow<Player?>(null)
     override val player: StateFlow<Player?> = _player
@@ -79,12 +84,66 @@ class MediaControllerPlayerConnection @Inject constructor(
             )
         }.stateIn(scope, SharingStarted.Eagerly, null)
 
+    /**
+     * ⚠️ 复审 Finding 1(已闭合):controller **不是**建一次就完事的。会话会被释放(暂停 → 从最近
+     * 任务划掉 App → `MediaSessionService.onTaskRemoved` 在没在播放时 `stopSelf` →
+     * `PlaybackService.onDestroy` 里 `mediaSession.release()`),此后那个 controller 永久断开:
+     * 音频还能播(引擎直接操作单例 ExoPlayer),但所有经 [player] 下发的传输命令全部静默 no-op,
+     * `isPlaying` 恒为 false —— UI 显示"已暂停",耳机里在响。
+     *
+     * 修正:状态机交给 [ControllerConnectionHolder](纯逻辑,已离线单测),这里只负责把 media3 的
+     * 回调接上去,并在三个时机调 [ensureConnected]。
+     */
+    private val holder = ControllerConnectionHolder<MediaController>(
+        isConnected = { it.isConnected },
+        release = { it.release() },
+        publish = { _player.value = it },
+        connect = ::buildController,
+    )
+
+    /**
+     * 建连的三个生产触发点(都在"绑定必定合法"的时刻,所以 [ControllerConnectionHolder.onDisconnected]
+     * 刻意不立刻重连,不去把用户刚划掉的 Service 又拉起来):
+     *
+     * 1. 单例初始化 —— App 冷启动。
+     * 2. `MainActivity.onStart` —— App 回到前台(Media3 推荐的 controller 生命周期时机),这是"划掉
+     *    App 再重开"这条路径上最早能恢复的点,用户还没点任何按钮传输控制就已经活了。
+     * 3. [nowPlaying] 变成非 null —— 真的开始播了。`AppSessionViewModel.play()` 会先
+     *    `startForegroundService` 再调 `engine.play`,所以此刻 Service 一定在,绑定必定成功;
+     *    这一条兜住"前台绑定因为任何原因失败了"的情况。
+     */
     init {
+        ensureConnected()
+        scope.launch {
+            nowPlaying.collect { info -> if (info != null) ensureConnected() }
+        }
+    }
+
+    /** 见 [holder] 与 [init] 的说明。可从任意线程调用,内部统一切到主线程上执行。 */
+    fun ensureConnected() {
+        scope.launch { holder.ensureConnected() }
+    }
+
+    /**
+     * 线程:整个方法在主线程上跑(由 [scope] 保证),于是 `buildAsync` 记下的 application looper
+     * 就是主线程 —— `MediaController.Listener.onDisconnected` 与 future 的完成回调(用主线程
+     * executor)都回到同一个线程,[ControllerConnectionHolder] 的"单线程"契约得到满足。
+     *
+     * `future.get()` 必须包 `runCatching`:绑定失败时它抛 `ExecutionException`,而这里是在
+     * executor 回调里,抛出去没人接得住。失败按"暂时没有 controller"处理,等下一次 [ensureConnected]。
+     */
+    private fun buildController(onResult: (MediaController?) -> Unit) {
         val sessionToken = SessionToken(context, ComponentName(context, PlaybackService::class.java))
-        val controllerFuture = MediaController.Builder(context, sessionToken).buildAsync()
-        controllerFuture.addListener(
-            { _player.value = controllerFuture.get() },
-            MoreExecutors.directExecutor(),
+        val future = MediaController.Builder(context, sessionToken)
+            .setListener(object : MediaController.Listener {
+                override fun onDisconnected(controller: MediaController) {
+                    holder.onDisconnected(controller)
+                }
+            })
+            .buildAsync()
+        future.addListener(
+            { onResult(runCatching { future.get() }.getOrNull()) },
+            ContextCompat.getMainExecutor(context),
         )
     }
 
