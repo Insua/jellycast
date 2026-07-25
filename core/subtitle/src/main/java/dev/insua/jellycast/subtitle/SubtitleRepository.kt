@@ -1,6 +1,7 @@
 package dev.insua.jellycast.subtitle
 
 import dev.insua.jellycast.model.SubtitleTimeline
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -20,19 +21,19 @@ class SubtitleRepository(
      */
     suspend fun load(itemId: String, mediaSourceId: String, subtitleIndex: Int): SubtitleTimeline =
         withContext(Dispatchers.IO) {
-            val format = "srt"
-            val url = "${baseUrlProvider().trimEnd('/')}/Videos/$itemId/$mediaSourceId/" +
-                "Subtitles/$subtitleIndex/Stream.$format?api_key=${tokenProvider()}"
             try {
+                val format = "srt"
+                val url = "${baseUrlProvider().trimEnd('/')}/Videos/$itemId/$mediaSourceId/" +
+                    "Subtitles/$subtitleIndex/Stream.$format?api_key=${tokenProvider()}"
                 client.newCall(Request.Builder().url(url).get().build()).execute().use { resp ->
-                    if (!resp.isSuccessful) return@withContext SubtitleTimeline(emptyList())
-                    val body = resp.body.string()
-                    try {
-                        SubtitleTimeline(parserFor(format).parse(body))
-                    } catch (e: Exception) {
+                    if (!resp.isSuccessful) {
                         SubtitleTimeline(emptyList())
+                    } else {
+                        SubtitleTimeline(parserFor(format).parse(resp.body.string()))
                     }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 SubtitleTimeline(emptyList())
             }
