@@ -34,6 +34,13 @@ import javax.inject.Inject
  * "写好了但没有生产调用方"的死代码——[onCreate] 里真的调用了 [bindEngine],`engine` 就是
  * [Player.STATE_ENDED] 那一刻驱动自动连播的同一个实例,和 `exoPlayer` 也是同一个单例
  * (见 `PlayerModule.provideExoPlayer` 的 KDoc)。
+ *
+ * ⚠️ Finding 1(已闭合):[Player.STATE_ENDED] 的自动连播曾经直接调
+ * `ExoPlayerControl(exoPlayer).setMediaItemAndPrepare(next.streamUrl)`,绕开了
+ * [AudioPlaybackEngine.play]——`engine` 内部的 `currentItemId`/`currentUserId` 从没更新过,
+ * 自动连播之后锁屏拖进度条会悄悄跳回上一集。现在经 [PlaybackEndedAdvancer] 统一走
+ * `engine.play(...)`,和 `MediaControllerPlayerConnection.skipToNext()` / `AppSessionViewModel.play()`
+ * 是同一条路,详见该类 KDoc。
  */
 @AndroidEntryPoint
 class PlaybackService : MediaSessionService() {
@@ -74,17 +81,20 @@ class PlaybackService : MediaSessionService() {
         // SeekInterceptingPlayer 拦截后静默丢弃(engine 恒为 null)。
         bindEngine(playbackEngine)
 
-        // 修正 §1(b):自动连播接到 Player.STATE_ENDED。播完一集后,拿当前登录用户 id 问
+        // 修正 §1(b)/Finding 1:自动连播接到 Player.STATE_ENDED。播完一集后,拿当前登录用户 id 问
         // AutoPlayNextController 要不要接着播下一条——它内部已经处理好"关闭自动连播/播完本集
-        // 睡眠定时/队列耗尽回退 NextUp"这些分支,这里只负责把结果喂给播放器,不重复决策逻辑。
+        // 睡眠定时/队列耗尽回退 NextUp"这些分支,这里只负责把结果喂给 engine,不重复决策逻辑。
+        // 必须经 PlaybackEndedAdvancer → engine.play(...),不能直接操作 exoPlayer/ExoPlayerControl——
+        // 否则 engine 内部状态和实际在放的条目就对不上了(详见 PlaybackEndedAdvancer 类注释)。
+        val playbackEndedAdvancer = PlaybackEndedAdvancer(
+            engine = playbackEngine,
+            autoPlayNextController = autoPlayNextController,
+            userIdProvider = { runCatching { jellyfinSession.userId() }.getOrNull() },
+        )
         exoPlayer.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState != Player.STATE_ENDED) return
-                serviceScope.launch {
-                    val userId = runCatching { jellyfinSession.userId() }.getOrNull() ?: return@launch
-                    val next = autoPlayNextController.onPlaybackEnded(userId) ?: return@launch
-                    ExoPlayerControl(exoPlayer).setMediaItemAndPrepare(next.streamUrl)
-                }
+                serviceScope.launch { playbackEndedAdvancer.onPlaybackEnded() }
             }
         })
 
