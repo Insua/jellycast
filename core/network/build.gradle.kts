@@ -31,6 +31,7 @@ dependencies {
     testImplementation(libs.junit.jupiter)
     testRuntimeOnly(libs.junit.platform.launcher)
     testImplementation(libs.okhttp.mockwebserver)
+    testImplementation(libs.okhttp.tls)
     testImplementation(libs.kotlinx.coroutines.test)
 }
 
