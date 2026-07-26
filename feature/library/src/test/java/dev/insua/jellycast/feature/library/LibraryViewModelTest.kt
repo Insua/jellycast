@@ -7,6 +7,8 @@ import dev.insua.jellycast.network.session.JellyfinSession
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.mockk
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
@@ -232,22 +234,38 @@ class LibraryViewModelTest {
 
     // ---- 证明 flatMapLatest 真正取消了在途请求,而不仅仅是"最终结果凑巧正确" ----
     // "银" 的请求故意做成慢响应(delay 1000ms 才返回);在它完成前切换到 "银魂"。
-    // 断言 1:"银" 的请求确实被发出过(证明不是被 debounce 拦下,而是真正在途被取消)。
-    // 断言 2:最终结果只有 "银魂",没有被姗姗来迟的 "银" 响应污染。
+    // 光靠 coVerify(exactly = 1) + 最终 items == ["银魂"] 不能区分"真的取消"和"没取消但
+    // PageState.onPageLoaded 的 startIndex 幂等保护碰巧丢弃了迟到的响应"——两条查询都是
+    // startIndex = 0,在 flatMapMerge(不取消)下"银魂"先落地把 items.size 变成 1,之后姗姗
+    // 来迟的"银"响应因为 startIndex(0) != items.size(1) 一样会被幂等保护默默丢弃,现象雷同。
+    // 所以这里改为直接观察协程本身是否被取消:fake 在 delay 处 catch CancellationException
+    // 并置位标记后重新抛出(维持正常取消语义),再用 CompletableDeferred 证明请求确实已经真正
+    // 发出(而不是被 debounce 拦在发出之前)。
     @Test fun `新查询到达时取消仍在进行的旧查询请求`() = runTest {
         val api = mockk<JellyfinApi>(relaxed = true)
+        var yinWasCancelled = false
+        val yinDispatched = CompletableDeferred<Unit>()
         coEvery { api.items(any(), "Series,Movie", any(), any(), 0, 50, any(), "银") } coAnswers {
-            delay(1_000)
-            page("银")
+            yinDispatched.complete(Unit)
+            try {
+                delay(1_000)
+                page("银")
+            } catch (e: CancellationException) {
+                yinWasCancelled = true
+                throw e
+            }
         }
         coEvery { api.items(any(), "Series,Movie", any(), any(), 0, 50, any(), "银魂") } returns page("银魂")
         val vm = newViewModel(api)
 
         vm.onQueryChange("银")
         advanceTimeBy(400) // 越过 300ms 防抖,"银" 的请求已经真正发出、正挂在 delay(1000) 上
+        assertTrue(yinDispatched.isCompleted, "旧查询的请求应已真正发出,而不是被 debounce 拦在发出之前")
+
         vm.onQueryChange("银魂")
         advanceUntilIdle()
 
+        assertTrue(yinWasCancelled, "flatMapLatest 应该取消仍在途的旧查询协程,而不只是让它的结果被后续状态覆盖")
         coVerify(exactly = 1) { api.items(any(), "Series,Movie", any(), any(), 0, 50, any(), "银") }
         assertEquals(listOf("银魂"), vm.uiState.value.searchResults.items.map { it.name })
     }
