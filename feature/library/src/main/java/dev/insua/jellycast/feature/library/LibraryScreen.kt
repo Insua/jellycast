@@ -29,6 +29,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -154,7 +155,9 @@ fun LibraryScreenContent(
             }
         }
 
-        val gridState = rememberLazyGridState()
+        // 三份列表(剧集 / 电影 / 搜索结果)各自一个滚动状态:共用一个的话,从剧集第 80 条
+        // 切到电影、或从浏览态进搜索,新列表会直接继承上一个列表的滚动位置。
+        val gridState = key(uiState.tab, uiState.isSearching) { rememberLazyGridState() }
 
         // 预取协程只启动一次(key 是稳定的 gridState),所以**绝不能**直接闭包捕获 visible /
         // onLoadNextPage:那样捕获到的永远是首次组合时的那份值——首次组合时第一页还没到货,
