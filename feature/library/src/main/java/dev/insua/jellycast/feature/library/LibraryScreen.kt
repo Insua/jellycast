@@ -30,6 +30,9 @@ import dev.insua.jellycast.model.MediaItem
 import dev.insua.jellycast.model.MediaKind
 import dev.insua.jellycast.network.mapper.posterUrl
 
+/** 滚动到距列表底部还剩这么多项时就预取下一页(设计文档 §3.1)。 */
+private const val PREFETCH_THRESHOLD = 10
+
 /**
  * 媒体库:剧集 / 电影两个 Tab,支持分页加载与搜索。剧集条目点进去是
  * [SeriesDetailScreen](经 [onSeriesClick]);电影条目本身就是完整可播放单元,
@@ -81,7 +84,7 @@ fun LibraryScreen(
             snapshotFlow { gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index }
                 .collect { lastVisibleIndex ->
                     val total = viewModel.uiState.value.visible.items.size
-                    if (lastVisibleIndex != null && total > 0 && lastVisibleIndex >= total - 6) {
+                    if (lastVisibleIndex != null && total > 0 && lastVisibleIndex >= total - PREFETCH_THRESHOLD) {
                         viewModel.loadNextPage()
                     }
                 }
