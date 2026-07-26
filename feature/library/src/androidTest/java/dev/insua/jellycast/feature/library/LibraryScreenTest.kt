@@ -4,9 +4,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertTextContains
+import androidx.compose.ui.test.hasScrollToIndexAction
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.test.performTextInput
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.insua.jellycast.model.MediaItem
@@ -154,5 +156,44 @@ class LibraryScreenTest {
 
         composeTestRule.onNodeWithTag(LibraryScreenTestTags.item("s1")).assertExists()
         composeTestRule.onNodeWithTag(LibraryScreenTestTags.LOADING_MORE).assertExists()
+    }
+
+    // ---- 无限滚动:滚到接近底部必须真的触发 onLoadNextPage ----
+    // 这条专门盯住"预取协程读到的是首次组合时那份过期状态"这个 bug:首屏必须从**空列表**
+    // 开始(和真实 ViewModel 一样:先 isLoading,第一页到货后才有 items),否则闭包捕获的
+    // items.size 恰好就是最终值,bug 被掩盖、测试照样通过。
+    @Test
+    fun 滚动到接近底部触发加载下一页() {
+        var loadCalls = 0
+        val loaded = (1..60).map { mediaItem("s$it", name = "剧集$it") }
+
+        // 首次组合:第一页还没到货(空列表 + 转圈),这正是预取协程启动的时刻。
+        var state by mutableStateOf(LibraryUiState(series = PageState(isLoading = true)))
+        composeTestRule.setContent {
+            LibraryScreenContent(
+                uiState = state,
+                onQueryChange = {},
+                onSelectTab = {},
+                onLoadNextPage = { loadCalls++ },
+                onRetry = {},
+                onSeriesClick = {},
+                onPlay = {},
+            )
+        }
+        composeTestRule.waitForIdle()
+
+        // 第一页到货:60 条,服务端说总共还有 200 条,所以远没到底。
+        state = LibraryUiState(series = PageState(items = loaded, totalCount = 200))
+        composeTestRule.waitForIdle()
+
+        assert(loadCalls == 0) { "还没滚动就不该预取下一页,实际调用了 $loadCalls 次" }
+
+        // 滚到最后一项:此时 lastVisibleIndex >= 60 - PREFETCH_THRESHOLD(10),必须预取。
+        composeTestRule.onNode(hasScrollToIndexAction()).performScrollToIndex(loaded.lastIndex)
+        composeTestRule.waitForIdle()
+
+        assert(loadCalls > 0) {
+            "滚动到列表底部必须触发 onLoadNextPage(无限滚动),实际一次都没触发"
+        }
     }
 }

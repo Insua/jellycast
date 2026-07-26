@@ -29,6 +29,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -155,15 +156,23 @@ fun LibraryScreenContent(
 
         val gridState = rememberLazyGridState()
 
+        // 预取协程只启动一次(key 是稳定的 gridState),所以**绝不能**直接闭包捕获 visible /
+        // onLoadNextPage:那样捕获到的永远是首次组合时的那份值——首次组合时第一页还没到货,
+        // items.size 恒为 0,`total > 0` 永远不成立,无限滚动直接死掉。
+        // rememberUpdatedState 每次重组都把最新值写进同一个 State,而 snapshotFlow 会订阅
+        // 块内读到的 State,于是"已加载条目数变化"本身也能重新驱动一次判定。
+        val currentVisible by rememberUpdatedState(visible)
+        val currentOnLoadNextPage by rememberUpdatedState(onLoadNextPage)
+
         // 滚动到接近列表底部时自动加载下一页;loadNextPage 内部已挡住重复触发。
         LaunchedEffect(gridState) {
-            snapshotFlow { gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index }
-                .collect { lastVisibleIndex ->
-                    val total = visible.items.size
-                    if (lastVisibleIndex != null && total > 0 && lastVisibleIndex >= total - PREFETCH_THRESHOLD) {
-                        onLoadNextPage()
-                    }
+            snapshotFlow {
+                gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index to currentVisible.items.size
+            }.collect { (lastVisibleIndex, total) ->
+                if (lastVisibleIndex != null && total > 0 && lastVisibleIndex >= total - PREFETCH_THRESHOLD) {
+                    currentOnLoadNextPage()
                 }
+            }
         }
 
         LazyVerticalGrid(
