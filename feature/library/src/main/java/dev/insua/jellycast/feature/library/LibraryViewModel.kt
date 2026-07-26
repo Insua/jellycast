@@ -94,6 +94,20 @@ class LibraryViewModel @Inject constructor(
 
     private val queryFlow = MutableStateFlow("")
 
+    /**
+     * **当前 searchResults 里那批结果是哪个查询词产生的** —— 搜索分页请求的"身份证"。
+     *
+     * 搜索第一页走 `flatMapLatest`,换词自动取消;但搜索**第二页**走 [loadNextPage] →
+     * [requestPage],直接 launch 在 [viewModelScope] 上,换词不会取消它。而
+     * [PageState.onPageLoaded] 是泛型容器,只按 startIndex 做幂等保护,不知道也不该知道
+     * "查询词"这回事:旧词第二页(startIndex = 50)迟到时,新词第一页恰好也是 50 条,
+     * startIndex 对得上,于是被当成合法下一页追加进去。所以身份校验必须放在这一层。
+     *
+     * 注意它跟 `_uiState.value.query` 不是一回事:用户敲下新字符到防抖窗口结束之间,
+     * query 已经变了、屏幕上显示的却仍是旧词的结果。翻页要的是**结果的**词,不是输入框的词。
+     */
+    private var displayedSearchTerm: String? = null
+
     init {
         loadLibrary()
 
@@ -104,9 +118,12 @@ class LibraryViewModel @Inject constructor(
                 .distinctUntilChanged()
                 .flatMapLatest { query ->
                     if (query.isBlank()) {
+                        displayedSearchTerm = null
                         flowOf<Result<ItemsResponseDto>?>(null)
                     } else {
                         flow {
+                            // 结果换人的同一时刻改身份:此后迟到的旧词分页都对不上号,会被丢弃。
+                            displayedSearchTerm = query
                             updatePageState(ListTarget.SEARCH) { it.reset().startLoading() }
                             emit(runCatching { fetchPage(types = "Series,Movie", startIndex = 0, searchTerm = query) })
                         }
@@ -143,9 +160,13 @@ class LibraryViewModel @Inject constructor(
         val target = currentTarget()
         val current = getPageState(target)
         if (current.isLoading || current.endReached) return
+        val searchTerm = searchTermFor(target)
+        // 搜索态但还没有任何一批结果落地(防抖窗口内、首次搜索尚未返回):没有可翻的"下一页",
+        // 更不能拿 searchTerm = null 去发请求 —— 那会退化成拉取整个未过滤的库。
+        if (target == ListTarget.SEARCH && searchTerm == null) return
         val startIndex = current.loadedCount
         updatePageState(target) { it.startLoading() }
-        requestPage(target, startIndex, searchTermFor(target))
+        requestPage(target, startIndex, searchTerm)
     }
 
     /** 重试当前可见列表的失败页——本质就是"再要一次下一页",因为失败没有推进 loadedCount。 */
@@ -198,6 +219,10 @@ class LibraryViewModel @Inject constructor(
     private fun requestPage(target: ListTarget, startIndex: Int, searchTerm: String?) {
         viewModelScope.launch {
             val result = runCatching { fetchPage(types = typesFor(target), startIndex = startIndex, searchTerm = searchTerm) }
+            // 身份校验:响应回来时,屏幕上显示的结果如果已经换成别的查询词(或已退出搜索),
+            // 这一页就是"上一场比赛的成绩",直接丢弃 —— 既不追加条目也不覆盖 totalCount。
+            // 此时 searchResults 的 isLoading 由新查询那条管线自己负责收尾,不会卡住。
+            if (target == ListTarget.SEARCH && searchTerm != displayedSearchTerm) return@launch
             result.fold(
                 onSuccess = { response ->
                     updatePageState(target) {
@@ -250,8 +275,13 @@ class LibraryViewModel @Inject constructor(
         ListTarget.SEARCH -> "Series,Movie"
     }
 
+    /**
+     * 翻页要用的查询词。搜索态下取 [displayedSearchTerm](**产生当前这批结果**的词),
+     * 而不是 `_uiState.value.query`(输入框里的实时值)—— 防抖窗口内两者不一致,
+     * 用后者会把新词的第 2 页接到旧词的列表后面。
+     */
     private fun searchTermFor(target: ListTarget): String? =
-        if (target == ListTarget.SEARCH) _uiState.value.query else null
+        if (target == ListTarget.SEARCH) displayedSearchTerm else null
 
     private fun getPageState(target: ListTarget): PageState<MediaItem> = when (target) {
         ListTarget.SERIES -> _uiState.value.series

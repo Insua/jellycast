@@ -269,4 +269,64 @@ class LibraryViewModelTest {
         coVerify(exactly = 1) { api.items(any(), "Series,Movie", any(), any(), 0, 50, any(), "银") }
         assertEquals(listOf("银魂"), vm.uiState.value.searchResults.items.map { it.name })
     }
+
+    // ---- 搜索分页的查询词身份:迟到的旧查询第二页不得粘到新查询结果后面 ----
+    // 搜索**第一页**走 flatMapLatest,换词会被取消;搜索**第二页**走 loadNextPage →
+    // requestPage,直接 launch 在 viewModelScope 上,不会被取消。PageState.onPageLoaded
+    // 只按 startIndex 做幂等保护,它是泛型容器、压根不知道"查询词"这回事:旧词第二页
+    // (startIndex = 50)迟到时,新词第一页刚好也是 50 条,startIndex 对得上,于是被当成
+    // 合法的下一页**追加**进去,totalCount 也被旧词的总数覆盖。用户会看到 50 条毫不相干
+    // 的结果凭空接在自己的搜索结果后面。
+
+    @Test fun `迟到的旧查询第二页不会被追加到新查询结果`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), "Series,Movie", any(), any(), 0, 50, any(), "银") } returns
+            ItemsResponseDto((1..50).map { seriesDto("银-$it") }, total = 300)
+        // "银" 的第二页故意挂住,直到测试主动放行 —— 模拟慢响应迟到。
+        val yinPage2 = CompletableDeferred<Unit>()
+        coEvery { api.items(any(), "Series,Movie", any(), any(), 50, 50, any(), "银") } coAnswers {
+            yinPage2.await()
+            ItemsResponseDto((51..100).map { seriesDto("银-$it") }, total = 300)
+        }
+        coEvery { api.items(any(), "Series,Movie", any(), any(), 0, 50, any(), "银魂") } returns
+            ItemsResponseDto((1..50).map { seriesDto("银魂-$it") }, total = 60)
+
+        val vm = newViewModel(api)
+        vm.onQueryChange("银"); advanceUntilIdle()
+        assertEquals(50, vm.uiState.value.searchResults.items.size)
+
+        vm.loadNextPage()          // "银" 的第二页发出,挂在慢响应上
+        advanceUntilIdle()
+
+        vm.onQueryChange("银魂"); advanceUntilIdle()   // 新查询落地:50 条 "银魂"
+        assertEquals(50, vm.uiState.value.searchResults.items.size)
+
+        yinPage2.complete(Unit)    // 旧查询第二页现在才回来
+        advanceUntilIdle()
+
+        val names = vm.uiState.value.searchResults.items.map { it.name }
+        assertTrue(names.all { it.startsWith("银魂-") }, "新查询结果里混进了旧查询的条目:$names")
+        assertEquals(50, names.size, "迟到的旧查询分页不得追加到新查询结果之后")
+        assertEquals(60, vm.uiState.value.searchResults.totalCount, "totalCount 不得被旧查询的总数覆盖")
+    }
+
+    @Test fun `防抖窗口内翻页请求的是当前展示结果的查询词`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), "Series,Movie", any(), any(), 0, 50, any(), "银") } returns
+            ItemsResponseDto((1..50).map { seriesDto("银-$it") }, total = 300)
+        coEvery { api.items(any(), "Series,Movie", any(), any(), 50, 50, any(), "银") } returns
+            ItemsResponseDto((51..100).map { seriesDto("银-$it") }, total = 300)
+
+        val vm = newViewModel(api)
+        vm.onQueryChange("银"); advanceUntilIdle()
+
+        // 用户又敲了一个字,但 300ms 防抖还没过 —— 屏幕上显示的仍然是 "银" 的结果。
+        vm.onQueryChange("银魂")
+        advanceTimeBy(100)
+        vm.loadNextPage()
+        advanceTimeBy(1)
+
+        coVerify(exactly = 0) { api.items(any(), any(), any(), any(), 50, any(), any(), "银魂") }
+        coVerify(exactly = 1) { api.items(any(), "Series,Movie", any(), any(), 50, 50, any(), "银") }
+    }
 }
