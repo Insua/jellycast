@@ -142,8 +142,10 @@ private object NoopJellyfinApi : JellyfinApi {
         types: String,
         recursive: Boolean,
         sortBy: String,
+        startIndex: Int?,
         limit: Int?,
         parentId: String?,
+        searchTerm: String?,
     ): ItemsResponseDto = error("not used in test")
     override suspend fun resume(userId: String): ItemsResponseDto = error("not used in test")
     override suspend fun nextUp(userId: String, limit: Int): ItemsResponseDto = error("not used in test")

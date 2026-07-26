@@ -5,6 +5,7 @@ import dev.insua.jellycast.network.dto.BaseItemDto
 import dev.insua.jellycast.network.dto.ItemsResponseDto
 import dev.insua.jellycast.network.session.JellyfinSession
 import io.mockk.coEvery
+import io.mockk.coVerify
 import io.mockk.mockk
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -108,5 +109,28 @@ class HomeViewModelTest {
         val sections = viewModel.uiState.value.sections
         assertEquals(1, sections.size)
         assertEquals(HomeSectionKind.NEXT_UP, sections.single().kind)
+    }
+
+    // ---- 库里有 8744 集,「最近添加」不带 limit 会一次性拉全量并渲染 ----
+
+    @Test
+    fun `最近添加带加载上限,不拉全量`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto(items = emptyList())
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto(items = emptyList())
+        coEvery {
+            api.items(any(), any(), any(), any(), any(), any(), any(), any())
+        } returns ItemsResponseDto(items = emptyList())
+
+        val viewModel = HomeViewModel(api, fakeSession())
+        advanceUntilIdle()
+
+        coVerify {
+            api.items(
+                userId = any(), types = "Episode,Movie", recursive = any(),
+                sortBy = "DateCreated", startIndex = any(), limit = 20,
+                parentId = any(), searchTerm = any(),
+            )
+        }
     }
 }

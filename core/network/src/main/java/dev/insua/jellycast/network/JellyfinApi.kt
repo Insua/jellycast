@@ -21,14 +21,18 @@ interface JellyfinApi {
     suspend fun authenticate(@Body body: AuthRequestDto): AuthResultDto
 
     // 原文 GET Users/{userId}/Items 在 10.10.7 已移除,改为 GET Items?userId=
+    // startIndex / searchTerm 均已核对 docs/jellyfin-openapi.json 的 /Items 参数表。
+    // 注意 Jellyfin 对错误大小写的查询参数静默忽略,不报错 —— 参数名必须逐字与 OpenAPI 一致。
     @GET("Items")
     suspend fun items(
         @Query("userId") userId: String,
         @Query("includeItemTypes") types: String,
         @Query("recursive") recursive: Boolean = true,
         @Query("sortBy") sortBy: String = "SortName",
+        @Query("startIndex") startIndex: Int? = null,
         @Query("limit") limit: Int? = null,
         @Query("parentId") parentId: String? = null,
+        @Query("searchTerm") searchTerm: String? = null,
     ): ItemsResponseDto
 
     // 原文 GET Users/{userId}/Items/Resume 在 10.10.7 已移除,改为 GET UserItems/Resume?userId=

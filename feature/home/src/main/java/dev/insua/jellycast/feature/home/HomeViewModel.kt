@@ -71,7 +71,7 @@ class HomeViewModel @Inject constructor(
             }
             val recentDeferred = async {
                 runCatching {
-                    api.items(userId, types = "Episode,Movie", sortBy = "DateCreated")
+                    api.items(userId, types = "Episode,Movie", sortBy = "DateCreated", limit = 20)
                         .items.mapNotNull { it.toMediaItem() }
                 }
             }

@@ -50,9 +50,12 @@ class SessionJellyfinApi(private val session: JellyfinSession) : JellyfinApi {
         types: String,
         recursive: Boolean,
         sortBy: String,
+        startIndex: Int?,
         limit: Int?,
         parentId: String?,
-    ): ItemsResponseDto = delegate { items(userId, types, recursive, sortBy, limit, parentId) }
+        searchTerm: String?,
+    ): ItemsResponseDto =
+        delegate { items(userId, types, recursive, sortBy, startIndex, limit, parentId, searchTerm) }
 
     override suspend fun resume(userId: String): ItemsResponseDto = delegate { resume(userId) }
 
