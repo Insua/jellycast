@@ -42,15 +42,19 @@ class PageStateTest {
         // 场景:重复请求或乱序响应。startIndex=0 的第二次响应不得把首页再追加一遍
         val s = PageState<String>()
             .onPageLoaded(listOf("a", "b"), 0, 4)
+            .startLoading()
             .onPageLoaded(listOf("a", "b"), 0, 4)
         assertEquals(listOf("a", "b"), s.items)
+        assertFalse(s.isLoading)
     }
 
     @Test fun `超前的 startIndex 也被丢弃`() {
         val s = PageState<String>()
             .onPageLoaded(listOf("a"), 0, 10)
+            .startLoading()
             .onPageLoaded(listOf("x"), 5, 10)   // 中间缺了一段,不能接
         assertEquals(listOf("a"), s.items)
+        assertFalse(s.isLoading)
     }
 
     @Test fun `空结果立即视为到底`() {
@@ -77,6 +81,16 @@ class PageStateTest {
             .startLoading()
             .onPageLoaded(listOf("c", "d"), 2, 4)
         assertEquals(listOf("a", "b", "c", "d"), s.items)
+        assertNull(s.error)
+    }
+
+    @Test fun `错误后丢弃的响应清除错误信息`() {
+        // 场景:onError 后收到过期响应,discard 会清除错误状态。这是可接受的行为,但需要显式测试。
+        val s = PageState<String>()
+            .onPageLoaded(listOf("a"), 0, 5)
+            .onError("网络错误")
+            .onPageLoaded(listOf("stale"), 0, 5)  // startIndex 不符,被丢弃
+        assertEquals(listOf("a"), s.items)
         assertNull(s.error)
     }
 
