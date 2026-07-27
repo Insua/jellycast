@@ -6,8 +6,16 @@ import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import dagger.hilt.android.AndroidEntryPoint
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import dev.insua.jellycast.datastore.PreferencesStore
 import dev.insua.jellycast.network.session.JellyfinSession
 import kotlinx.coroutines.CoroutineScope
@@ -168,6 +176,85 @@ class PlaybackService : MediaSessionService() {
     }
 
     /**
+     * ## 🔴 稳定性根因 #1:前台服务时限不得被网络往返绑架
+     *
+     * `Context.startForegroundService()` 之后系统只给 **10 秒**,超时就是
+     * `ForegroundServiceDidNotStartInTimeException` → `bg anr` → 整个进程 `kill -9`。
+     * 用户报的「锁屏就断」「点播放就闪退」都出在这里。
+     *
+     * 在这一行之前,本 Service **自己从不调 `startForeground()`**,完全指望 Media3 的
+     * `MediaNotificationManager` 在"播放器真的开始缓冲"那一刻顺带把服务提到前台。那一刻要等
+     * `POST Items/{id}/PlaybackInfo` 往返 + L1 纯音频探测 + ExoPlayer 拉起远端转码流 ——
+     * Task 1 在**模拟器 + 局域网**实测 `startForegroundDelayMs:10785`,已经越线;真机走公网只会更慢。
+     * 也就是说:**这条时限被网络延迟绑架了,而网络延迟没有上界。**
+     *
+     * ### 为什么选"立刻进前台 + 占位通知",而不是"把解析搬进 Service"
+     *
+     * 把解析搬进 Service 只是把同一段网络往返换个地方跑 —— 只要"进前台"这件事仍然排在解析**之后**,
+     * 时限就仍然和网络耦合。而在这里进前台,时限从 O(网络) 变成 O(微秒),和服务器多慢、
+     * 家宽上行多窄彻底解耦。代价只是可能多显示一秒"正在准备播放",这是诚实的信息。
+     * 另外它也不需要动 `AudioPlaybackEngine` / DI 装配 —— 稳定性修复不该顺手做架构重构。
+     *
+     * ### 为什么用 Media3 的通知 id / channel id
+     *
+     * [MEDIA_NOTIFICATION_ID] / [MEDIA_CHANNEL_ID] 就是 `DefaultMediaNotificationProvider` 的默认值。
+     * 用同一个 id 意味着 Media3 随后 post 的媒体通知是**替换**这条占位通知,而不是并排多出一条;
+     * 用同一个 channel 意味着用户在系统设置里只看到一个「正在播放」通道。
+     *
+     * ### 为什么要先看 `activeNotifications`
+     *
+     * 用户在已经有内容在播时点另一集,会再走一次 `startForegroundService`。这时如果无脑贴占位通知,
+     * 锁屏卡片会从完整的媒体卡片闪回"正在准备播放"再闪回去。所以:媒体通知已经在了就拿它自己
+     * 重新 `startForeground` 一次 —— 视觉上零变化,而"进前台"这个义务照样当场履行完。
+     *
+     * 这里也一并修掉 Task 1 发现的第二个事实:一个进程里只出现过一次 `am_foreground_service_start`。
+     * Service 被销毁重建后 Media3 再也没把它提到前台。现在**每一次** `onStartCommand` 都会进前台,
+     * 不依赖 Media3 内部任何状态。
+     */
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        enterForegroundNow()
+        return super.onStartCommand(intent, flags, startId)
+    }
+
+    private fun enterForegroundNow() {
+        val manager = getSystemService(NotificationManager::class.java) ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    MEDIA_CHANNEL_ID,
+                    NOTIFICATION_CHANNEL_NAME,
+                    NotificationManager.IMPORTANCE_LOW,
+                ),
+            )
+        }
+        val existing = runCatching {
+            manager.activeNotifications.firstOrNull { it.id == MEDIA_NOTIFICATION_ID }?.notification
+        }.getOrNull()
+
+        // 铁律 3/4 的同一条精神:进前台失败也绝不把播放搞崩。真进不去,最坏是回到修复前的行为,
+        // 而不是在这里抛一个没人接得住的异常。
+        runCatching {
+            ServiceCompat.startForeground(
+                this,
+                MEDIA_NOTIFICATION_ID,
+                existing ?: preparingNotification(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+            )
+        }
+    }
+
+    /** 占位通知:只在"媒体通知还没被 Media3 贴出来"的那一小段窗口里出现。 */
+    private fun preparingNotification(): Notification =
+        NotificationCompat.Builder(this, MEDIA_CHANNEL_ID)
+            .setSmallIcon(androidx.media3.session.R.drawable.media3_notification_small_icon)
+            .setContentTitle(PREPARING_TITLE)
+            .setOngoing(true)
+            .setSilent(true)
+            .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .build()
+
+    /**
      * 复审 Critical 2:进度上报的两个时机。
      *
      * 1. **新源就绪** —— 引擎每进入 `Ready` 就是"首播 / 换集 / seek 后重新 resolve"三者之一。
@@ -263,10 +350,24 @@ class PlaybackService : MediaSessionService() {
         mediaSession = null
         engine = null
         serviceScope.cancel()
+        // 占位通知是本类自己贴的,也必须由本类自己收走 —— 否则 Service 销毁后通知栏会留下一条
+        // 点不动的"正在准备播放"。
+        runCatching { ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE) }
         super.onDestroy()
     }
 
     private companion object {
+        /**
+         * 必须和 `DefaultMediaNotificationProvider.DEFAULT_NOTIFICATION_ID` /
+         * `DEFAULT_CHANNEL_ID` 一致 —— 见 [onStartCommand] 的说明。这两个常量在 Media3 里是
+         * public,但刻意不直接引用:直接引用会让"占位通知"这件事看起来像是 Media3 的一部分,
+         * 而它其实是本类为了不被系统杀掉而必须自己承担的责任。
+         */
+        const val MEDIA_NOTIFICATION_ID = 1001
+        const val MEDIA_CHANNEL_ID = "default_channel_id"
+        const val NOTIFICATION_CHANNEL_NAME = "正在播放"
+        const val PREPARING_TITLE = "正在准备播放"
+
         /** 设计文档 §7:进度上报"每 10s 或 seek 时"。 */
         const val PROGRESS_TICK_INTERVAL_MS = 10_000L
 

@@ -27,6 +27,9 @@ dependencies {
     implementation(project(":core:datastore"))
 
     implementation(libs.kotlinx.coroutines)
+    // NotificationCompat / ServiceCompat.startForeground —— PlaybackService 自己进前台需要它们
+    // (见 PlaybackService.onStartCommand 的说明)。
+    implementation(libs.androidx.core.ktx)
     implementation(libs.media3.exoplayer)
     implementation(libs.media3.exoplayer.hls)
     implementation(libs.media3.session)
