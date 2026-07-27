@@ -1,6 +1,9 @@
 package dev.insua.jellycast.feature.server
 
 import dev.insua.jellycast.network.sha256Fingerprint
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.security.cert.X509Certificate
 import javax.net.ssl.SSLContext
@@ -18,12 +21,18 @@ import javax.net.ssl.X509TrustManager
  * `Endpoint.trustedCertSha256`,写入之后也只对这一个 endpoint 生效。
  */
 fun interface PeerCertificateFetcher {
-    fun fetch(endpointUrl: String): X509Certificate?
+    /**
+     * `suspend`,不是普通阻塞函数:这里做的是一次真实 TLS 握手。调用方是 ViewModel 的
+     * `viewModelScope.launch { }`,跑在 `Dispatchers.Main` 上——和 `HttpEndpointProbe.probe()`
+     * 那个 `NetworkOnMainThreadException` 是同一类缺陷(见该函数 KDoc)。切 IO 调度器的责任放在
+     * 实现里,而不是让每个调用方各自记得包一层。
+     */
+    suspend fun fetch(endpointUrl: String): X509Certificate?
 }
 
 object DefaultPeerCertificateFetcher : PeerCertificateFetcher {
-    override fun fetch(endpointUrl: String): X509Certificate? {
-        val httpUrl = endpointUrl.toHttpUrlOrNull() ?: return null
+    override suspend fun fetch(endpointUrl: String): X509Certificate? = withContext(Dispatchers.IO) {
+        val httpUrl = endpointUrl.toHttpUrlOrNull() ?: return@withContext null
         var captured: Array<X509Certificate>? = null
 
         val inspectionOnlyTrustManager = object : X509TrustManager {
@@ -35,7 +44,7 @@ object DefaultPeerCertificateFetcher : PeerCertificateFetcher {
             override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
         }
 
-        return try {
+        try {
             val sslContext = SSLContext.getInstance("TLS").apply {
                 init(null, arrayOf(inspectionOnlyTrustManager), null)
             }
@@ -43,6 +52,9 @@ object DefaultPeerCertificateFetcher : PeerCertificateFetcher {
                 socket.startHandshake()
             }
             captured?.firstOrNull()
+        } catch (e: CancellationException) {
+            // 与 SubtitleRepository / HttpStreamProbe 保持一致:取消不是"取证书失败",必须正常传播。
+            throw e
         } catch (e: Exception) {
             null
         }
@@ -50,5 +62,5 @@ object DefaultPeerCertificateFetcher : PeerCertificateFetcher {
 }
 
 /** [DefaultPeerCertificateFetcher] 拿到的证书算出的指纹,格式与 [sha256Fingerprint] 一致。 */
-fun PeerCertificateFetcher.fetchFingerprint(endpointUrl: String): String? =
+suspend fun PeerCertificateFetcher.fetchFingerprint(endpointUrl: String): String? =
     fetch(endpointUrl)?.sha256Fingerprint()

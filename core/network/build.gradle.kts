@@ -9,7 +9,10 @@ plugins {
 android {
     namespace = "dev.insua.jellycast.network"
     compileSdk = 36
-    defaultConfig { minSdk = 26 }
+    defaultConfig {
+        minSdk = 26
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -40,6 +43,14 @@ dependencies {
     testImplementation(libs.okhttp.mockwebserver)
     testImplementation(libs.okhttp.tls)
     testImplementation(libs.kotlinx.coroutines.test)
+
+    // 真机/模拟器上才存在的行为(StrictMode 的 penaltyDeathOnNetwork)只能在
+    // instrumentation 测试里复现 —— 纯 JVM 单测里 NetworkOnMainThreadException 根本不存在。
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.junit4)
+    androidTestImplementation(libs.okhttp.mockwebserver)
+    androidTestImplementation(libs.kotlinx.coroutines)
 }
 
 // AGP library 模块下 tasks.test 访问器不可用(它是 DefaultTask 聚合器),

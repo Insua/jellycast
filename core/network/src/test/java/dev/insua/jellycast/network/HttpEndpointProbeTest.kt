@@ -2,16 +2,20 @@ package dev.insua.jellycast.network
 
 import dev.insua.jellycast.model.Endpoint
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import okhttp3.Call
+import okhttp3.EventListener
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 class HttpEndpointProbeTest {
@@ -80,5 +84,53 @@ class HttpEndpointProbeTest {
         job.join()
 
         server.shutdown()
+    }
+
+    // 真机 bug:`probe()` 从 `Dispatchers.Main`(ViewModel 的 viewModelScope)调用时抛
+    // NetworkOnMainThreadException。原因不是 enqueue —— 而是 `use { }` 退出时的
+    // `Response.close()`:探测从不读响应体,OkHttp 为了复用连接会 drain 掉剩余的响应体
+    // (FixedLengthSource.close → discard → skipAll → SocketInputStream.read),
+    // 而 suspendCancellableCoroutine 的续体是按**调用方的调度器**恢复的,于是这次阻塞
+    // socket 读落在调用方线程上。
+    //
+    // StrictMode 只有 Android 上才有,所以这条离线用例换个等价的可观测量:OkHttp 的
+    // EventListener.callEnd 正是在关闭响应体的那个线程上回调的。断言它没有落在调用方线程上,
+    // 就等价于断言"没有在调用方线程上做 socket I/O"。修复前这条会红(callEnd 跑在
+    // jellycast-caller 上),修复后为绿。协程调试模式会给线程名追加 " @coroutine#N",
+    // 所以按前缀匹配而不是全等。
+    @Test fun `probe 的响应体收尾不落在调用方线程上`() {
+        val server = MockWebServer().apply {
+            enqueue(MockResponse().setBody("""{"ServerName":"x","Version":"10.10.7","Id":"abc"}"""))
+            start()
+        }
+        val callEndThreads = mutableListOf<String>()
+        val client = OkHttpClient.Builder()
+            .eventListener(object : EventListener() {
+                override fun callEnd(call: Call) {
+                    callEndThreads += Thread.currentThread().name
+                }
+            })
+            .build()
+        val callerExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, CALLER_THREAD) }
+
+        try {
+            val health = runBlocking(callerExecutor.asCoroutineDispatcher()) {
+                HttpEndpointProbe(client).probe(endpointFor(server))
+            }
+
+            assertTrue(health.reachable, "探测应当成功,实际失败原因:${health.failureReason}")
+            assertTrue(callEndThreads.isNotEmpty(), "EventListener.callEnd 应当被回调过")
+            assertTrue(
+                callEndThreads.none { it.startsWith(CALLER_THREAD) },
+                "响应体收尾(阻塞 socket 读)不得发生在调用方线程上,实际线程:$callEndThreads",
+            )
+        } finally {
+            callerExecutor.shutdown()
+            server.shutdown()
+        }
+    }
+
+    private companion object {
+        const val CALLER_THREAD = "jellycast-caller"
     }
 }

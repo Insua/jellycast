@@ -1,5 +1,6 @@
 package dev.insua.jellycast.network
 
+import android.util.Log
 import dev.insua.jellycast.model.Endpoint
 import dev.insua.jellycast.model.EndpointHealth
 import kotlinx.coroutines.CancellationException
@@ -12,7 +13,33 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
 interface EndpointProbe {
+    /**
+     * 契约:实现**必须能从任意调度器安全调用**(包括 `Dispatchers.Main` —— ViewModel 的
+     * `viewModelScope.launch { }` 就跑在那儿)。谁做阻塞 I/O,谁自己保证切到 IO 调度器,
+     * 不能指望每个调用方记得包一层 `withContext(Dispatchers.IO)`。
+     */
     suspend fun probe(endpoint: Endpoint): EndpointHealth
+}
+
+private const val PROBE_LOG_TAG = "JellyCast/Endpoint"
+
+/**
+ * 探测异常 → 给用户看的一行原因,**同时把带完整栈回溯的原始异常打进 logcat**。
+ *
+ * 原来这里只有 `e.javaClass.simpleName + ": " + (e.message ?: "")`:遇到 message 为 null 的异常
+ * (`NetworkOnMainThreadException` 就是),用户看到的是一个尾巴空着的 `"NetworkOnMainThreadException:"`,
+ * 而栈回溯**一个字节都没留下**——既没进 logcat,也没进 UI,现场完全无法定位。所以这里补一条
+ * `Log.w(tag, msg, e)`:栈只进 logcat(`adb logcat -s JellyCast/Endpoint`),UI 仍然只拿到简短的
+ * 一行,不把栈糊到用户脸上。
+ */
+internal fun describeProbeFailure(endpoint: Endpoint, e: Throwable): String {
+    Log.w(PROBE_LOG_TAG, "probe failed: ${endpoint.label} (${endpoint.url})", e)
+    val detail = e.message?.trim().orEmpty()
+    // AddServerScreen 靠 failureReason 里的 "SSL" 判断要不要显示「查看证书」,
+    // buildUnreachableMessage 靠 "timeout" 判断要不要提示检查 Tailscale——
+    // 异常类名本身就带这两个关键词(SSLHandshakeException / SocketTimeoutException),
+    // 所以类名必须留着,message 为空时不要拖一个空的冒号尾巴。
+    return if (detail.isEmpty()) e.javaClass.simpleName else "${e.javaClass.simpleName}: $detail"
 }
 
 /**
@@ -84,6 +111,6 @@ class EndpointSelector(
     } catch (e: CancellationException) {
         throw e
     } catch (e: Exception) {
-        EndpointHealth(endpoint, false, null, e.javaClass.simpleName + ": " + (e.message ?: ""))
+        EndpointHealth(endpoint, false, null, describeProbeFailure(endpoint, e))
     }
 }

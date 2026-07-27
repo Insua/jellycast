@@ -3,7 +3,9 @@ package dev.insua.jellycast.network
 import dev.insua.jellycast.model.Endpoint
 import dev.insua.jellycast.model.EndpointHealth
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.HttpUrl
@@ -44,9 +46,27 @@ class HttpEndpointProbe(
         .readTimeout(timeoutMs, TimeUnit.MILLISECONDS)
         .build()
 
-    override suspend fun probe(endpoint: Endpoint): EndpointHealth {
+    /**
+     * ## 为什么整段跑在 [Dispatchers.IO] 上,而不是"反正 enqueue 是异步的所以随便哪个线程都行"
+     *
+     * `enqueue()` 本身确实不在调用线程上做网络 I/O,但 **`Response.close()` 会**:
+     * 探测只看状态码、从不读响应体,于是 `use { }` 退出时 OkHttp 为了让连接能复用,会把没读完的
+     * 响应体 drain 掉——`Http1ExchangeCodec$FixedLengthSource.close()` → `discard()` →
+     * `skipAll()` → `SocketInputStream.read()`,一次**阻塞 socket 读**。而
+     * `suspendCancellableCoroutine` 的续体是按**调用方的调度器**恢复的,所以调用方在
+     * `Dispatchers.Main`(`viewModelScope.launch { }` 就是)时,这个 socket 读发生在主线程上,
+     * StrictMode 直接抛 `NetworkOnMainThreadException`。
+     *
+     * 而且它是**竞态**的:如果响应头和响应体恰好在同一个 TCP 段里到达,drain 只消耗 okio 缓冲区、
+     * 不碰 socket,就什么事都没有——这正是真机上"有时能连上、有时报错"的原因,也是 274 个纯 JVM
+     * 单测全绿却没发现它的原因(JVM 上根本没有 StrictMode)。
+     *
+     * 因此 dispatcher 保证放在这里、而不是放在 ViewModel 调用点:一个执行 I/O 的 `suspend` 函数
+     * 必须能从任意调度器安全调用,这是被调用方的契约,不是每个调用方各自记得包一层 IO 的义务。
+     */
+    override suspend fun probe(endpoint: Endpoint): EndpointHealth = withContext(Dispatchers.IO) {
         val start = System.currentTimeMillis()
-        return try {
+        try {
             val request = Request.Builder().url(buildHealthCheckUrl(endpoint.url)).get().build()
             val call = client.newCall(request)
             call.await().use { response ->
@@ -61,7 +81,7 @@ class HttpEndpointProbe(
             // propagate cancellation, not be swallowed into a fake "failed" health result.
             throw e
         } catch (e: Exception) {
-            EndpointHealth(endpoint, false, null, e.javaClass.simpleName + ": " + (e.message ?: ""))
+            EndpointHealth(endpoint, false, null, describeProbeFailure(endpoint, e))
         }
     }
 

@@ -191,7 +191,7 @@ class ServerViewModelTest {
     @Test
     fun `确认证书指纹应写入目标地址而不是前面的空行`() = runTest {
         val certificateFetcher = mockk<PeerCertificateFetcher>()
-        every { certificateFetcher.fetch(any()) } returns fakeCertificate(1)
+        coEvery { certificateFetcher.fetch(any()) } returns fakeCertificate(1)
 
         val targetUrl = "http://192.168.1.10:8096"
         // 用 any() + captured 参数回填结果,而不是手写期望的 Endpoint(priority 取决于表单里的
@@ -231,7 +231,7 @@ class ServerViewModelTest {
     @Test
     fun `确认证书指纹不影响其它地址行`() = runTest {
         val certificateFetcher = mockk<PeerCertificateFetcher>()
-        every { certificateFetcher.fetch(any()) } returns fakeCertificate(2)
+        coEvery { certificateFetcher.fetch(any()) } returns fakeCertificate(2)
 
         val e1 = lan()
         val e2 = tailscale()
@@ -259,7 +259,7 @@ class ServerViewModelTest {
     @Test
     fun `取消证书确认不写入任何指纹`() = runTest {
         val certificateFetcher = mockk<PeerCertificateFetcher>()
-        every { certificateFetcher.fetch(any()) } returns fakeCertificate(3)
+        coEvery { certificateFetcher.fetch(any()) } returns fakeCertificate(3)
 
         val target = lan()
         coEvery { endpointSelector.probeAll(listOf(target)) } returns listOf(
