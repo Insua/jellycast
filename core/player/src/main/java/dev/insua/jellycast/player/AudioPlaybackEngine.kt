@@ -166,6 +166,26 @@ class AudioPlaybackEngineImpl(
     @Volatile
     private var currentStartPositionMs: Long? = null
 
+    /**
+     * ## 稳定性根因 #2:连点快进时"最后请求的那一次说了算"
+     *
+     * 生产路径上唯一存在并发的地方:`SeekInterceptingPlayer.seekForward()` → [EngineSeekRouter] →
+     * `scope.launch { engine.seekTo(...) }` —— **每一次按键都新起一个协程,谁也不等谁**。用户连点
+     * 三下快进,就是三个并发的 [resolveAndPrepare] 各自跑一次 `PlaybackInfo` 往返 + 一次 L1 探测。
+     *
+     * 在这个计数器之前,**哪一次先完成哪一次说了算**。而"先按下的那次"完全可能后完成(撞上一次慢的
+     * PlaybackInfo、或者服务端起转码起得慢),于是进度条跳到最后一个目标之后又自己退回去;更糟的是
+     * 一个**迟到的失败**会把 `state` 打成 `Error`、UI 弹「该条目无法播放」,而耳机里明明在响。
+     *
+     * 每次请求领一个单调递增的号,拿到结果时号已经不是最新的就整条丢弃 —— 不 prepare、不动流基准、
+     * 不改 state。
+     *
+     * **线程契约:** "对号"和"落地"之间没有挂起点,而生产上所有 play/seek 都发生在主线程
+     * (`PlaybackService` 的 main-looper scope、`viewModelScope`、`Dispatchers.Main.immediate`),
+     * 所以这段检查-然后-写入是原子的。
+     */
+    private val requestSeq = java.util.concurrent.atomic.AtomicLong(0L)
+
     override val absolutePositionMs: Long
         get() = currentStartPositionMs
             ?.plus(playerControl.currentPositionMs.coerceAtLeast(0L))
@@ -185,8 +205,10 @@ class AudioPlaybackEngineImpl(
     }
 
     private suspend fun resolveAndPrepare(itemId: String, userId: String, startPositionMs: Long) {
+        val token = requestSeq.incrementAndGet()
         try {
             val source = sourceProvider.resolve(itemId, userId, startPositionMs)
+            if (isStale(token)) return
             playerControl.setMediaItemAndPrepare(source.streamUrl)
             // 顺序要紧:先换基准,再发 Ready。反过来的话观察 Ready 的进度上报可能读到旧基准 + 已归零
             // 的流内位置,报出一个"倒退"的绝对位置。
@@ -195,12 +217,25 @@ class AudioPlaybackEngineImpl(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            // 迟到的失败同样要丢弃:此刻在播的是**更新的那一次请求**接上的流,把它打成 Error
+            // 会让用户在"耳机里正在响"的同时看到「该条目无法播放」。
+            if (isStale(token)) return
             _state.value = PlaybackEngineState.Error(itemId)
         }
     }
 
-    /** 见 [AudioPlaybackEngine.reset]。刻意**不**碰 [playerControl]:那个播放器是 `@Singleton`。 */
+    /** 见 [requestSeq]:领号之后又有更新的请求进来,这一次的结果就已经没有意义了。 */
+    private fun isStale(token: Long): Boolean = requestSeq.get() != token
+
+    /**
+     * 见 [AudioPlaybackEngine.reset]。刻意**不**碰 [playerControl]:那个播放器是 `@Singleton`。
+     *
+     * 领一个新号(见 [requestSeq]):Service 销毁那一刻可能正有一次 resolve 在飞,它落地时播放器
+     * 已经被 `stop()` + `clearMediaItems()` 了,再让它 prepare 一条流 + 发 `Ready` 就是凭空复活
+     * 一个没人在听的播放会话。
+     */
     override fun reset() {
+        requestSeq.incrementAndGet()
         currentItemId = null
         currentUserId = null
         currentStartPositionMs = null
