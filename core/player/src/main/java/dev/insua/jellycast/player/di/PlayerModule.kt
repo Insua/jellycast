@@ -106,10 +106,9 @@ object PlayerModule {
     @Singleton
     fun provideAutoPlayNextController(
         playQueue: PlayQueue,
-        sourceProvider: PlaybackSourceProvider,
         api: JellyfinApi,
         preferencesStore: PreferencesStore,
-    ): AutoPlayNextController = AutoPlayNextController(playQueue, sourceProvider, api, preferencesStore)
+    ): AutoPlayNextController = AutoPlayNextController(playQueue, api, preferencesStore)
 
     /**
      * 单例 [ExoPlayer]:同一个实例既是 [AudioPlaybackEngine] 内部驱动的播放器,也是

@@ -17,26 +17,34 @@ import kotlinx.coroutines.flow.first
  *
  * 决策顺序(计划 Task 11 Step 5 + 控制者修正 §2):
  * 1. `autoPlayNext` 为 false → 不连播。
- * 2. [PlayQueue.hasNext] → [PlayQueue.next],解析新的 [PlaybackSource]。
- * 3. 队列已耗尽 → 调 [JellyfinApi.nextUp] 补充队列,取补充后的第一项解析;NextUp 也空(或调用
+ * 2. [PlayQueue.hasNext] → [PlayQueue.next]。
+ * 3. 队列已耗尽 → 调 [JellyfinApi.nextUp] 补充队列,取补充后的第一项;NextUp 也空(或调用
  *    失败)则不连播,不向上抛错——和字幕/进度上报同样的"静默降级,绝不打断播放"原则。
  *
- * 只依赖 [PlayQueue](纯 Kotlin,已单测)、[PlaybackSourceProvider](fun interface,单测可造假)、
- * [JellyfinApi](MockK 可造假)、`autoPlayNext: Flow<Boolean>`——不依赖真实播放器,离线可单测。
+ * ## 稳定性根因 #4:本类**不**解析播放源
+ *
+ * 这里原本会 `resolve()` 一次并返回 [PlaybackSource],而调用方 [PlaybackEndedAdvancer] 把它整个丢掉、
+ * 转手经 [AudioPlaybackEngine.play] 再解析一次(那次才是真正拿来播的)。于是**每次换集都白跑一整个
+ * `POST Items/{id}/PlaybackInfo` 往返**,并在 Jellyfin 上凭空多开一个等不到 stop 的播放会话。
+ * 在家宽上行受限的真机上,这一次多余的往返直接顶在"上一集刚播完、下一集还没出声"的静默窗口上。
+ *
+ * 而"要不要连播、连播到哪一条"这个决策**根本不需要播放源** —— 它只依赖偏好开关、睡眠定时武装状态
+ * 和队列。所以本类只回答"下一条是哪个 [MediaItem]",解析留给唯一真正需要它的地方。
+ *
+ * 只依赖 [PlayQueue](纯 Kotlin,已单测)、[JellyfinApi](MockK 可造假)、
+ * `autoPlayNext: Flow<Boolean>`——不依赖真实播放器,离线可单测。
  * 次构造函数直接接 [PreferencesStore],生产环境用 `PreferencesStore.autoPlayNext` 构造。
  */
 class AutoPlayNextController(
     private val queue: PlayQueue,
-    private val sourceProvider: PlaybackSourceProvider,
     private val api: JellyfinApi,
     private val autoPlayNext: Flow<Boolean>,
 ) {
     constructor(
         queue: PlayQueue,
-        sourceProvider: PlaybackSourceProvider,
         api: JellyfinApi,
         preferencesStore: PreferencesStore,
-    ) : this(queue, sourceProvider, api, preferencesStore.autoPlayNext)
+    ) : this(queue, api, preferencesStore.autoPlayNext)
 
     /**
      * 「播完本集」睡眠定时模式(设计文档 §3.5)落地处:一次性武装标志,武装后下一次
@@ -58,16 +66,15 @@ class AutoPlayNextController(
         stopAfterCurrentEpisode.value = false
     }
 
-    suspend fun onPlaybackEnded(userId: String): PlaybackSource? {
+    /** 返回该接着播的条目;不连播时为 null。见类注释:这里**不**解析播放源。 */
+    suspend fun onPlaybackEnded(userId: String): MediaItem? {
         if (stopAfterCurrentEpisode.value) {
             stopAfterCurrentEpisode.value = false
             return null
         }
         if (!autoPlayNext.first()) return null
 
-        val next = queue.next() ?: refillFromNextUp(userId) ?: return null
-        return runCatching { sourceProvider.resolve(next.id, userId, 0L) }
-            .getOrNull()
+        return queue.next() ?: refillFromNextUp(userId)
     }
 
     /**

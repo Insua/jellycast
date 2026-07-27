@@ -62,7 +62,7 @@ class PlaybackEndedAdvancerTest {
             resolvedItemIds += itemId
             source(itemId)
         }
-        val controller = AutoPlayNextController(queue, provider, api, flowOf(true))
+        val controller = AutoPlayNextController(queue, api, flowOf(true))
         val engine = AudioPlaybackEngineImpl(provider, RecordingPlayerControl())
         val advancer = PlaybackEndedAdvancer(engine, controller) { "u1" }
 
@@ -79,11 +79,47 @@ class PlaybackEndedAdvancerTest {
         assertEquals("2", resolvedItemIds.last(), "seekTo 应该针对新一集重新 resolve,不是停在旧一集的 itemId")
     }
 
+    /**
+     * ## 稳定性根因 #4:一次换集只该解析一次播放源
+     *
+     * [AutoPlayNextController] 原本自己 `resolve()` 一次(只为了回答"要不要连播/连播到哪一条"),
+     * 结果被整个丢掉;紧接着 [PlaybackEndedAdvancer] 又经 `engine.play()` 再 resolve 一次才是真正
+     * 用来播的那一条。于是**每次换集都白跑一整个 `POST Items/{id}/PlaybackInfo` 往返**,
+     * 并在 Jellyfin 上凭空多开一个等不到 stop 的播放会话。
+     *
+     * "要不要连播"这个决策**根本不需要播放源** —— 它只依赖偏好开关、睡眠定时武装状态和队列。
+     * 把 resolve 留给唯一真正需要它的地方([AudioPlaybackEngine.play]),换集路径就只剩一次往返,
+     * 而且 engine 的 `currentItemId` 和实际在放的条目依然是同一条(Finding 1 的不变量不受影响)。
+     */
+    @Test fun `一次自动连播只解析一次播放源`() = runTest {
+        val queue = PlayQueue().apply { setQueue(listOf(ep("1"), ep("2")), 0) }
+        val api = mockk<JellyfinApi>()
+        val resolvedItemIds = mutableListOf<String>()
+        val provider = PlaybackSourceProvider { itemId, _, _ ->
+            resolvedItemIds += itemId
+            source(itemId)
+        }
+        val controller = AutoPlayNextController(queue, api, flowOf(true))
+        val engine = AudioPlaybackEngineImpl(provider, RecordingPlayerControl())
+        val advancer = PlaybackEndedAdvancer(engine, controller) { "u1" }
+
+        engine.play("1", "u1", 0L)
+        resolvedItemIds.clear()
+
+        advancer.onPlaybackEnded()
+
+        assertEquals(
+            listOf("2"),
+            resolvedItemIds,
+            "一次换集只该解析一次播放源;多出来的那次是白跑的 PlaybackInfo 往返 + 一个等不到 stop 的幽灵会话",
+        )
+    }
+
     @Test fun `武装播完本集时,STATE_ENDED 不推进,engine 状态保持当前集`() = runTest {
         val queue = PlayQueue().apply { setQueue(listOf(ep("1"), ep("2")), 0) }
         val api = mockk<JellyfinApi>()
         val provider = PlaybackSourceProvider { itemId, _, _ -> source(itemId) }
-        val controller = AutoPlayNextController(queue, provider, api, flowOf(true))
+        val controller = AutoPlayNextController(queue, api, flowOf(true))
         val engine = AudioPlaybackEngineImpl(provider, RecordingPlayerControl())
         val advancer = PlaybackEndedAdvancer(engine, controller) { "u1" }
 
@@ -110,7 +146,7 @@ class PlaybackEndedAdvancerTest {
             }
             source(itemId)
         }
-        val controller = AutoPlayNextController(queue, provider, api, flowOf(true))
+        val controller = AutoPlayNextController(queue, api, flowOf(true))
         val engine = AudioPlaybackEngineImpl(provider, RecordingPlayerControl())
         val advancer = PlaybackEndedAdvancer(engine, controller) { "u1" }
 
