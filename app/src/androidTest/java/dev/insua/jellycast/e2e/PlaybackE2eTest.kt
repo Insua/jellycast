@@ -27,7 +27,11 @@ import dev.insua.jellycast.player.AudioPlaybackEngine
 import dev.insua.jellycast.player.PlayQueue
 import dev.insua.jellycast.player.PlaybackService
 import dev.insua.jellycast.player.MediaControllerPlayerConnection
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertTrue
@@ -90,6 +94,9 @@ class PlaybackE2eTest {
     private lateinit var userId: String
     private lateinit var playableItem: MediaItem
 
+    /** 自动连播场景需要队列里有第二条;和 [playableItem] 来自同一次挑选。 */
+    private lateinit var secondItem: MediaItem
+
     @Before
     fun setUp() {
         TestCredentials.assumeConfigured()
@@ -107,7 +114,9 @@ class PlaybackE2eTest {
         runBlocking {
             seedSession()
             userId = session.userId()
-            playableItem = pickPlayableItem(userId)
+            val picked = pickPlayableItems(userId)
+            playableItem = picked.first()
+            secondItem = picked[1]
         }
 
         // Media3 的标准路径:UI 只通过 MediaController 跟会话对话。这里把它拉起来,让
@@ -238,6 +247,106 @@ class PlaybackE2eTest {
         )
     }
 
+    // ---------------------------------------------------------------- 场景 3b
+
+    /**
+     * 场景 3b:**连点快进(短时间内连续多次 seek)之后,落点必须是最后一次请求的位置,且仍在播。**
+     *
+     * 用户报的四个崩溃点里明确有 "seek 与切集"。Task 1 的场景 3 只测了**一次**孤立的 seek,
+     * 而现实里用户是**连点**快进键的 —— 那正是生产路径上唯一存在并发的地方:
+     * `SeekInterceptingPlayer.seekForward()` → `EngineSeekRouter` → `scope.launch { engine.seekTo() }`,
+     * 每一次按键都**新起一个协程**,谁也不等谁。于是 N 次连点 = N 个并发的
+     * `resolve()`(每个都是一次 PlaybackInfo 往返 + 一次 L1 探测 GET),
+     * 而最终留在播放器上的是**最后完成**的那一条,不是**最后请求**的那一次。
+     *
+     * 本用例严格复刻这条路(同一个主线程 scope 上 launch,不做任何串行化),断言的是用户的期望:
+     * **最后按下的那一次说了算。**
+     */
+    @Test
+    fun `连点快进之后落在最后一次目标并继续播放`() {
+        startPlayback(playableItem, startPositionMs = 0L)
+        assertTrue(
+            "播放从未开始,无法验证连点快进。${diagnostics()}",
+            awaitCondition(STARTUP_TIMEOUT_MS) { position() > 0L },
+        )
+
+        val targets = rapidSeekTargets(playableItem)
+        val seekScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+        try {
+            targets.forEach { target ->
+                // 和 EngineSeekRouter 完全一样:launch 出去就不管了,不等它完成。
+                instrumentation.runOnMainSync { seekScope.launch { engine.seekTo(target) } }
+                Thread.sleep(RAPID_SEEK_INTERVAL_MS)
+            }
+
+            val last = targets.last()
+            val lower = last - SEEK_TOLERANCE_BEFORE_MS
+            val upper = last + SEEK_TOLERANCE_AFTER_MS
+            val landed = awaitCondition(SEEK_TIMEOUT_MS) { position() in lower..upper }
+            assertTrue(
+                "连点 ${targets.size} 次快进(目标依次为 $targets,间隔 ${RAPID_SEEK_INTERVAL_MS}ms)之后," +
+                    "落点不是最后一次请求的位置:期望 [$lower, $upper],实际 ${position()}ms。" +
+                    "${SEEK_TIMEOUT_MS / 1000}s 内一直没落到位。${diagnostics()}",
+                landed,
+            )
+
+            val from = position()
+            val keptGoing = awaitCondition(ADVANCE_WINDOW_MS) { position() - from >= MIN_ADVANCE_AFTER_SEEK_MS }
+            assertNoPlaybackError("连点快进之后")
+            assertTrue(
+                "连点快进之后播放停住了:${ADVANCE_WINDOW_MS / 1000}s 内只前进了 ${position() - from}ms。${diagnostics()}",
+                keptGoing,
+            )
+        } finally {
+            seekScope.cancel()
+        }
+    }
+
+    // ---------------------------------------------------------------- 场景 3c
+
+    /**
+     * 场景 3c:**一集播完自动连播到下一集。**
+     *
+     * 用户报的"切集异常"就落在这里。这条路和其它三条都不一样:它由 `Player.STATE_ENDED` 触发,
+     * 经 `PlaybackService` 的监听器 → `PlaybackEndedAdvancer` → `AutoPlayNextController` →
+     * `AudioPlaybackEngine.play`,中间还夹着一次进度上报。
+     *
+     * 为了不用等一整集播完,这里从**距结尾 [AUTOPLAY_TAIL_MS] 处**开始播 —— 转码流从这个
+     * `startTimeTicks` 起,播到头就是真实的 `STATE_ENDED`,和播完整集触发的是同一个回调。
+     *
+     * 断言分两级:引擎当前 `Ready` 的条目 id 必须换成第二条(状态真的推进了),
+     * 而且**新的一集要真的在出声**(位置继续前进)——只换 id 不出声正是"切集之后没声音"。
+     */
+    @Test
+    fun `一集播完自动连播到下一集`() {
+        val next = secondItem
+        val queue = listOf(playableItem, next)
+        playQueue.setQueue(queue, 0)
+        ContextCompat.startForegroundService(context, Intent(context, PlaybackService::class.java))
+
+        val nearEnd = ((playableItem.runTimeMs ?: 0L) - AUTOPLAY_TAIL_MS).coerceAtLeast(0L)
+        runBlocking(Dispatchers.Main) { engine.play(playableItem.id, userId, nearEnd) }
+        assertTrue(
+            "第一集都没播起来,自动连播无从谈起。${diagnostics()}",
+            awaitCondition(STARTUP_TIMEOUT_MS) { position() > 0L },
+        )
+
+        val switched = awaitCondition(AUTOPLAY_TIMEOUT_MS) { currentReadyItemId() == next.id }
+        assertTrue(
+            "第一集播完之后没有连播到下一集:引擎当前条目仍是 ${currentReadyItemId()}," +
+                "期望 ${next.id}。${diagnostics()}",
+            switched,
+        )
+
+        val from = position()
+        val playing = awaitCondition(ADVANCE_WINDOW_MS) { position() - from >= MIN_ADVANCE_AFTER_SEEK_MS }
+        assertNoPlaybackError("自动连播之后")
+        assertTrue(
+            "连播到下一集之后没有出声:${ADVANCE_WINDOW_MS / 1000}s 内只前进了 ${position() - from}ms。${diagnostics()}",
+            playing,
+        )
+    }
+
     // ---------------------------------------------------------------- 场景 4
 
     /**
@@ -316,7 +425,7 @@ class PlaybackE2eTest {
      * 没有剧集就退回电影。挑不到就让测试**失败**而不是跳过 —— 服务器配好了却一个可播条目都没有,
      * 那是需要人看一眼的事实,不是"环境没配"。
      */
-    private suspend fun pickPlayableItem(userId: String): MediaItem {
+    private suspend fun pickPlayableItems(userId: String): List<MediaItem> {
         val candidates = mutableListOf<BaseItemDto>()
         candidates += runCatching { api.items(userId = userId, types = "Episode", limit = 50).items }
             .getOrElse { emptyList() }
@@ -325,12 +434,14 @@ class PlaybackE2eTest {
                 .getOrElse { emptyList() }
         }
 
-        val chosen = candidates.firstOrNull { it.longEnough }
-            ?: candidates.firstOrNull()
+        // 第一条要够长(seek 场景要跳到 10 分钟);第二条只用来验证自动连播换集,不挑长度。
+        val mapped = candidates.mapNotNull { it.toMediaItem() }
+        val first = mapped.firstOrNull { (it.runTimeMs ?: 0L) >= MIN_ITEM_RUNTIME_MS }
+            ?: mapped.firstOrNull()
             ?: throw AssertionError("服务器上找不到任何 Episode / Movie 条目,无法进行端到端播放验证。")
-
-        return chosen.toMediaItem()
-            ?: error("条目 ${chosen.id} 的类型 ${chosen.type} 不被 MediaItemMapper 识别")
+        val second = mapped.firstOrNull { it.id != first.id }
+            ?: throw AssertionError("服务器上只有一个可播条目,无法验证自动连播换集。")
+        return listOf(first, second)
     }
 
     private val BaseItemDto.longEnough: Boolean
@@ -349,6 +460,21 @@ class PlaybackE2eTest {
     private fun seekTargetMs(item: MediaItem): Long {
         val runtime = item.runTimeMs ?: 0L
         return if (runtime >= MIN_ITEM_RUNTIME_MS) DEFAULT_SEEK_TARGET_MS else (runtime / 2).coerceAtLeast(30_000L)
+    }
+
+    /**
+     * 连点快进的目标序列。刻意按**条目时长的比例**取,而不是"600s 起、每次 +30s" ——
+     * 后者对一个 8 分钟的条目会请求超过结尾的 `startTimeTicks`,测出来的是服务端边界行为,
+     * 不是本项目要验证的东西。留出 [AUTOPLAY_TAIL_MS] 的尾部余量,保证最后一次落点之后还有得播。
+     */
+    private fun rapidSeekTargets(item: MediaItem): List<Long> {
+        val usable = ((item.runTimeMs ?: 0L) - AUTOPLAY_TAIL_MS).coerceAtLeast(120_000L)
+        return (1..RAPID_SEEK_COUNT).map { usable * it / (RAPID_SEEK_COUNT + 1) }
+    }
+
+    /** 引擎当前 `Ready` 的条目 id;没有就绪的源时为 null。 */
+    private fun currentReadyItemId(): String? = onMain {
+        (engine.state.value as? dev.insua.jellycast.player.PlaybackEngineState.Ready)?.source?.itemId
     }
 
     // ---------------------------------------------------------------- 工具
@@ -438,6 +564,14 @@ class PlaybackE2eTest {
         const val SEEK_TOLERANCE_BEFORE_MS = 10_000L
         const val SEEK_TOLERANCE_AFTER_MS = 30_000L
         const val MIN_ADVANCE_AFTER_SEEK_MS = 3_000L
+
+        /** 连点快进:次数与间隔。间隔取得比一次 resolve 的耗时短,才能真的把并发窗口打开。 */
+        const val RAPID_SEEK_COUNT = 4
+        const val RAPID_SEEK_INTERVAL_MS = 700L
+
+        /** 自动连播:从距结尾这么近的地方开播,不用等一整集。 */
+        const val AUTOPLAY_TAIL_MS = 25_000L
+        const val AUTOPLAY_TIMEOUT_MS = 120_000L
 
         const val BACKGROUND_WINDOW_MS = 20_000L
         const val MIN_BACKGROUND_ADVANCE_MS = 8_000L
