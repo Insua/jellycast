@@ -30,20 +30,49 @@ data class CachedItemEntity(
     val updatedAt: Long,
 )
 
+/**
+ * "(serverId, bucket) 有没有被成功刷新过"这一位单独存放,独立于 [CachedItemEntity] 的行数。
+ *
+ * [CachedItemDao.observeBucket] 只能回答"这个 bucket 现在有几行",回答不了"零行是因为从没
+ * 刷新过,还是刷新过、服务端就是没有内容"——这两种情况对调用方的意义完全不同(前者该显示
+ * "无法连接服务器 + 重试",后者该显示"这里还没有内容"),仅凭 `cached_item` 表分不出来。
+ *
+ * 这张表只回答"有没有刷新过"这一个问题,不管刷新完是不是空的。[refreshedAt] 目前只用于
+ * 调试和未来可能的 TTL,读缓存的判断只看这一行**存不存在**,不看它的值。
+ */
+@Entity(tableName = "cache_bucket_meta", primaryKeys = ["serverId", "bucket"])
+data class CacheBucketMetaEntity(
+    val serverId: String,
+    val bucket: String,
+    val refreshedAt: Long,
+)
+
 @Dao
 interface CachedItemDao {
 
     @Query("SELECT * FROM cached_item WHERE serverId = :serverId AND bucket = :bucket ORDER BY position ASC")
     fun observeBucket(serverId: String, bucket: String): Flow<List<CachedItemEntity>>
 
+    /** true 表示 (serverId, bucket) 至少成功刷新过一次——哪怕刷新完是空的。 */
+    @Query("SELECT EXISTS(SELECT 1 FROM cache_bucket_meta WHERE serverId = :serverId AND bucket = :bucket)")
+    suspend fun hasRefreshedBucket(serverId: String, bucket: String): Boolean
+
     /**
-     * 整体替换一个 bucket:先删掉该 serverId+bucket 下的所有旧行,再插入新行。
-     * 用事务包裹,避免观察者在删除和插入之间看到一个空 bucket 的瞬间状态。
+     * 整体替换一个 bucket:先删掉该 serverId+bucket 下的所有旧行,再插入新行,并把
+     * [CacheBucketMetaEntity] 标记为"这一刻刷新过"——即使 [items] 是空的,这一位也要写,
+     * 这样"服务端确实没有"和"从没刷新过"才分得清楚。用事务包裹,避免观察者在删除和插入之间
+     * 看到一个空 bucket 的瞬间状态。
      */
     @Transaction
-    suspend fun replaceBucket(serverId: String, bucket: String, items: List<CachedItemEntity>) {
+    suspend fun replaceBucket(
+        serverId: String,
+        bucket: String,
+        items: List<CachedItemEntity>,
+        refreshedAt: Long = System.currentTimeMillis(),
+    ) {
         deleteBucket(serverId, bucket)
         if (items.isNotEmpty()) insertAll(items)
+        upsertBucketMeta(CacheBucketMetaEntity(serverId, bucket, refreshedAt))
     }
 
     @Query("DELETE FROM cached_item WHERE serverId = :serverId AND bucket = :bucket")
@@ -52,9 +81,33 @@ interface CachedItemDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertAll(items: List<CachedItemEntity>)
 
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertBucketMeta(meta: CacheBucketMetaEntity)
+
+    /** 清空某台服务器的全部缓存,含 [CacheBucketMetaEntity]——否则残留的"刷新过"标记会让
+     *  下次(比如换了新服务器复用同一 serverId 的极端场景下)把从未刷新过的 bucket 误判成
+     *  "刷新过但是空的"。 */
+    @Transaction
+    suspend fun clearServer(serverId: String) {
+        deleteItemsForServer(serverId)
+        deleteMetaForServer(serverId)
+    }
+
     @Query("DELETE FROM cached_item WHERE serverId = :serverId")
-    suspend fun clearServer(serverId: String)
+    suspend fun deleteItemsForServer(serverId: String)
+
+    @Query("DELETE FROM cache_bucket_meta WHERE serverId = :serverId")
+    suspend fun deleteMetaForServer(serverId: String)
+
+    @Transaction
+    suspend fun clearAll() {
+        deleteAllItems()
+        deleteAllMeta()
+    }
 
     @Query("DELETE FROM cached_item")
-    suspend fun clearAll()
+    suspend fun deleteAllItems()
+
+    @Query("DELETE FROM cache_bucket_meta")
+    suspend fun deleteAllMeta()
 }

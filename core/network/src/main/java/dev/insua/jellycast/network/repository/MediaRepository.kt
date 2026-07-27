@@ -60,10 +60,11 @@ interface MediaRepository {
  *   持续观察会让一次写回触发一次额外发射,UI 白白重组一遍。
  * - **没有 TTL。** 缓存是"上次看到的样子",过期也比空白强(设计文档 §3.1)。
  *   只在成功刷新时整体覆盖。
- * - **"有缓存" ⟺ "至少有一条能解析出来的行"。** 因此一个被成功刷新写成空的 bucket,
- *   下次离线打开会被当作"没有缓存"而进入错误态,而不是显示空列表。这是已知取舍:
- *   表结构里没有"这个 bucket 刷新过且确实是空的"这一位信息,而在两种解释之间,
- *   "让用户看到可重试的错误"比"让用户看到一个无法解释的空列表"更诚实。
+ * - **"有缓存" ⟺ "这个 bucket 至少成功刷新过一次"**,不等于"至少有一条能解析出来的行"。
+ *   一个被成功刷新、但服务端确实没有内容的 bucket(没有电影库,或"继续收听"已经全部听完)
+ *   离线打开时应该显示"这里还没有内容",而不是"无法连接服务器"的错误态——两者对用户的意义
+ *   完全不同,混为一谈会让"刷新成功且为空"和"从没刷新过"看起来一样。区分靠
+ *   [CachedItemDao.hasRefreshedBucket](见 `cache_bucket_meta` 表),不再单纯依赖行数。
  * - **解析不出当前激活服务器时(未登录 / 服务器被删),既不读也不写缓存**,但流程照常走完,
  *   网络那一步会自然失败并收敛到错误态 —— 绝不抛异常。
  * - **一次 bucket()/pagedBucket() 调用只解析一次 serverId**,读缓存和写回缓存共用同一个值。
@@ -105,12 +106,16 @@ class CachingMediaRepository(
         )
     }
 
-    /** 返回 null 表示没有可用缓存。任何异常都由 [staleWhileRevalidate] 兜成 null。 */
+    /**
+     * 返回 null 表示这个 bucket **从没被成功刷新过** —— 区别于"刷新过、但确实是空的"(那种情况
+     * 返回空列表,而不是 null)。任何异常都由 [staleWhileRevalidate] 兜成 null。
+     */
     private suspend fun readCache(serverId: String, bucket: String): List<MediaItem>? {
-        return dao.observeBucket(serverId, bucket)
+        val rows = dao.observeBucket(serverId, bucket)
             .first()
             .mapNotNull { CachedItemPayload.decode(it.payloadJson) }
-            .takeIf { it.isNotEmpty() }
+        if (rows.isNotEmpty()) return rows
+        return if (dao.hasRefreshedBucket(serverId, bucket)) emptyList() else null
     }
 
     private suspend fun writeThrough(serverId: String, bucket: String, items: List<MediaItem>) {
@@ -127,6 +132,7 @@ class CachingMediaRepository(
                 updatedAt = now,
             )
         }
-        dao.replaceBucket(serverId, bucket, rows)
+        // replaceBucket 同时把 cache_bucket_meta 标记为"刷新过"——即使 rows 是空的。
+        dao.replaceBucket(serverId, bucket, rows, now)
     }
 }

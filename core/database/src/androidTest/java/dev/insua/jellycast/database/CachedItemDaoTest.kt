@@ -7,6 +7,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -145,5 +146,58 @@ class CachedItemDaoTest {
         val dao = db.cachedItemDao()
         val result = dao.observeBucket(serverId = "s1", bucket = "home.resume").first()
         assertTrue(result.isEmpty())
+    }
+
+    @Test
+    fun `从未刷新过的bucket_hasRefreshedBucket为false`() = runBlocking {
+        val dao = db.cachedItemDao()
+        assertFalse(dao.hasRefreshedBucket(serverId = "s1", bucket = "home.resume"))
+    }
+
+    @Test
+    fun `replaceBucket写入空列表后_hasRefreshedBucket为true但observeBucket仍为空`() = runBlocking {
+        val dao = db.cachedItemDao()
+        // 服务端确实没有内容的一次成功刷新——items 为空,但这一次刷新本身要被记住。
+        dao.replaceBucket(serverId = "s1", bucket = "home.resume", items = emptyList())
+
+        assertTrue(dao.hasRefreshedBucket(serverId = "s1", bucket = "home.resume"))
+        assertTrue(dao.observeBucket(serverId = "s1", bucket = "home.resume").first().isEmpty())
+    }
+
+    @Test
+    fun `replaceBucket写入非空列表后_hasRefreshedBucket同样为true`() = runBlocking {
+        val dao = db.cachedItemDao()
+        dao.replaceBucket(
+            serverId = "s1", bucket = "home.resume", items = listOf(
+                CachedItemEntity(
+                    serverId = "s1", bucket = "home.resume", itemId = "a1",
+                    position = 0, payloadJson = "{}", updatedAt = 1L
+                ),
+            )
+        )
+
+        assertTrue(dao.hasRefreshedBucket(serverId = "s1", bucket = "home.resume"))
+    }
+
+    @Test
+    fun `hasRefreshedBucket按serverId和bucket分区_互不干扰`() = runBlocking {
+        val dao = db.cachedItemDao()
+        dao.replaceBucket(serverId = "sA", bucket = "home.resume", items = emptyList())
+
+        assertTrue(dao.hasRefreshedBucket(serverId = "sA", bucket = "home.resume"))
+        assertFalse("另一台服务器不该被这次刷新影响到", dao.hasRefreshedBucket(serverId = "sB", bucket = "home.resume"))
+        assertFalse("另一个 bucket 不该被这次刷新影响到", dao.hasRefreshedBucket(serverId = "sA", bucket = "home.nextup"))
+    }
+
+    @Test
+    fun `clearServer后该服务器的hasRefreshedBucket标记也被清掉`() = runBlocking {
+        val dao = db.cachedItemDao()
+        dao.replaceBucket(serverId = "sA", bucket = "home.resume", items = emptyList())
+        dao.replaceBucket(serverId = "sB", bucket = "home.resume", items = emptyList())
+
+        dao.clearServer("sA")
+
+        assertFalse(dao.hasRefreshedBucket(serverId = "sA", bucket = "home.resume"))
+        assertTrue("另一台服务器的标记不受影响", dao.hasRefreshedBucket(serverId = "sB", bucket = "home.resume"))
     }
 }

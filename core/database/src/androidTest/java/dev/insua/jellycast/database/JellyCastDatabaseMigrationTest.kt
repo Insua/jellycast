@@ -49,4 +49,55 @@ class JellyCastDatabaseMigrationTest {
             assertEquals(1000L, it.getLong(4))
         }
     }
+
+    /**
+     * 迁移 2 -> 3 只新增 `cache_bucket_meta` 表(见 [MIGRATION_2_3]),不得触碰
+     * `progress_report`(尚未上报的观看进度)或 `cached_item`(离线缓存)里已有的任何一行——
+     * 这两张表在 v2 就已经存在,`fallbackToDestructiveMigration()` 会把它们连带清空。
+     */
+    @Test
+    fun `迁移2到3后progress_report和cached_item里的行原封不动`() {
+        val v2: SupportSQLiteDatabase = helper.createDatabase(TEST_DB, 2)
+        v2.execSQL(
+            """
+            INSERT INTO progress_report (id, serverId, itemId, playSessionId, positionMs, kind, createdAt)
+            VALUES (1, 'sA', 'item-1', NULL, 12345, 'progress', 1000)
+            """.trimIndent()
+        )
+        v2.execSQL(
+            """
+            INSERT INTO cached_item (serverId, bucket, itemId, position, payloadJson, updatedAt)
+            VALUES ('sA', 'home.resume', 'item-1', 0, '{}', 1000)
+            """.trimIndent()
+        )
+        v2.close()
+
+        val v3 = helper.runMigrationsAndValidate(TEST_DB, 3, true, MIGRATION_2_3)
+
+        val progressCursor = v3.query("SELECT serverId, itemId, positionMs FROM progress_report")
+        progressCursor.use {
+            assertEquals(1, it.count)
+            it.moveToFirst()
+            assertEquals("sA", it.getString(0))
+            assertEquals("item-1", it.getString(1))
+            assertEquals(12345L, it.getLong(2))
+        }
+
+        val cachedItemCursor = v3.query("SELECT serverId, bucket, itemId, position FROM cached_item")
+        cachedItemCursor.use {
+            assertEquals(1, it.count)
+            it.moveToFirst()
+            assertEquals("sA", it.getString(0))
+            assertEquals("home.resume", it.getString(1))
+            assertEquals("item-1", it.getString(2))
+            assertEquals(0, it.getInt(3))
+        }
+
+        // 新表存在且可查询(空表,这条 INSERT 之前 v2 里没有这张表)。
+        val metaCursor = v3.query("SELECT COUNT(*) FROM cache_bucket_meta")
+        metaCursor.use {
+            it.moveToFirst()
+            assertEquals(0, it.getInt(0))
+        }
+    }
 }

@@ -260,6 +260,38 @@ class MediaRepositoryTest {
         assertTrue(dao.replaceCalls.single().second.isEmpty(), "确知服务端没有内容时缓存要跟着清空")
     }
 
+    // ---- 刷新过且确实为空 ≠ 从没缓存过:一个被成功刷新写成空的 bucket,离线时该显示为
+    // "这里还没有内容",而不是"无法连接服务器"(那需要一次都不发射,见"无缓存且网络失败"用例)----
+
+    @Test
+    fun `刷新过但服务端确实为空的bucket_离线时仍能读到空列表而不是当成无缓存`() = runTest {
+        val dao = FakeCachedItemDao()
+        // 先来一次成功的刷新,服务端如实返回空——这次成功要被记住,不是"从没刷新过"。
+        repository(dao).bucket(bucket) { emptyList<MediaItem>() }.collectToList()
+
+        // 现在断网:如果空 bucket 被当成"没有缓存",这里会一次都不发射(对照"无缓存且网络失败时
+        // 不发射也不崩溃"用例)——调用方会把它误判成"连不上服务器",而不是"库确实是空的"。
+        val offline = repository(dao).bucket(bucket) { throw java.io.IOException("offline") }.collectToList()
+
+        assertEquals(
+            2, offline.size,
+            "有缓存(哪怕缓存内容是空列表)时,断网也要经历「先发缓存、再发失败标记」两次发射",
+        )
+        assertTrue(offline.all { it.data.isEmpty() })
+        assertTrue(offline.last().refreshFailed)
+    }
+
+    @Test
+    fun `从未刷新过的bucket_断网时依然一次都不发射`() = runTest {
+        // 对照组:同样是空,但从来没有成功刷新过(连一次成功的空响应都没有)——
+        // 必须继续走"无缓存"路径,不能被上一条用例的修复误伤。
+        val dao = FakeCachedItemDao()
+
+        val offline = repository(dao).bucket(bucket) { throw java.io.IOException("offline") }.collectToList()
+
+        assertTrue(offline.isEmpty(), "从没成功刷新过,不能凭空冒出一个「空但已缓存」的结论")
+    }
+
     // ---- 读缓存和写回缓存必须用同一个 serverId:两者之间隔着一次网络请求,
     // 如果各自独立解析,用户中途切换了激活服务器,读到的是服务器 A、写回的却是服务器 B ----
 
