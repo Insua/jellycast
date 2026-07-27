@@ -66,38 +66,54 @@ interface MediaRepository {
  *   "让用户看到可重试的错误"比"让用户看到一个无法解释的空列表"更诚实。
  * - **解析不出当前激活服务器时(未登录 / 服务器被删),既不读也不写缓存**,但流程照常走完,
  *   网络那一步会自然失败并收敛到错误态 —— 绝不抛异常。
+ * - **一次 bucket()/pagedBucket() 调用只解析一次 serverId**,读缓存和写回缓存共用同一个值。
+ *   两者之间隔着一次网络请求(可能耗时数秒),如果各自独立调 [JellyfinSession.serverId],
+ *   用户中途切换了激活服务器时,读到的是服务器 A 的缓存、写回的却是服务器 B 的分区——
+ *   一台服务器的列表被悄悄写进另一台服务器名下。
  */
 class CachingMediaRepository(
     private val dao: CachedItemDao,
     private val session: JellyfinSession,
 ) : MediaRepository {
 
-    override fun bucket(bucket: String, fetch: suspend () -> List<MediaItem>): Flow<Cached<List<MediaItem>>> =
-        staleWhileRevalidate(
-            readCache = { readCache(bucket) },
+    override fun bucket(bucket: String, fetch: suspend () -> List<MediaItem>): Flow<Cached<List<MediaItem>>> {
+        // 读缓存时解析出来的 serverId,写回缓存复用同一个值(见类 KDoc)。
+        // 读缓存失败(没有激活服务器等)时保持 null,写回就跳过——不知道该写到哪个分区,宁可不写。
+        var resolvedServerId: String? = null
+        return staleWhileRevalidate(
+            readCache = {
+                val serverId = session.serverId()
+                resolvedServerId = serverId
+                readCache(serverId, bucket)
+            },
             fetch = fetch,
-            writeThrough = { items -> writeThrough(bucket, items) },
+            writeThrough = { items -> resolvedServerId?.let { writeThrough(it, bucket, items) } },
         )
+    }
 
-    override fun pagedBucket(bucket: String, fetch: suspend () -> ItemPage): Flow<Cached<ItemPage>> =
-        staleWhileRevalidate(
-            // 缓存回来的页永远不带 total —— 见 ItemPage 的 KDoc。
-            readCache = { readCache(bucket)?.let { ItemPage(it, total = null) } },
+    override fun pagedBucket(bucket: String, fetch: suspend () -> ItemPage): Flow<Cached<ItemPage>> {
+        var resolvedServerId: String? = null
+        return staleWhileRevalidate(
+            readCache = {
+                val serverId = session.serverId()
+                resolvedServerId = serverId
+                // 缓存回来的页永远不带 total —— 见 ItemPage 的 KDoc。
+                readCache(serverId, bucket)?.let { ItemPage(it, total = null) }
+            },
             fetch = fetch,
-            writeThrough = { page -> writeThrough(bucket, page.items) },
+            writeThrough = { page -> resolvedServerId?.let { writeThrough(it, bucket, page.items) } },
         )
+    }
 
     /** 返回 null 表示没有可用缓存。任何异常都由 [staleWhileRevalidate] 兜成 null。 */
-    private suspend fun readCache(bucket: String): List<MediaItem>? {
-        val serverId = session.serverId()
+    private suspend fun readCache(serverId: String, bucket: String): List<MediaItem>? {
         return dao.observeBucket(serverId, bucket)
             .first()
             .mapNotNull { CachedItemPayload.decode(it.payloadJson) }
             .takeIf { it.isNotEmpty() }
     }
 
-    private suspend fun writeThrough(bucket: String, items: List<MediaItem>) {
-        val serverId = session.serverId()
+    private suspend fun writeThrough(serverId: String, bucket: String, items: List<MediaItem>) {
         val now = System.currentTimeMillis()
         // 主键是 (serverId, bucket, itemId):同一 bucket 里重复的 id 会在插入时互相覆盖,
         // 导致写进去 N 条、读回来 N-1 条,position 也会出现空洞。先去重,让写入和读出严格对称。

@@ -1,6 +1,7 @@
 package dev.insua.jellycast.network.repository
 
 import app.cash.turbine.test
+import dev.insua.jellycast.database.CacheBucketMetaEntity
 import dev.insua.jellycast.database.CachedItemDao
 import dev.insua.jellycast.database.CachedItemEntity
 import dev.insua.jellycast.model.MediaItem
@@ -38,15 +39,27 @@ class MediaRepositoryTest {
         /** serverId + bucket -> 行,模拟真表的分区语义。 */
         val rows = MutableStateFlow<Map<Pair<String, String>, List<CachedItemEntity>>>(emptyMap())
 
+        /** serverId + bucket -> 有没有被成功刷新过,模拟 `cache_bucket_meta` 表。 */
+        val refreshedBuckets = mutableSetOf<Pair<String, String>>()
+
         /** 记录每一次整体替换,用来断言"网络成功才写回、失败绝不碰库"。 */
         val replaceCalls = mutableListOf<Pair<String, List<CachedItemEntity>>>()
 
         override fun observeBucket(serverId: String, bucket: String): Flow<List<CachedItemEntity>> =
             rows.map { it[serverId to bucket].orEmpty().sortedBy { row -> row.position } }
 
-        override suspend fun replaceBucket(serverId: String, bucket: String, items: List<CachedItemEntity>) {
+        override suspend fun hasRefreshedBucket(serverId: String, bucket: String): Boolean =
+            (serverId to bucket) in refreshedBuckets
+
+        override suspend fun replaceBucket(
+            serverId: String,
+            bucket: String,
+            items: List<CachedItemEntity>,
+            refreshedAt: Long,
+        ) {
             replaceCalls += bucket to items
             rows.value = rows.value + ((serverId to bucket) to items)
+            refreshedBuckets += serverId to bucket
         }
 
         override suspend fun deleteBucket(serverId: String, bucket: String) {
@@ -55,12 +68,34 @@ class MediaRepositoryTest {
 
         override suspend fun insertAll(items: List<CachedItemEntity>) = Unit
 
+        override suspend fun upsertBucketMeta(meta: CacheBucketMetaEntity) {
+            refreshedBuckets += meta.serverId to meta.bucket
+        }
+
         override suspend fun clearServer(serverId: String) {
             rows.value = rows.value.filterKeys { it.first != serverId }
+            refreshedBuckets.removeAll { it.first == serverId }
+        }
+
+        override suspend fun deleteItemsForServer(serverId: String) {
+            rows.value = rows.value.filterKeys { it.first != serverId }
+        }
+
+        override suspend fun deleteMetaForServer(serverId: String) {
+            refreshedBuckets.removeAll { it.first == serverId }
         }
 
         override suspend fun clearAll() {
             rows.value = emptyMap()
+            refreshedBuckets.clear()
+        }
+
+        override suspend fun deleteAllItems() {
+            rows.value = emptyMap()
+        }
+
+        override suspend fun deleteAllMeta() {
+            refreshedBuckets.clear()
         }
     }
 
@@ -223,6 +258,42 @@ class MediaRepositoryTest {
         assertFalse(emissions.last().refreshFailed, "成功不能被标记成失败")
         assertEquals(1, dao.replaceCalls.size)
         assertTrue(dao.replaceCalls.single().second.isEmpty(), "确知服务端没有内容时缓存要跟着清空")
+    }
+
+    // ---- 读缓存和写回缓存必须用同一个 serverId:两者之间隔着一次网络请求,
+    // 如果各自独立解析,用户中途切换了激活服务器,读到的是服务器 A、写回的却是服务器 B ----
+
+    @Test
+    fun `一次取数只解析一次serverId_写回缓存复用读缓存时解析出来的值`() = runTest {
+        val dao = FakeCachedItemDao()
+        val session = mockk<JellyfinSession>()
+        // 模拟"读缓存时还是 server-1,写回缓存那一刻(网络请求之后)已经切到 server-2"——
+        // 如果读和写各自独立调 serverId(),写回会用上第二个值,数据就串到别的服务器名下了。
+        coEvery { session.serverId() } returnsMany listOf("server-1", "server-2", "server-3")
+
+        CachingMediaRepository(dao, session).bucket(bucket) { listOf(episode("n1")) }.collectToList()
+
+        assertTrue(
+            dao.rows.value.containsKey("server-1" to bucket),
+            "写回缓存必须用读缓存那一刻解析出来的 serverId,不能中途切换服务器时串到别的分区",
+        )
+        assertTrue(
+            dao.rows.value.keys.none { it.first != "server-1" },
+            "serverId 只应该被解析一次(读缓存那一次),写回不该再问一次拿到不同的值",
+        )
+    }
+
+    @Test
+    fun `分页bucket同样只解析一次serverId`() = runTest {
+        val dao = FakeCachedItemDao()
+        val session = mockk<JellyfinSession>()
+        coEvery { session.serverId() } returnsMany listOf("server-1", "server-2", "server-3")
+        val page = ItemPage(listOf(episode("n1")), total = 10)
+
+        CachingMediaRepository(dao, session).pagedBucket(bucket) { page }.collectToList()
+
+        assertTrue(dao.rows.value.containsKey("server-1" to bucket))
+        assertTrue(dao.rows.value.keys.none { it.first != "server-1" })
     }
 
     @Test
