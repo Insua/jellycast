@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.compose.compiler)
@@ -5,6 +7,32 @@ plugins {
     alias(libs.plugins.ksp)
 }
 // 注意:AGP 9 内置 Kotlin 支持,不 apply kotlin-android 插件。
+
+/**
+ * 发布签名材料的来源,按优先级:
+ *   1. 环境变量(CI 用:secret 注入,keystore 由 base64 还原到 JELLYCAST_STORE_FILE 指向的路径)
+ *   2. 项目根的 keystore.properties(本机用;已被 .gitignore 排除)
+ *
+ * **密码与 .jks 绝不进版本库。** 两者都拿不到时,release 产出未签名包而不是构建失败 ——
+ * 这样别人 clone 下来仍能跑 assembleDebug 与全部测试。
+ */
+val releaseSigning: Properties? = run {
+    fun env(name: String) = System.getenv(name)?.takeIf { it.isNotBlank() }
+
+    val fromEnv = env("JELLYCAST_STORE_FILE")?.let { storeFile ->
+        Properties().apply {
+            setProperty("storeFile", storeFile)
+            setProperty("storePassword", env("JELLYCAST_STORE_PASSWORD").orEmpty())
+            setProperty("keyAlias", env("JELLYCAST_KEY_ALIAS") ?: "jellycast")
+            setProperty("keyPassword", env("JELLYCAST_KEY_PASSWORD").orEmpty())
+        }
+    }
+    if (fromEnv != null) return@run fromEnv
+
+    val file = rootProject.file("keystore.properties")
+    if (!file.exists()) return@run null
+    Properties().apply { file.inputStream().use { load(it) } }
+}
 
 android {
     namespace = "dev.insua.jellycast"
@@ -16,12 +44,67 @@ android {
         versionCode = 1
         versionName = "0.1.0"
     }
+
+    signingConfigs {
+        // 只有拿到了签名材料才注册 release 配置;拿不到就完全不注册,
+        // 让 release 走"未签名"路径,而不是抱着一个半配置的 signingConfig 在构建期炸掉。
+        releaseSigning?.let { props ->
+            val store = file(props.getProperty("storeFile"))
+            if (store.exists()) {
+                create("release") {
+                    storeFile = store
+                    storePassword = props.getProperty("storePassword")
+                    keyAlias = props.getProperty("keyAlias")
+                    keyPassword = props.getProperty("keyPassword")
+                    // v1 是给 API<24 用的,本应用 minSdk 26,关掉可减小包体也更快。
+                    enableV1Signing = false
+                    enableV2Signing = true
+                    enableV3Signing = true
+                    enableV4Signing = true
+                }
+            } else {
+                logger.warn("keystore 不存在,release 将产出未签名包:${store.absolutePath}")
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            // 刻意**不**用发布密钥签 debug —— 保持 Android 默认调试密钥。
+            // 发布密钥只在真正出包时使用;用它签日常 debug 会让私钥和密码出现在每次构建里,毫无收益。
+            // (参考项目 cuoa_app 把 debug 也指向 release 签名配置,那是应当避免的做法。)
+        }
+        release {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.findByName("release")
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+        }
+    }
+
     buildFeatures { compose = true }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
     // 注意:没有 kotlinOptions { },jvmTarget 通过下面的 kotlin { } 块配置。
+}
+
+/** 让 `./gradlew signingReport` 之外也能一眼看出当前是否配了签名。 */
+tasks.register("signingStatus") {
+    group = "verification"
+    description = "打印当前 release 签名配置来源,不泄露任何密码。"
+    val configured = releaseSigning != null
+    val source = when {
+        System.getenv("JELLYCAST_STORE_FILE")?.isNotBlank() == true -> "环境变量"
+        rootProject.file("keystore.properties").exists() -> "keystore.properties"
+        else -> "无"
+    }
+    doLast {
+        println(if (configured) "release 签名:已配置(来源:$source)" else "release 签名:未配置 —— release 将产出未签名包")
+    }
 }
 
 kotlin {

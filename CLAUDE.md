@@ -138,3 +138,30 @@ adb shell dumpsys media.metrics | grep -i codec
 - **Spike 结论与计划冲突** → 以 Spike 实测为准,更新计划文档和设计文档,并说明改动原因。
 - **Jellyfin API 与计划中的签名不符** → 以 `docs/jellyfin-openapi.json` 为准,修正计划。
 - **某个 Task 做不下去** → 停下来说明卡在哪、试过什么,不要猜着往下写。
+
+---
+
+## 发布签名
+
+**keystore 与密码永远不进版本库。** 构建脚本从外部读取,读不到就产出未签名包而不是构建失败。
+
+| 项 | 位置 |
+|---|---|
+| keystore | `~/.android/keystores/jellycast.jks`(**仓库之外**,PKCS12,RSA 4096,10000 天) |
+| 本机配置 | `keystore.properties`(项目根,已 gitignore) |
+| 模板 | `keystore.properties.example`(已提交,不含真密码) |
+| alias | `jellycast` |
+
+```bash
+./gradlew signingStatus      # 看当前是否配了签名,不泄露密码
+./gradlew :app:assembleRelease
+```
+
+**CI 用环境变量**(优先级高于 keystore.properties):
+`JELLYCAST_STORE_FILE` / `JELLYCAST_STORE_PASSWORD` / `JELLYCAST_KEY_ALIAS` / `JELLYCAST_KEY_PASSWORD`。
+keystore 用 base64 存进 secret,构建时还原到 `JELLYCAST_STORE_FILE` 指向的路径。
+
+**debug 不用发布密钥签名**,走 Android 默认调试密钥 —— 发布私钥只在真正出包时才碰。
+
+> ⚠️ **丢失 keystore 或密码 = 永远无法为已发布的应用推送更新**(除非用了 Play App Signing)。
+> 请把 `.jks` 和密码分别备份到密码管理器/离线介质。
