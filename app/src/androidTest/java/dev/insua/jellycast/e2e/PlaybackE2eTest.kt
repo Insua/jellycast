@@ -6,6 +6,7 @@ import android.content.Intent
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
+import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -218,6 +219,19 @@ class PlaybackE2eTest {
      *
      * 目标位置按条目时长自适应:够长就用 10 分钟(计划里的值),太短就取时长的一半 ——
      * 对一个 8 分钟的条目 seek 到 10 分钟,测的是服务端的边界行为,不是本项目要验证的东西。
+     *
+     * ## ⚠️ 复审 Important 2(已闭合):前两段断言**证明不了 seek 真的发生了**
+     *
+     * [position] = `currentStartPositionMs + 流内位置`,而 `AudioPlaybackEngineImpl` 在 `resolve()`
+     * 一返回就把 `currentStartPositionMs` 设成**请求的目标** —— 也就是说"落到目标区间"这个断言
+     * 在**一个音频样本都还没出声**的时候就已经满足了;紧接着的"还在前进"也照样满足,因为那条流
+     * 确实在放,只不过是**从第 0 秒开始放的**。
+     *
+     * 这不是假想的漏洞,是一个**已知的真实缺陷**的形状:L3 兜底的 URL 带 `static=true`,服务端
+     * 于是**静默忽略 `startTimeTicks`**,seek 从头重播而进度条照走(见 v2-task-2 报告 §8)。
+     * 这两段断言在那种情况下**全绿**。
+     *
+     * 所以最后加一段真正有判别力的:见 [assertSeekOffsetHonoredAtTail]。
      */
     @Test
     fun `seek后位置跳到目标并继续前进`() {   // 名字里不能有空格:dex < 040 不允许方法名含空格
@@ -245,6 +259,8 @@ class PlaybackE2eTest {
             "seek 之后位置停住了:${ADVANCE_WINDOW_MS / 1000}s 内只前进了 ${position() - from}ms。${diagnostics()}",
             keptGoing,
         )
+
+        assertSeekOffsetHonoredAtTail(playableItem, "单次 seek")
     }
 
     // ---------------------------------------------------------------- 场景 3b
@@ -261,6 +277,14 @@ class PlaybackE2eTest {
      *
      * 本用例严格复刻这条路(同一个主线程 scope 上 launch,不做任何串行化),断言的是用户的期望:
      * **最后按下的那一次说了算。**
+     *
+     * ## ⚠️ 复审 Important 2(已闭合)
+     *
+     * 和场景 3 同一个盲区:落点断言读的是 [position],而它在 `resolve()` 一返回就等于目标了。
+     * 所以这里把**最后一次**连点的目标放在距结尾 [TAIL_SEEK_MARGIN_MS] 处,再要求
+     * `STATE_ENDED` 真的到来 —— 见 [assertSeekOffsetHonoredAtTail]。这样"最后一次说了算"和
+     * "偏移真的生效"两件事被同一段断言一起验掉:落在别的目标上范围断言就红,偏移被忽略
+     * ENDED 就不会来。
      */
     @Test
     fun `连点快进之后落在最后一次目标并继续播放`() {
@@ -272,6 +296,9 @@ class PlaybackE2eTest {
 
         val targets = rapidSeekTargets(playableItem)
         val seekScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+        // ENDED 只发生一次,而且随后 PlaybackService 的自动连播监听器会立刻 prepare 下一条流 ——
+        // 必须在 seek **之前**就挂上监听,轮询 playbackState 极容易整个错过这一瞬间。
+        val latch = addEndedLatch()
         try {
             targets.forEach { target ->
                 // 和 EngineSeekRouter 完全一样:launch 出去就不管了,不等它完成。
@@ -297,7 +324,11 @@ class PlaybackE2eTest {
                 "连点快进之后播放停住了:${ADVANCE_WINDOW_MS / 1000}s 内只前进了 ${position() - from}ms。${diagnostics()}",
                 keptGoing,
             )
+
+            // 最后一次连点的目标就是尾部落点([rapidSeekTargets]),所以这里不再 seek,直接等 ENDED。
+            awaitEnded(latch, "连点快进的最后一次落点(${last}ms,距结尾 ${TAIL_SEEK_MARGIN_MS}ms)")
         } finally {
+            removeEndedLatch(latch)
             seekScope.cancel()
         }
     }
@@ -465,11 +496,93 @@ class PlaybackE2eTest {
     /**
      * 连点快进的目标序列。刻意按**条目时长的比例**取,而不是"600s 起、每次 +30s" ——
      * 后者对一个 8 分钟的条目会请求超过结尾的 `startTimeTicks`,测出来的是服务端边界行为,
-     * 不是本项目要验证的东西。留出 [AUTOPLAY_TAIL_MS] 的尾部余量,保证最后一次落点之后还有得播。
+     * 不是本项目要验证的东西。
+     *
+     * **最后一次落在 [tailSeekTargetMs](距结尾 [TAIL_SEEK_MARGIN_MS])**,这样"最后一次说了算"
+     * 可以用 `STATE_ENDED` 判别(见 [awaitEnded]);前几次均匀铺在它之前,彼此相距足够远,
+     * 落错了目标范围断言就红。
      */
     private fun rapidSeekTargets(item: MediaItem): List<Long> {
-        val usable = ((item.runTimeMs ?: 0L) - AUTOPLAY_TAIL_MS).coerceAtLeast(120_000L)
-        return (1..RAPID_SEEK_COUNT).map { usable * it / (RAPID_SEEK_COUNT + 1) }
+        val tail = tailSeekTargetMs(item)
+        return (1 until RAPID_SEEK_COUNT).map { tail * it / (RAPID_SEEK_COUNT + 1) } + tail
+    }
+
+    // ------------------------------------------------- 偏移是否真的生效(复审 Important 2)
+
+    /**
+     * 尾部落点:距结尾 [TAIL_SEEK_MARGIN_MS]。
+     *
+     * 之所以必须**贴着结尾**取:这是唯一一个"服务端认不认 `startTimeTicks`"会产生**数量级差异**的
+     * 可观测点 —— 认了,这条流只剩 30 秒,很快 `STATE_ENDED`;忽略了(L3 的 `static=true` 就是这样),
+     * 这条流是整整一集,几十分钟内绝不可能 ENDED。
+     */
+    private fun tailSeekTargetMs(item: MediaItem): Long {
+        val runtime = item.runTimeMs ?: 0L
+        // 判别力的前提:忽略偏移时"从头放完整条"必须**明显长于** ENDED 的等待时限,否则两种情况
+        // 都可能在时限内 ENDED,这条断言就又变成一句空话了。
+        val minimum = TAIL_END_TIMEOUT_MS + TAIL_SEEK_MARGIN_MS
+        assertTrue(
+            "条目时长 ${runtime}ms 太短(要求 ≥ ${minimum}ms),尾部落点判别不出 startTimeTicks " +
+                "是否生效 —— 从头重播也能在 ${TAIL_END_TIMEOUT_MS}ms 内播完。换一个更长的条目。",
+            runtime >= minimum,
+        )
+        return runtime - TAIL_SEEK_MARGIN_MS
+    }
+
+    /**
+     * 🔴 **本文件唯一能证明"seek 真的发生了"的断言。**
+     *
+     * [position] = `currentStartPositionMs + 流内位置`,而 `AudioPlaybackEngineImpl` 在 `resolve()`
+     * 一返回就把 `currentStartPositionMs` 设成请求的目标 —— 所以"落到目标区间 + 还在前进"这两段
+     * 断言在**服务端把 `startTimeTicks` 整个忽略掉、从第 0 秒重播**的时候**照样全绿**。
+     * 这正是 v2-task-2 报告 §8 记录的真实缺陷:L3 兜底 URL 带 `static=true`,服务端直接吐原始文件。
+     *
+     * 判别办法:从距结尾 [TAIL_SEEK_MARGIN_MS] 处开始播,要求 [TAIL_END_TIMEOUT_MS] 内收到
+     * `STATE_ENDED`。认了偏移 → 30 秒后就到;忽略了偏移 → 要放完整整一集(挑选条目时已保证
+     * ≥ [MIN_ITEM_RUNTIME_MS]),这个时限内不可能到。判别力来自这个数量级差,不依赖任何时序抖动。
+     *
+     * 为什么用监听器而不是轮询 `exoPlayer.playbackState`:ENDED 只存在一瞬间,紧接着
+     * `PlaybackService` 的自动连播监听器就会 prepare 下一条流,轮询会整个错过它。
+     */
+    private class EndedLatch : Player.Listener {
+        @Volatile
+        var ended = false
+
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            if (playbackState == Player.STATE_ENDED) ended = true
+        }
+    }
+
+    private fun addEndedLatch(): EndedLatch =
+        EndedLatch().also { latch -> onMain { exoPlayer.addListener(latch) } }
+
+    private fun removeEndedLatch(latch: EndedLatch) {
+        runCatching { onMain { exoPlayer.removeListener(latch) } }
+    }
+
+    private fun awaitEnded(latch: EndedLatch, label: String) {
+        val ended = awaitCondition(TAIL_END_TIMEOUT_MS) { latch.ended }
+        assertTrue(
+            "$label:${TAIL_END_TIMEOUT_MS / 1000}s 内没有收到 STATE_ENDED。" +
+                "这条流本该只剩 ${TAIL_SEEK_MARGIN_MS / 1000}s —— 收不到 ENDED 说明服务端**忽略了 " +
+                "startTimeTicks**,实际在从头重播,而 absolutePositionMs 还在按'起始位置 + 流内位置'" +
+                "报数(界面显示末尾,耳朵听到开头)。已知触发路径:落到 L3 时 URL 带 static=true。" +
+                "${diagnostics()}",
+            ended,
+        )
+    }
+
+    /** 见 [awaitEnded]。在当前已经在播的条目上再 seek 一次到尾部,然后等 ENDED。 */
+    private fun assertSeekOffsetHonoredAtTail(item: MediaItem, label: String) {
+        val tail = tailSeekTargetMs(item)
+        val latch = addEndedLatch()
+        try {
+            runBlocking(Dispatchers.Main) { engine.seekTo(tail) }
+            assertNoPlaybackError("$label:尾部 seek 之后")
+            awaitEnded(latch, "$label:seek 到 ${tail}ms(距结尾 ${TAIL_SEEK_MARGIN_MS}ms)")
+        } finally {
+            removeEndedLatch(latch)
+        }
     }
 
     /** 引擎当前 `Ready` 的条目 id;没有就绪的源时为 null。 */
@@ -568,6 +681,18 @@ class PlaybackE2eTest {
         /** 连点快进:次数与间隔。间隔取得比一次 resolve 的耗时短,才能真的把并发窗口打开。 */
         const val RAPID_SEEK_COUNT = 4
         const val RAPID_SEEK_INTERVAL_MS = 700L
+
+        /**
+         * 尾部落点距结尾的距离(见 [tailSeekTargetMs])。够短,ENDED 很快就到;
+         * 够长,落点之后仍然能先验一段"还在前进"。
+         */
+        const val TAIL_SEEK_MARGIN_MS = 30_000L
+
+        /**
+         * 尾部落点到 `STATE_ENDED` 的宽限:30s 内容 + 起转码/缓冲/网络往返的余量。
+         * 偏移被忽略时这条流是整整一集(≥ [MIN_ITEM_RUNTIME_MS] = 15 分钟),这个时限内不可能 ENDED。
+         */
+        const val TAIL_END_TIMEOUT_MS = 120_000L
 
         /** 自动连播:从距结尾这么近的地方开播,不用等一整集。 */
         const val AUTOPLAY_TAIL_MS = 25_000L
