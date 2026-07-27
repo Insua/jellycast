@@ -26,6 +26,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.foundation.text.KeyboardOptions
@@ -103,13 +104,30 @@ fun AddServerScreen(
             value = uiState.form.username,
             onValueChange = viewModel::onUsernameChange,
             label = { Text("用户名") },
+            singleLine = true,
+            // 根因(现场排查):软键盘默认对这个字段做自动首字母大写 + 自动纠错/联想候选,
+            // Jellyfin 用户名虽然大小写不敏感,但输入法插入/替换字符仍会污染输入——
+            // 关掉大写与自动纠错,让用户看到的就是实际提交的内容。
+            keyboardOptions = KeyboardOptions(
+                capitalization = KeyboardCapitalization.None,
+                autoCorrectEnabled = false,
+            ),
             modifier = Modifier.fillMaxWidth(),
         )
         OutlinedTextField(
             value = uiState.form.password,
             onValueChange = viewModel::onPasswordChange,
             label = { Text("密码") },
+            singleLine = true,
             visualTransformation = PasswordVisualTransformation(),
+            // 根因(现场排查):这里之前完全没设 keyboardOptions——PasswordVisualTransformation
+            // 只负责把明文渲染成圆点,并不会告诉输入法"这是密码字段"。软键盘因此照常做自动
+            // 首字母大写/自动纠错,曾把 4 位密码悄悄改成 5 个点。KeyboardType.Password 让输入法
+            // 按密码语境工作(不联想候选、不自动改写),同时关闭自动纠错兜底。
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Password,
+                autoCorrectEnabled = false,
+            ),
             modifier = Modifier.fillMaxWidth(),
         )
 

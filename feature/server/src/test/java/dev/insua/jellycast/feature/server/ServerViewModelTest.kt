@@ -278,4 +278,57 @@ class ServerViewModelTest {
         assertNull(vm.uiState.value.certConfirmation)
         assertTrue(vm.uiState.value.form.endpoints.all { it.trustedCertSha256 == null })
     }
+
+    // ---- 输入清洗:用户名与地址前后空白必须在到达 API 前被清掉,密码原样保留 ----
+    // 根因(见任务描述):软键盘对用户名/密码字段做自动首字母大写/自动纠错,导致密码被静默
+    // 篡改;键盘修复在 AddServerScreen.kt(Compose UI,不在本文件覆盖范围)。这里只覆盖
+    // ServerViewModel 这一层能单测的部分:提交前的字符串清洗策略。
+
+    @Test
+    fun `提交时用户名前后空白被裁剪但密码原样保留`() = runTest {
+        val endpoint = lan()
+        val winner = EndpointHealth(endpoint, true, 12L)
+        coEvery { endpointSelector.select(listOf(endpoint)) } returns winner
+
+        val fakeApi = mockk<JellyfinApi>()
+        val authRequest = slot<AuthRequestDto>()
+        coEvery { fakeApi.authenticate(capture(authRequest)) } returns
+            AuthResultDto(accessToken = "tok-123", user = UserDto(id = "user-1", name = "bob"))
+        every { jellyfinApiFactory.create(endpoint) } returns fakeApi
+
+        val vm = viewModel()
+        vm.onNameChange("我的 NAS")
+        vm.fillEndpoints(endpoint)
+        vm.onUsernameChange("  bob  ")
+        vm.onPasswordChange("  secret  ")
+
+        vm.submit()
+
+        assertEquals("bob", authRequest.captured.username, "用户名前后空白应被裁剪")
+        assertEquals("  secret  ", authRequest.captured.pw, "密码不允许被裁剪——首尾空格可能是密码的一部分")
+    }
+
+    @Test
+    fun `提交时地址前后空白被裁剪`() = runTest {
+        val endpoint = lan()
+        val winner = EndpointHealth(endpoint, true, 12L)
+        coEvery { endpointSelector.select(listOf(endpoint)) } returns winner
+
+        val fakeApi = mockk<JellyfinApi>(relaxed = true)
+        every { jellyfinApiFactory.create(endpoint) } returns fakeApi
+
+        val vm = viewModel()
+        vm.onNameChange("我的 NAS")
+        vm.onEndpointUrlChange(0, "  ${endpoint.url}  ")
+        vm.onEndpointLabelChange(0, endpoint.label)
+        vm.onUsernameChange("bob")
+        vm.onPasswordChange("secret")
+
+        vm.submit()
+
+        // select() 只会被裁剪后的 endpoint 列表调用——如果地址带着空白被传下去,
+        // 这个 mock 匹配不上,select() 返回 null,登录会走"无法连接"分支而不是成功分支。
+        coVerify(exactly = 1) { endpointSelector.select(listOf(endpoint)) }
+        assertNotNull(vm.uiState.value.connectedServerId)
+    }
 }
