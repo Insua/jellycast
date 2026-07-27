@@ -1,0 +1,8 @@
+<resources>
+    <!-- Compose-only app: no AppCompat / Material Components XML theme dependency.
+         This theme only exists to satisfy the Android manifest requirement
+         (a launch/splash background) before Compose content is set. -->
+    <style name="Theme.JellyCast" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@android:color/black</item>
+    </style>
+</resources>

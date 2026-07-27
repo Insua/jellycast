@@ -1,0 +1,38 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:name=".JellyCastApp"
+        android:label="JellyCast"
+        android:usesCleartextTraffic="true"
+        android:theme="@style/Theme.JellyCast">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          android:exported="false":本应用不对外提供媒体会话给第三方 App(不支持 Android Auto /
+          外部 MediaBrowser 接入),设为 true 会不必要地扩大攻击面。系统内的锁屏卡片/通知栏控制/
+          蓝牙耳机按键走的是本进程内已持有的 MediaSession token,不需要 exported=true。
+          若真机验收(Task 23)发现锁屏控制或蓝牙按键失效,再改回 true 并在报告中说明原因。
+        -->
+        <service
+            android:name="dev.insua.jellycast.player.PlaybackService"
+            android:foregroundServiceType="mediaPlayback"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="androidx.media3.session.MediaSessionService" />
+            </intent-filter>
+        </service>
+    </application>
+</manifest>

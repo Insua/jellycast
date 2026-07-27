@@ -120,9 +120,16 @@ adb shell dumpsys media.metrics | grep -i codec
 
 ## v1 范围边界
 
-**做:** 多服务器 + 多地址自动选路 / 剧集 + 电影 / 纯音频三级降级 / 歌词式字幕 / 后台播放与锁屏控制 / 倍速 · 睡眠定时 · 快进快退 / 自动连播 / 音轨选择 / 进度双向同步
+**做:** 多服务器 + 多地址自动选路 / 剧集 + 电影 / 纯音频**两级**降级 / 歌词式字幕 / 后台播放与锁屏控制 / 倍速 · 睡眠定时 · 快进快退 / 自动连播 / 音轨选择(仅 L3) / 进度双向同步 / **媒体库分页** / **搜索**
 
-**不做(不要自作主张加进来):** 离线下载 · 搜索 · 视频画面 · 音乐/有声书库 · 投屏 · 收藏夹 · 硬字幕 OCR
+**不做(不要自作主张加进来):** 离线下载 · 视频画面 · 音乐/有声书库 · 投屏 · 收藏夹 · 硬字幕 OCR
+
+> **范围变更记录:**
+> - 2026-07-25:Spike 实测证明 L2(HLS 音频 rendition)不存在,降级链由三级改为**两级**。
+> - 2026-07-25:音轨选择改为**仅 L3 支持** —— `/Audio/{id}/universal` 无 `audioStreamIndex` 参数(已核对 OpenAPI)。
+> - 2026-07-26:**「搜索」由不做改为做**,并新增「媒体库分页」。原因见
+>   `docs/superpowers/specs/2026-07-26-library-paging-and-search-design.md`:
+>   目标服务器有 8744 集、数百部剧,无分页会卡、无搜索找不到东西。
 
 ---
 
@@ -131,3 +138,30 @@ adb shell dumpsys media.metrics | grep -i codec
 - **Spike 结论与计划冲突** → 以 Spike 实测为准,更新计划文档和设计文档,并说明改动原因。
 - **Jellyfin API 与计划中的签名不符** → 以 `docs/jellyfin-openapi.json` 为准,修正计划。
 - **某个 Task 做不下去** → 停下来说明卡在哪、试过什么,不要猜着往下写。
+
+---
+
+## 发布签名
+
+**keystore 与密码永远不进版本库。** 构建脚本从外部读取,读不到就产出未签名包而不是构建失败。
+
+| 项 | 位置 |
+|---|---|
+| keystore | `~/.android/keystores/jellycast.jks`(**仓库之外**,PKCS12,RSA 4096,10000 天) |
+| 本机配置 | `keystore.properties`(项目根,已 gitignore) |
+| 模板 | `keystore.properties.example`(已提交,不含真密码) |
+| alias | `jellycast` |
+
+```bash
+./gradlew signingStatus      # 看当前是否配了签名,不泄露密码
+./gradlew :app:assembleRelease
+```
+
+**CI 用环境变量**(优先级高于 keystore.properties):
+`JELLYCAST_STORE_FILE` / `JELLYCAST_STORE_PASSWORD` / `JELLYCAST_KEY_ALIAS` / `JELLYCAST_KEY_PASSWORD`。
+keystore 用 base64 存进 secret,构建时还原到 `JELLYCAST_STORE_FILE` 指向的路径。
+
+**debug 不用发布密钥签名**,走 Android 默认调试密钥 —— 发布私钥只在真正出包时才碰。
+
+> ⚠️ **丢失 keystore 或密码 = 永远无法为已发布的应用推送更新**(除非用了 Play App Signing)。
+> 请把 `.jks` 和密码分别备份到密码管理器/离线介质。

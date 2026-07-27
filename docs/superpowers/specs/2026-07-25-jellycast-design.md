@@ -40,19 +40,32 @@ JellyCast 把这件事翻转过来:**UI 是音乐/播客播放器的形态(对�
 
 ## 3. 核心设计决策
 
-### 3.1 音频投递:三级降级链(本项目最重要的设计)
+### 3.1 音频投递:两级降级链(本项目最重要的设计)
+
+> ✅ **已由 Spike-1 实测确定(2026-07-25)。完整数据见 `2026-07-25-spike-results.md`。**
+> 原设计的三级链已修订为两级:**L2(HLS 音频 rendition)实测不存在,已删除。**
 
 播放一集时,按顺序尝试,**第一个成功的即采用**:
 
-| 级别 | 做法 | 流量 | CPU | 状态 |
+| 级别 | 做法 | 实测流量 | CPU | 状态 |
 |---|---|---|---|---|
-| **L1 服务端纯音频流** | 请求 Jellyfin 只输出音频轨 | **~64–128 Kbps** | 低(转码/copy 音频) | ⚠️ **需 Spike 验证** |
-| **L2 HLS 音频 rendition** | 从 HLS 主播放列表中只取音频 rendition | 低 | 低 | ⚠️ 需 Spike 验证 |
-| **L3 客户端禁用视频轨** | 拉完整流,用 Media3 `TrackSelector` 关掉 video track | 高(仍下载视频字节) | 低(不解码视频) | ✅ **确定可行,兜底** |
+| **L1 服务端纯音频流** | `GET /Audio/{itemId}/universal?audioCodec=aac&audioBitRate=…` | **71–132 Kbps 实测** | 41x 实时,非瓶颈 | ✅ **实测可用,默认路径** |
+| ~~L2 HLS 音频 rendition~~ | ~~从 HLS 主播放列表取音频 rendition~~ | — | — | ❌ **实测不存在,删除** |
+| **L3 客户端禁用视频轨** | 拉完整流,用 Media3 `TrackSelector` 关掉 video track | 高(仍下载视频字节) | 低(不解码视频) | ✅ 兜底 |
 
-**设计原则:L3 保证产品一定能用,L1/L2 决定产品好不好用。**
+**实测省流量倍数:** 原始 1080p 流 5.57 Mbps → L1 @128k 实测 132 kbps,**省 42 倍**;
+@64k 实测 71 kbps,**省 78 倍**。约 58 MB/小时 vs 原始 2.5 GB/小时。**产品核心价值已被数据证实。**
 
-> ⚠️ **实现约束:** L1/L2 的具体 API 形态**必须先做技术验证**(见 §9 Spike-1),不允许凭猜测编码。降级过程对用户**静默无感**,只在开发者选项里显示当前命中的级别。
+**设计原则:L3 保证产品一定能用,L1 决定产品好不好用。** 降级对用户**静默无感**,只在开发者选项里显示当前级别。
+
+> ⚠️ **关键架构约束(Spike-1 实测):转码流返回 `Accept-Ranges: none`。**
+> 带 Range 的请求返回 200 而非 206,服务器直接忽略。因此 **ExoPlayer 无法按字节 seek**——
+> **seek 必须实现为「带新的 `startTimeTicks` 重新发起请求并 prepare」**。断点续播同理。
+> 这一条直接决定 `:core:player` 的设计,不可沿用"给播放器一个 URL 然后 seekTo"的思路。
+
+> ⚠️ **注意 L1 用的是 `/Audio/…` 接口而非 `/Videos/…`** —— 即把音频接口用在视频条目上。
+> 计划中曾推测的 `/Videos/{id}/stream.mp3`(HTTP 500)与
+> `/Videos/{id}/stream?audioCodec=aac`(视频轨仍在)**均已实测否定**。
 
 **永远不渲染视频。** 即使走 L3,ExoPlayer 也不绑定 `Surface`,播放界面显示的是**海报封面**。
 
@@ -107,8 +120,28 @@ Server(一台 Jellyfin 服务器)
 | 倍速 | 0.5x – 3.0x,记忆上次设置 |
 | 快退 / 快进 | 15s / 30s(可在设置中调整) |
 | 睡眠定时 | 15/30/45/60 分钟 + "播完本集" |
-| 音轨选择 | 支持(多语言音轨) |
-| 进度同步 | 双向同步回 Jellyfin |
+| 音轨选择 | **仅 L3 路径支持**(见下方说明) |
+| 进度同步 | 双向同步回 Jellyfin(客户端每 10s 上报一次 + seek 时立即上报,失败入队补报) |
+
+#### 音轨选择的真实边界(v1 已知限制)
+
+原表格写的是"支持(多语言音轨)",这是**无条件承诺,与 API 事实不符**,在此更正:
+
+- **L1(`GET /Audio/{itemId}/universal`)不支持选音轨。** 核对 `docs/jellyfin-openapi.json`:该端点的
+  查询参数只有 `container / mediaSourceId / deviceId / userId / audioCodec / maxAudioChannels /
+  transcodingAudioChannels / maxStreamingBitrate / audioBitRate / startTimeTicks / transcodingContainer /
+  transcodingProtocol / maxAudioSampleRate / maxAudioBitDepth / enableRemoteMedia /
+  enableAudioVbrEncoding / breakOnNonKeyFrames / enableRedirection` —— **没有 `audioStreamIndex`**。
+  服务端输出的是它自己挑好的单一音轨,客户端无从指定;`Player.getCurrentTracks()` 也就只会报一条音轨。
+- **L3(`GET /Videos/{itemId}/stream?static=true`)支持。** 直通原始容器,原文件里的多条音轨都在流里,
+  用 Media3 的 `TrackSelectionOverride` 正常切换(`PlayerViewModel.onCycleAudioTrack`)。
+
+因此播放页的"音轨"按钮在 L1 下是 no-op(`audioGroups.size <= 1` 直接返回),这是**符合 API 事实的
+预期行为,不是缺陷**。而 L1 是本产品的核心价值路径(流量省 40 倍),绝不会为了让音轨切换可用而
+默认降级到 L3。
+
+> 若将来要在纯音频路径上支持选音轨,唯一可行方向是改用带 `audioStreamIndex` 参数的
+> `/Videos/{itemId}/stream` 系列端点并要求服务端只转码音频轨——那是 v2 的事,需要重新做 Spike。
 
 ---
 
@@ -234,26 +267,34 @@ Server(一台 Jellyfin 服务器)
 
 ---
 
-## 9. 待验证的技术风险(Spike)
+## 9. 技术风险验证(Spike)结论
 
-必须在正式开发前完成,**结论写回本文档**:
+> 完整实测数据见 **`2026-07-25-spike-results.md`**。下面是摘要。
 
-**Spike-1(阻塞级):Jellyfin 能否输出纯音频流?**
-- 对真实 DS920+ 逐一测试:
-  - `GET /Videos/{id}/stream.mp3?...`
-  - `GET /Videos/{id}/master.m3u8?...` 中是否存在独立音频 rendition
-  - `PlaybackInfo` 中各类参数组合(container / audioCodec / videoCodec)
-- **产出:** 确定 L1/L2 是否可行、具体 URL 与参数、实测码率与 NAS CPU 占用。
-- **若全部不可行:** L3 兜底,并在文档中记录结论,产品仍可交付。
+**Spike-1(阻塞级):Jellyfin 能否输出纯音频流?→ ✅ 可行,已解除阻塞**
 
-**Spike-2:字幕文本获取**
-- 验证内封 SRT/ASS 能否通过字幕接口取到**文本**;
-- 确认返回格式(SRT / VTT / JSON)与时间轴精度;
-- 确认位图字幕(PGS/VobSub)如何在 `MediaStreams` 中识别并过滤掉。
+- 可用接口:`GET /Audio/{itemId}/universal?audioCodec=aac&audioBitRate={bps}&maxAudioChannels=2`
+- 实测码率:请求 128k → 输出 132 kbps;请求 64k → 输出 71 kbps(原始 5.57 Mbps)
+- NAS 性能:**41 倍实时速度**,J4125 非瓶颈,无需为 CPU 做降级设计
+- **L2(HLS 音频 rendition)实测不存在**(`/Audio/…/master.m3u8` 返回 500;
+  `/Videos/…/master.m3u8` 只有一条 1080p 混流),**已从降级链删除**
+- **关键约束:`Accept-Ranges: none`**,seek 必须靠重发 `startTimeTicks` 请求(详见 §3.1)
 
-**Spike-3:公网 IPv6 + HTTPS 可达性**
-- 在移动网络下验证 IPv6 直连群晖是否通(部分运营商 IPv6 不稳定);
-- 验证证书链在 Android 上是否被信任。
+**Spike-2:字幕文本获取 → ✅ 可行**
+
+- 接口:`GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/Stream.{format}`
+- `srt` / `vtt` / `ass` / `js` 四种格式**全部返回 200**;**选用 `srt`**(体积最小、毫秒精度)
+- 位图字幕识别字段:`MediaStreams[].IsTextSubtitleStream`
+- ⚠️ **真实数据的三个坑,解析器必须处理:**
+  1. **ASS 特效标签 `{\pos(…)}` 未被剥离**(srt 与 js 中均残留)→ 解析器须同时剥离 `{...}` 与 HTML 标签
+  2. **存在零时长条目**(`00:00:00,000 --> 00:00:00,000`,内容为制作组标记)→ 须过滤 `endMs <= startMs`
+  3. 文件带 **UTF-8 BOM**,VTT 另有 `Region:` 头块
+
+**Spike-3:公网 IPv6 + HTTPS 可达性 → ⏸ 未完成**
+
+- **缺少 DDNS 域名,无法测试。** Tailscale 侧仅 8096 开放,8920 不可达。
+- **对开发影响有限:** 多地址选路与证书指纹白名单的实现不依赖此结论,
+  只需保证公网 endpoint 探测失败时正确降级。待域名到位后在 Task 23 端到端验收中补测。
 
 ---
 
@@ -283,11 +324,13 @@ Server(一台 Jellyfin 服务器)
 
 ## 11. v1 范围边界
 
-**做:** 多服务器 + 多接入地址自动选路 / 剧集 + 电影 / 纯音频播放(三级降级)/ 歌词式字幕 / 后台播放与锁屏控制 / 倍速 · 睡眠定时 · 快进快退 / 自动连播 / 音轨选择 / 进度双向同步
+**做:** 多服务器 + 多接入地址自动选路 / 剧集 + 电影 / 纯音频播放(实际两级降级 L1+L3,L2 经 Spike 证实永不可达)/ 歌词式字幕 / 后台播放与锁屏控制 / 倍速 · 睡眠定时 · 快进快退 / 自动连播 / **音轨选择(仅 L3,见 §3.5 的边界说明)** / 进度双向同步
+
+> **2026-07-26 范围变更:** 「搜索」与「媒体库分页」已移入「做」。
+> 见 `2026-07-26-library-paging-and-search-design.md`。
 
 **明确不做:**
 - ❌ 离线下载(v2)
-- ❌ 搜索(用户明确不需要)
 - ❌ 视频画面渲染(与产品定位冲突)
 - ❌ 音乐 / 有声书库
 - ❌ 投屏 / 遥控其他设备

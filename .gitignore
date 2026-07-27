@@ -11,3 +11,8 @@ captures/
 *.keystore
 *.jks
 .DS_Store
+
+.superpowers/
+
+# 发布签名:真实密码与 keystore 绝不进版本库(keystore.properties.example 是模板,可提交)
+keystore.properties
