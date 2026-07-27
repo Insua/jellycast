@@ -7,6 +7,7 @@ import dev.insua.jellycast.network.dto.MediaStreamDto
 import dev.insua.jellycast.network.dto.PlaybackInfoResponseDto
 import io.mockk.coEvery
 import io.mockk.mockk
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -96,6 +97,30 @@ class PlaybackSourceResolverTest {
         val src = resolver.resolve(TEST_ITEM_ID, TEST_USER_ID)
         assertEquals(AudioDeliveryLevel.CLIENT_VIDEO_DISABLED, src.level)
         assertTrue(src.streamUrl.isNotBlank())
+    }
+
+    /**
+     * `runCatching` 连 [CancellationException] 一起吞 —— 而 [HttpStreamProbe] 特意把它重新抛出来了,
+     * 到这一层又被吞回去,那份小心白费。
+     *
+     * 具体后果:`PlaybackService.onDestroy` 取消 `serviceScope` 时,一次正在飞的 seek 的探测被取消,
+     * 这里把它当成"不是纯音频"、若无其事地继续走完 L3 分支,回一个播放源给一个正在被拆掉的播放器。
+     * 协程取消**必须**一路传播到顶,这是项目既定不变量。
+     *
+     * 注意这和"探测失败静默降级到 L3"(上一条用例)是两件不同的事:取消不是失败。
+     */
+    @Test fun `探测被取消时 CancellationException 向上传播,不被当成不是纯音频`() = runTest {
+        val cancellingProbe = object : StreamProbe {
+            override suspend fun isAudioOnly(url: String): Boolean = throw CancellationException("会话被取消")
+        }
+        val resolver = newResolver(cancellingProbe)
+
+        try {
+            resolver.resolve(TEST_ITEM_ID, TEST_USER_ID)
+            throw AssertionError("CancellationException 必须向上传播,不得被 runCatching 吞掉")
+        } catch (expected: CancellationException) {
+            // 期望路径
+        }
     }
 
     @Test fun `位图字幕被过滤掉不出现在可选字幕中`() = runTest {

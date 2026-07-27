@@ -5,6 +5,7 @@ import dev.insua.jellycast.model.AudioTrack
 import dev.insua.jellycast.model.PlaybackSource
 import dev.insua.jellycast.model.SubtitleTrackRef
 import dev.insua.jellycast.network.JellyfinApi
+import kotlinx.coroutines.CancellationException
 
 /**
  * 探测某个 URL 实测吐出的流是否为"纯音频"(不含视频轨)。
@@ -55,6 +56,7 @@ class PlaybackSourceResolver(
      * 不需要任何失效逻辑。
      */
     private val audioOnlyByMediaSource = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
     suspend fun resolve(itemId: String, userId: String, startPositionMs: Long = 0L): PlaybackSource {
         val info = api.playbackInfo(itemId, userId)
         val ms = info.mediaSources.firstOrNull()
@@ -116,12 +118,23 @@ class PlaybackSourceResolver(
      * 探测异常照旧静默吞掉当"不是纯音频"(铁律 3:降级链必须保底可用,失败不得让用户看到错误)。
      * 但**失败的判定不写进缓存**:那多半是一次偶发的网络抖动,记下来会把整个会话钉死在 L3
      * (~42 倍带宽),这正是本产品最不能接受的静默降级。
+     *
+     * ⚠️ [CancellationException] **必须**穿过去。原来这里是 `runCatching { … }.getOrDefault(false)`,
+     * 连协程取消一起吞:`PlaybackService.onDestroy` 取消 `serviceScope` 时,一次正在飞的 seek 探测被
+     * 取消,却被当成"不是纯音频"若无其事地走完 L3 分支,把一个播放源交给一个正在被拆掉的播放器。
+     * [HttpStreamProbe] 特意重新抛出了它,不能在这一层又吞回去。**取消不是失败。**
      */
     private suspend fun isAudioOnly(itemId: String, mediaSourceId: String, base: String, token: String): Boolean {
         val key = "$itemId/$mediaSourceId"
         audioOnlyByMediaSource[key]?.let { return it }
         val probeUrl = buildAudioUniversalUrl(base, itemId, token, mediaSourceId, audioBitRateBps, startTimeTicks = null)
-        val verdict = runCatching { streamProbe.isAudioOnly(probeUrl) }.getOrNull() ?: return false
+        val verdict = try {
+            streamProbe.isAudioOnly(probeUrl)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return false
+        }
         audioOnlyByMediaSource[key] = verdict
         return verdict
     }
