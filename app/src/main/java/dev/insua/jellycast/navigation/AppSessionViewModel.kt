@@ -133,11 +133,40 @@ class AppSessionViewModel @Inject constructor(
         refreshBaseUrl()
     }
 
+    /**
+     * 解析出用于拼封面 URL 的 baseUrl。
+     *
+     * **断网时必须有兜底。** [JellyfinSession.baseUrl] 走的是并发选路,断网必然失败;而这个值一旦
+     * 是空串,[dev.insua.jellycast.feature.home.HomeScreen] / `LibraryScreen` 就**根本不会去拼图片
+     * URL**(见它们的 `imageUrl = if (baseUrl.isBlank()) null else ...`),于是 Coil 连缓存键都拿不到,
+     * 磁盘缓存里明明躺着这些封面也一张都用不上 —— 列表内容从 Room 缓存里出来了,却是一整屏灰色
+     * 占位图,和白屏差不了多少。真机验证时看到的正是这个现象。
+     *
+     * 兜底顺序:
+     * 1. 这一刻选路的结果(联网时的正常路径);
+     * 2. 本进程上一次成功解析的地址([JellyfinSession.cachedBaseUrlOrNull])—— 覆盖"用着用着断网";
+     * 3. 激活服务器优先级最高的那个 endpoint —— 覆盖"冷启动就没网"。
+     *
+     * 后两条给出的地址此刻当然是连不上的,但这**正是想要的**:URL 只是 Coil 的缓存键,
+     * 命中磁盘缓存的请求根本不会走网络;没命中的那张本来也加载不出来,退回占位图,和现在一样。
+     */
     private fun refreshBaseUrl() {
         viewModelScope.launch {
-            runCatching { session.baseUrl() }.getOrNull()?.let { _baseUrl.value = it }
+            val resolved = runCatching { session.baseUrl() }.getOrNull()
+                ?: session.cachedBaseUrlOrNull()
+                ?: activeServerFallbackBaseUrl()
+            if (!resolved.isNullOrBlank()) _baseUrl.value = resolved
         }
     }
+
+    private suspend fun activeServerFallbackBaseUrl(): String? = runCatching {
+        val activeId = serverStore.activeServerId.first() ?: return@runCatching null
+        serverStore.servers.first()
+            .find { it.id == activeId }
+            ?.endpoints
+            ?.minByOrNull { it.priority }
+            ?.url
+    }.getOrNull()
 
     /**
      * 和 [dev.insua.jellycast.feature.player.PlayerViewModel.observePlaybackState] 同样的

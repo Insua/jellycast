@@ -3,6 +3,8 @@ package dev.insua.jellycast
 import android.app.Application
 import coil3.ImageLoader
 import coil3.PlatformContext
+import coil3.disk.DiskCache
+import okio.Path.Companion.toOkioPath
 import coil3.SingletonImageLoader
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import dagger.hilt.android.HiltAndroidApp
@@ -33,5 +35,35 @@ class JellyCastApp : Application(), SingletonImageLoader.Factory {
     override fun newImageLoader(context: PlatformContext): ImageLoader =
         ImageLoader.Builder(context)
             .components { add(OkHttpNetworkFetcherFactory(callFactory = { trustAwareHttpClient })) }
+            .diskCache {
+                DiskCache.Builder()
+                    .directory(cacheDir.resolve(IMAGE_CACHE_DIR).toOkioPath())
+                    .maxSizeBytes(IMAGE_DISK_CACHE_BYTES)
+                    .build()
+            }
             .build()
+
+    private companion object {
+        const val IMAGE_CACHE_DIR = "image_cache"
+
+        /**
+         * 封面图磁盘缓存上限:**128 MiB**。
+         *
+         * 依据:
+         * - Coil 3 **默认不开磁盘缓存**,只有内存缓存。后果是进程一重启封面就全没了,断网时
+         *   列表内容(Room 缓存)在、封面却一张都加载不出来 —— 整页灰色占位,和白屏差不多。
+         *   这是本次离线改造里必须补的一环。
+         * - 单张封面走的是 Jellyfin 的 `Images/Primary`,按本项目的卡片尺寸(≈ 140dp 宽)
+         *   实际落盘通常 30–80 KB。128 MiB 大约能装下 **2000 张以上**,而这台服务器整个库的
+         *   剧集 + 电影海报数量远小于这个量级 —— 也就是说常用范围内基本不会发生淘汰,
+         *   离线时该有的封面都在。
+         * - 上限本身仍然必要:`cacheDir` 是系统在存储紧张时会整目录清掉的地方,不设上限等于
+         *   把"什么时候清"完全交给系统。128 MiB 对一台现代 Android 手机是可以忽略的占用,
+         *   却给了 LRU 一个明确的边界。
+         *
+         * 放在 `cacheDir` 而不是 `filesDir`:这是可再生数据,系统需要空间时清掉它是正确行为,
+         * 清掉之后联网再拉一次就好,不该占用"用户数据"的配额。
+         */
+        const val IMAGE_DISK_CACHE_BYTES = 128L * 1024 * 1024
+    }
 }
