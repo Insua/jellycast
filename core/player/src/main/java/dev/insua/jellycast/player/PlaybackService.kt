@@ -110,6 +110,30 @@ class PlaybackService : MediaSessionService() {
     private var playbackStateListener: Player.Listener? = null
     private var bandwidthListener: AnalyticsListener? = null
 
+    /**
+     * 「进前台」和「退前台」的决策全在这里(见 [ForegroundLifecycleController] 类注释)。
+     * 本类只提供两件 Android 才做得到的事:贴/摘通知、停服务。
+     */
+    private var foregroundLifecycle: ForegroundLifecycleController? = null
+
+    private val foregroundHooks = object : ForegroundLifecycleController.Hooks {
+        override fun enterForeground() = enterForegroundNow()
+
+        /**
+         * 占位通知是本类贴的,只能由本类摘。`STOP_FOREGROUND_REMOVE` 是关键 —— 不带这个标志
+         * 通知会留在栏里;而它 `setOngoing(true)` 且没有 `contentIntent`,用户既划不掉也点不动。
+         *
+         * `stopSelf()` 在有 `MediaController` 绑着的时候不会真的销毁服务(绑定客户端会把它留住),
+         * 那也没关系:用户可见的那条假通知已经没了,进程也不再被钉在前台。
+         */
+        override fun dismissNotificationAndStop() {
+            runCatching {
+                ServiceCompat.stopForeground(this@PlaybackService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+            }
+            stopSelf()
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         val router = SeekRouter { positionMs ->
@@ -173,6 +197,16 @@ class PlaybackService : MediaSessionService() {
 
         observeProgressReporting()
         observePlaybackSpeedPreference()
+
+        // 占位通知的收尾责任方。判据是"播放器手里还有内容吗" —— `STATE_IDLE` 表示 stop/clear 过或者
+        // 从来没 prepare 成功过,也就是"占位通知后面什么都没有"。在主线程 scope 上读播放器,
+        // 满足 ExoPlayer 的 application thread 约束。
+        foregroundLifecycle = ForegroundLifecycleController(
+            scope = serviceScope,
+            engineState = playbackEngine.state,
+            isPlayerActive = { exoPlayer.playbackState != Player.STATE_IDLE },
+            hooks = foregroundHooks,
+        ).also { it.start() }
     }
 
     /**
@@ -208,11 +242,18 @@ class PlaybackService : MediaSessionService() {
      * 重新 `startForeground` 一次 —— 视觉上零变化,而"进前台"这个义务照样当场履行完。
      *
      * 这里也一并修掉 Task 1 发现的第二个事实:一个进程里只出现过一次 `am_foreground_service_start`。
-     * Service 被销毁重建后 Media3 再也没把它提到前台。现在**每一次** `onStartCommand` 都会进前台,
-     * 不依赖 Media3 内部任何状态。
+     * Service 被销毁重建后 Media3 再也没把它提到前台。现在**每一次带 intent 的** `onStartCommand`
+     * 都会进前台,不依赖 Media3 内部任何状态。
+     *
+     * ### ⚠️ 复审 Important 1(已闭合):进得去也得出得来
+     *
+     * `intent == null` 说明这是系统按 `START_STICKY` 重启本服务 —— 什么都没在播,而且这条路
+     * **根本没有 10s 时限要赶**(时限只针对 `startForegroundService()`)。此时贴占位通知等于凭空
+     * 造一条幽灵通知。判定连同"解析失败 / 长时间空转就收摊"一起交给
+     * [ForegroundLifecycleController](纯 Kotlin,已单测),本方法只负责把事实告诉它。
      */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        enterForegroundNow()
+        foregroundLifecycle?.onStartCommand(hasIntent = intent != null)
         return super.onStartCommand(intent, flags, startId)
     }
 
@@ -349,6 +390,8 @@ class PlaybackService : MediaSessionService() {
         mediaSession?.release()
         mediaSession = null
         engine = null
+        foregroundLifecycle?.stop()
+        foregroundLifecycle = null
         serviceScope.cancel()
         // 占位通知是本类自己贴的,也必须由本类自己收走 —— 否则 Service 销毁后通知栏会留下一条
         // 点不动的"正在准备播放"。
