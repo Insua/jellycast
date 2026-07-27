@@ -44,6 +44,9 @@ media3-exoplayer-hls = { module = "androidx.media3:media3-exoplayer-hls", versio
 media3-session = { module = "androidx.media3:media3-session", version.ref = "media3" }
 hilt-android = { module = "com.google.dagger:hilt-android", version.ref = "hilt" }
 hilt-compiler = { module = "com.google.dagger:hilt-android-compiler", version.ref = "hilt" }
+# 端到端 instrumentation 测试:HiltTestApplication + HiltAndroidRule。
+# 版本必须跟 hilt 本体走同一个 version ref,不允许写死。
+hilt-android-testing = { module = "com.google.dagger:hilt-android-testing", version.ref = "hilt" }
 hilt-navigation-compose = { module = "androidx.hilt:hilt-navigation-compose", version.ref = "hilt-navigation-compose" }
 retrofit = { module = "com.squareup.retrofit2:retrofit", version.ref = "retrofit" }
 retrofit-serialization = { module = "com.jakewharton.retrofit:retrofit2-kotlinx-serialization-converter", version.ref = "retrofit-serialization" }
