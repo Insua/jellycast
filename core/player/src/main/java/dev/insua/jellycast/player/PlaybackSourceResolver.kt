@@ -9,10 +9,17 @@ import kotlinx.coroutines.CancellationException
 
 /**
  * 探测某个 URL 实测吐出的流是否为"纯音频"(不含视频轨)。
- * 任何异常都不得向上抛出 —— 调用方(resolve)负责把异常吞掉当作探测失败,静默降级。
+ *
+ * 三态,`null` 是**没问出结论**(服务端非 2xx、网络异常……),不是"不是纯音频"。
+ * 这个区分是必须的:调用方要按媒体源缓存判定,而**只有有结论的判定才可以被记住**。
+ * 把"J4125 上并发转码打架时回了个 500"记成"这个源不是纯音频",等于一次瞬时抽风就把整个会话
+ * 钉死在 L3(~42 倍带宽)且用户毫无感知 —— 本产品定义的最坏静默降级。
+ *
+ * [kotlinx.coroutines.CancellationException] 以外的异常都不得向上抛出:探测失败必须表现为 `null`,
+ * 由调用方兜底到 L3(铁律 3)。
  */
 interface StreamProbe {
-    suspend fun isAudioOnly(url: String): Boolean
+    suspend fun isAudioOnly(url: String): Boolean?
 }
 
 /**
@@ -119,6 +126,10 @@ class PlaybackSourceResolver(
      * 但**失败的判定不写进缓存**:那多半是一次偶发的网络抖动,记下来会把整个会话钉死在 L3
      * (~42 倍带宽),这正是本产品最不能接受的静默降级。
      *
+     * ⚠️ 只缓存**有结论**的判定([StreamProbe] 返回非 null)。端到端第 2 轮的实证:一个进程里
+     * 八个用例全程被钉在 L3,而第 1、3 轮同一个条目全程 `200 audio/aac` 走 L1 —— 代码里能把一个
+     * 进程整体钉死在 L3 的路径只有"某次没结论的探测被记进了缓存"这一条。
+     *
      * ⚠️ [CancellationException] **必须**穿过去。原来这里是 `runCatching { … }.getOrDefault(false)`,
      * 连协程取消一起吞:`PlaybackService.onDestroy` 取消 `serviceScope` 时,一次正在飞的 seek 探测被
      * 取消,却被当成"不是纯音频"若无其事地走完 L3 分支,把一个播放源交给一个正在被拆掉的播放器。
@@ -133,8 +144,8 @@ class PlaybackSourceResolver(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            return false
-        }
+            null
+        } ?: return false            // 没问出结论:这次兜底 L3,但**不**记住
         audioOnlyByMediaSource[key] = verdict
         return verdict
     }

@@ -6,6 +6,7 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -35,27 +36,32 @@ class HttpStreamProbeTest {
         server.enqueue(MockResponse().setResponseCode(200).addHeader("Content-Type", "audio/aac").setBody("x"))
         val probe = HttpStreamProbe(OkHttpClient())
 
-        assertTrue(probe.isAudioOnly(server.url("/Audio/1/universal").toString()))
+        assertTrue(probe.isAudioOnly(server.url("/Audio/1/universal").toString()) ?: false)
     }
 
     @Test fun `Content-Type 是 video 前缀时判定为不是纯音频`() = runTest {
         server.enqueue(MockResponse().setResponseCode(200).addHeader("Content-Type", "video/x-matroska").setBody("x"))
         val probe = HttpStreamProbe(OkHttpClient())
 
-        assertFalse(probe.isAudioOnly(server.url("/Videos/1/stream").toString()))
+        assertFalse(probe.isAudioOnly(server.url("/Videos/1/stream").toString()) ?: true)
     }
 
-    @Test fun `HTTP 非 2xx 判定为不是纯音频`() = runTest {
+    /**
+     * 非 2xx 是**没问出结论**,不是"不是纯音频"。区分二者是必须的:调用方按媒体源缓存判定,
+     * 只有有结论的判定才可以被记住(见 [StreamProbe] 与 `PlaybackSourceResolver.isAudioOnly`)。
+     * J4125 上并发转码打架回个 500 是常态,记成 false 就是一次抽风钉死整个会话在 L3。
+     */
+    @Test fun `HTTP 非 2xx 是没有结论,不是判定为不是纯音频`() = runTest {
         server.enqueue(MockResponse().setResponseCode(500))
         val probe = HttpStreamProbe(OkHttpClient())
 
-        assertFalse(probe.isAudioOnly(server.url("/Audio/1/universal").toString()))
+        assertNull(probe.isAudioOnly(server.url("/Audio/1/universal").toString()))
     }
 
-    @Test fun `网络异常时不向上抛出,判定为不是纯音频`() = runTest {
+    @Test fun `网络异常时不向上抛出,同样是没有结论`() = runTest {
         server.shutdown()
         val probe = HttpStreamProbe(OkHttpClient())
 
-        assertFalse(probe.isAudioOnly(server.url("/Audio/1/universal").toString()))
+        assertNull(probe.isAudioOnly(server.url("/Audio/1/universal").toString()))
     }
 }

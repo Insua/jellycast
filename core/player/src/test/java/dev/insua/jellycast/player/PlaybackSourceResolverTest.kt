@@ -9,6 +9,9 @@ import io.mockk.coEvery
 import io.mockk.mockk
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.test.runTest
+import okhttp3.OkHttpClient
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -91,7 +94,7 @@ class PlaybackSourceResolverTest {
 
     @Test fun `StreamProbe 抛异常时静默降级到 L3 不向上抛错`() = runTest {
         val throwingProbe = object : StreamProbe {
-            override suspend fun isAudioOnly(url: String): Boolean = error("网络炸了")
+            override suspend fun isAudioOnly(url: String): Boolean? = error("网络炸了")
         }
         val resolver = newResolver(throwingProbe)
         val src = resolver.resolve(TEST_ITEM_ID, TEST_USER_ID)
@@ -111,7 +114,7 @@ class PlaybackSourceResolverTest {
      */
     @Test fun `探测被取消时 CancellationException 向上传播,不被当成不是纯音频`() = runTest {
         val cancellingProbe = object : StreamProbe {
-            override suspend fun isAudioOnly(url: String): Boolean = throw CancellationException("会话被取消")
+            override suspend fun isAudioOnly(url: String): Boolean? = throw CancellationException("会话被取消")
         }
         val resolver = newResolver(cancellingProbe)
 
@@ -180,7 +183,7 @@ class PlaybackSourceResolverTest {
     @Test fun `同一个媒体源反复 resolve 只探测一次,seek 不再起新的孤儿转码`() = runTest {
         val probedUrls = mutableListOf<String>()
         val countingProbe = object : StreamProbe {
-            override suspend fun isAudioOnly(url: String): Boolean {
+            override suspend fun isAudioOnly(url: String): Boolean? {
                 probedUrls += url
                 return true
             }
@@ -204,7 +207,7 @@ class PlaybackSourceResolverTest {
     @Test fun `L3 判定同样被记住,不会每次 seek 重新探测`() = runTest {
         var probeCount = 0
         val countingProbe = object : StreamProbe {
-            override suspend fun isAudioOnly(url: String): Boolean {
+            override suspend fun isAudioOnly(url: String): Boolean? {
                 probeCount++
                 return false
             }
@@ -220,11 +223,56 @@ class PlaybackSourceResolverTest {
         assertTrue(second.streamUrl.contains("startTimeTicks=6000000000"), second.streamUrl)
     }
 
+    /**
+     * ## 缓存只许记**有结论**的探测,绝不许记一次服务端抽风
+     *
+     * 端到端第 2 轮暴露的真实回归:整整一轮八个用例,那台群晖上的同一个条目**全程走 L3**
+     * (`level=CLIENT_VIDEO_DISABLED`,起播 34s、连点快进 40s,都是拉全量 1080p 流的耗时特征),
+     * 而第 1 轮和第 3 轮同一个条目全程 `200 audio/aac` 走 L1。
+     *
+     * 代码里能把一个进程**整体**钉死在 L3 的路径只有一条:某一次探测返回了 false 并被记进缓存。
+     * 而 [HttpStreamProbe] 对 **HTTP 非 2xx 也返回 false** —— J4125 上并发转码打架时
+     * `/Audio/{item}/universal` 回一个 500 完全正常。于是一次瞬时抽风 = 整个会话 ~42 倍带宽,
+     * 而且用户毫无感知。**这正是本产品定义的最坏静默降级**,比不缓存严重得多。
+     *
+     * 判据:200 + 非 audio 的 Content-Type 是**有结论**的("这个源就是混流");
+     * 非 2xx / 网络异常是**没有结论**的("这次没问过")。只有前者可以记住。
+     *
+     * 这条用例用 MockWebServer 按服务端行为表述,不依赖探测器内部返回值的形状。
+     */
+    @Test fun `服务端一次 500 之后必须重新探测,不得把整个会话钉死在 L3`() = runTest {
+        val server = MockWebServer().apply { start() }
+        try {
+            server.enqueue(MockResponse().setResponseCode(500))                       // 第一次:服务端抽风
+            server.enqueue(
+                MockResponse().setResponseCode(200).addHeader("Content-Type", "audio/aac").setBody("x"),
+            )
+            val resolver = PlaybackSourceResolver(
+                api = fakeApi(),
+                streamProbe = HttpStreamProbe(OkHttpClient()),
+                baseUrlProvider = { server.url("/").toString().trimEnd('/') },
+                tokenProvider = { TEST_TOKEN },
+            )
+
+            val first = resolver.resolve(TEST_ITEM_ID, TEST_USER_ID)
+            val second = resolver.resolve(TEST_ITEM_ID, TEST_USER_ID, startPositionMs = 600_000L)
+
+            assertEquals(AudioDeliveryLevel.CLIENT_VIDEO_DISABLED, first.level, "这次没问出结论,兜底 L3 是对的")
+            assertEquals(
+                AudioDeliveryLevel.SERVER_AUDIO_ONLY,
+                second.level,
+                "一次 500 不是结论,后续必须重新探测;记住它等于把整个会话钉死在 ~42 倍带宽的 L3",
+            )
+        } finally {
+            server.shutdown()
+        }
+    }
+
     /** 缓存的键是媒体源,不是"探测过一次就对所有条目生效"。换一个条目必须重新探测。 */
     @Test fun `换一个条目必须重新探测`() = runTest {
         val probedUrls = mutableListOf<String>()
         val countingProbe = object : StreamProbe {
-            override suspend fun isAudioOnly(url: String): Boolean {
+            override suspend fun isAudioOnly(url: String): Boolean? {
                 probedUrls += url
                 return true
             }
