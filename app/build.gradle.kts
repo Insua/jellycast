@@ -122,6 +122,22 @@ android {
         }
     }
 
+    /**
+     * 每个 instrumentation 测试跑在**自己的进程**里。
+     *
+     * 不是洁癖,是实测的必要条件:这一套端到端测试全部依赖 `@Singleton`(ExoPlayer、PlayQueue、
+     * PlaybackService、JellyfinSession……),它们在同一个进程里被所有用例共享。
+     * `OfflineE2eTest` 会真的把设备切进飞行模式再切回来 —— 之后 `PlaybackE2eTest` 的"一集播完
+     * 自动连播"就再也不会推进队列(STATE_ENDED 到了、队列一步不动),而它单独跑、或者整套里
+     * 去掉断网用例之后,都是绿的。也就是说进程内残留状态确实会跨用例传染。
+     *
+     * Orchestrator 每跑一个用例重开一次进程,把这类耦合从根上去掉 —— 这也是官方对
+     * "测试互相污染 / 共享单例" 给出的标准答案。代价是每个用例多几秒启动时间。
+     */
+    testOptions {
+        execution = "ANDROIDX_TEST_ORCHESTRATOR"
+    }
+
     // buildConfig = true:上面的 buildConfigField 需要它才会生成 BuildConfig 类。
     buildFeatures {
         compose = true
@@ -204,7 +220,15 @@ dependencies {
     // ⚠️ 源码集纪律:src/test 是 JUnit5 + MockK,src/androidTest 是 JUnit4 + AndroidJUnit4。
     // 两套框架不混用 —— instrumentation 侧只有 JUnit4 能被 AndroidJUnitRunner 驱动。
     androidTestImplementation(libs.junit4)
+    // 离线提示条必须被断言成"在视口里真的看得见"(assertIsDisplayed),不能只断言 ViewModel 状态:
+    // 真机验证时出现过 isOffline=true、提示条也被组合出来了,却因为懒列表的锚定行为被顶到视口
+    // 上方,用户一眼看不到。只有 Compose 语义树上的可见性断言能抓住这种形状的缺陷。
+    androidTestImplementation(platform(libs.compose.bom))
+    androidTestImplementation(libs.compose.ui.test.junit4)
+    debugImplementation(libs.compose.ui.test.manifest)
     androidTestImplementation(libs.androidx.test.runner)
+    androidTestUtil(libs.androidx.test.orchestrator)
+    androidTestUtil(libs.androidx.test.services)
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.hilt.android.testing)
     kspAndroidTest(libs.hilt.compiler)

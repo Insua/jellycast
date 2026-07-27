@@ -30,6 +30,9 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -39,6 +42,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import dev.insua.jellycast.designsystem.OfflineBanner
 import dev.insua.jellycast.designsystem.PosterCard
 import dev.insua.jellycast.model.MediaItem
 import dev.insua.jellycast.model.MediaKind
@@ -56,6 +60,7 @@ object LibraryScreenTestTags {
     const val LOADING_MORE = "library_loading_more"
     const val ERROR_ROW = "library_error_row"
     const val EMPTY_STATE = "library_empty_state"
+    const val OFFLINE_BANNER = "library_offline_banner"
 
     fun item(id: String) = "library_item_$id"
 }
@@ -113,6 +118,9 @@ fun LibraryScreenContent(
 ) {
     val visible = uiState.visible
 
+    // 见 [HomeScreen]:关闭状态是页面级的,不进 ViewModel。
+    var offlineNoticeDismissed by rememberSaveable { mutableStateOf(false) }
+
     Column {
         OutlinedTextField(
             value = uiState.query,
@@ -153,6 +161,15 @@ fun LibraryScreenContent(
                     text = { Text("电影") },
                 )
             }
+        }
+
+        // 显示的是上次的内容:顶部一条可关闭的提示,底下的网格照常可滚动可点(不是弹窗)。
+        // 搜索态不显示 —— 搜索结果不缓存(见 [LibraryViewModel] 类 KDoc),那一屏没有"上次内容"可言。
+        if (uiState.isOffline && !uiState.isSearching && visible.loadedCount > 0 && !offlineNoticeDismissed) {
+            OfflineBanner(
+                onDismiss = { offlineNoticeDismissed = true },
+                modifier = Modifier.testTag(LibraryScreenTestTags.OFFLINE_BANNER),
+            )
         }
 
         // 三份列表(剧集 / 电影 / 搜索结果)各自一个滚动状态:共用一个的话,从剧集第 80 条

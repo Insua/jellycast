@@ -14,10 +14,13 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -77,7 +80,21 @@ fun JellyCastNavHost(
 
     var playerExpanded by remember { mutableStateOf(false) }
 
+    // 断网时点播放的提示(设计文档 §3.2 第四行)。用 Snackbar 而不是对话框:它不拦截操作,
+    // 用户可以立刻接着浏览缓存里的内容。
+    val snackbarHostState = remember { SnackbarHostState() }
+    val message by sessionViewModel.message.collectAsState()
+    LaunchedEffect(message) {
+        val text = message ?: return@LaunchedEffect
+        // 播放没起来,却把全屏播放页展开了,用户会盯着一个空白播放页发呆(还看不到底下的
+        // Snackbar)。所以先收起来,再提示。
+        playerExpanded = false
+        snackbarHostState.showSnackbar(text)
+        sessionViewModel.onMessageShown()
+    }
+
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
             if (showChrome) {
                 Column {

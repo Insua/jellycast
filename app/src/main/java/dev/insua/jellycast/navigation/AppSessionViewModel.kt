@@ -14,6 +14,7 @@ import dev.insua.jellycast.model.displaySubtitle
 import dev.insua.jellycast.network.mapper.posterUrl
 import dev.insua.jellycast.network.session.JellyfinSession
 import dev.insua.jellycast.player.AudioPlaybackEngine
+import dev.insua.jellycast.player.PlaybackEngineState
 import dev.insua.jellycast.player.PlaybackService
 import dev.insua.jellycast.player.PlayQueue
 import kotlinx.coroutines.currentCoroutineContext
@@ -26,6 +27,14 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import javax.inject.Inject
+
+/**
+ * 断网时点播放给用户看的话(设计文档 §3.2 第四行)。
+ *
+ * 措辞刻意点明「服务器」:用户能采取的行动是"把 VPN 打开 / 回到能连上服务器的网络",
+ * 而不是"重试"。不带任何技术细节(不出现 endpoint、超时、异常类名)。
+ */
+const val PLAYBACK_REQUIRES_SERVER_MESSAGE = "需要连接服务器才能播放"
 
 /** 常驻迷你播放条(修正 §4/§9)需要的最小展示状态。 */
 data class MiniPlayerUiState(
@@ -77,6 +86,16 @@ class AppSessionViewModel @Inject constructor(
     private val _miniPlayer = MutableStateFlow<MiniPlayerUiState?>(null)
     val miniPlayer: StateFlow<MiniPlayerUiState?> = _miniPlayer.asStateFlow()
 
+    /**
+     * 一条待展示给用户的提示(Snackbar),null = 没有。
+     *
+     * 目前唯一的来源是"点了播放但连不上服务器"(设计文档 §3.2 第四行)。用 [StateFlow] 而不是
+     * 一次性 Channel:导航层用 `LaunchedEffect(message)` 消费,展示完调 [onMessageShown] 清空,
+     * 旋转屏幕/重组不会重复弹,也不会因为此刻没有订阅者而把提示整个丢掉。
+     */
+    private val _message = MutableStateFlow<String?>(null)
+    val message: StateFlow<String?> = _message.asStateFlow()
+
     init {
         viewModelScope.launch {
             val activeId = serverStore.activeServerId.first()
@@ -84,6 +103,29 @@ class AppSessionViewModel @Inject constructor(
             if (activeId != null) refreshBaseUrl()
         }
         observeMiniPlayer()
+        observePlaybackFailure()
+    }
+
+    /** 提示已经展示过了,清空,免得下一次重组又弹一遍。 */
+    fun onMessageShown() {
+        _message.value = null
+    }
+
+    /**
+     * 引擎解析播放源失败时给出提示。
+     *
+     * 为什么光靠 [play] 里那次 `runCatching` 不够:进程在联网时已经解析过 endpoint,
+     * [JellyfinSession] 会一直复用那份缓存,所以"用着用着断网再点播放"这条路上
+     * `session.userId()` 照样成功,失败发生在更里面的 `AudioPlaybackEngine.resolve()` ——
+     * 而它按设计**不抛异常**,只是把状态置成 [PlaybackEngineState.Error](故意的:迟到的失败
+     * 不许打断正在响的那条流)。不监听这个状态,用户点下播放就是彻底的"没反应"。
+     */
+    private fun observePlaybackFailure() {
+        viewModelScope.launch {
+            audioPlaybackEngine.state.collect { state ->
+                if (state is PlaybackEngineState.Error) _message.value = PLAYBACK_REQUIRES_SERVER_MESSAGE
+            }
+        }
     }
 
     /** 登录/添加服务器成功后由导航层调用,让首页/媒体库尽快拿到正确的封面 baseUrl。 */
@@ -133,11 +175,24 @@ class AppSessionViewModel @Inject constructor(
         playerConnection.player.value?.let { player -> if (player.isPlaying) player.pause() else player.play() }
     }
 
-    /** 首页/媒体库点条目播放的唯一入口(见类注释)。[queue] 必须是整季/单集自身,由调用方决定。 */
+    /**
+     * 首页/媒体库点条目播放的唯一入口(见类注释)。[queue] 必须是整季/单集自身,由调用方决定。
+     *
+     * **断网时不许静默失败。** 解析不出会话(冷启动 + 没网 → 一轮选路探测全部失败)时,
+     * 以前是 `?: return@launch`,用户点下去什么也不会发生、也没有任何解释 —— 那和闪退一样,
+     * 都是用户口中的"点了没用"。现在收敛到 [message](设计文档 §3.2 第四行)。
+     *
+     * 请求发出之后的失败(引擎解析播放源失败)由 [observePlaybackFailure] 兜住,不在这里。
+     */
     fun play(item: MediaItem, queue: List<MediaItem>) {
         viewModelScope.launch {
             playQueue.setQueue(queue, queue.indexOfFirst { it.id == item.id }.coerceAtLeast(0))
-            val userId = runCatching { session.userId() }.getOrNull() ?: return@launch
+            val userId = runCatching { session.userId() }.getOrNull()
+            if (userId == null) {
+                _message.value = PLAYBACK_REQUIRES_SERVER_MESSAGE
+                return@launch
+            }
+            _message.value = null
             ContextCompat.startForegroundService(context, Intent(context, PlaybackService::class.java))
             audioPlaybackEngine.play(item.id, userId, item.resumePositionMs)
             refreshBaseUrl()

@@ -69,7 +69,23 @@ class ActiveServerSession(
 
     override suspend fun userId(): String = resolve().userId
 
-    override suspend fun serverId(): String = resolve().serverId
+    /**
+     * 🔴 **刻意不走 [resolve]。**
+     *
+     * "当前激活的是哪台服务器"是本地 DataStore 里的事实,和"这一刻哪个接入地址连得上"是两件事。
+     * 走 [resolve] 的话这个问题会被一次并发选路探测挡住,而离线缓存
+     * (`CachingMediaRepository`,缓存按 serverId 分区)**每次读缓存前都要先问它一次** ——
+     * 于是断网冷启动时读缓存必然失败,有缓存也被当成没缓存,用户看到的还是白屏。
+     * 整套离线缓存恰好在最需要它的那一刻失效,而且不报任何错。
+     *
+     * 仍然保留"没有已激活服务器就失败"这一条:那种情况下缓存该往哪个分区读写是没有答案的,
+     * 静默返回一个假 id 只会把不同服务器的缓存串在一起。
+     *
+     * 也刻意**不**读 [cached]:那份是"上次解析成功的那台",用户切换激活服务器之后它会短暂落后,
+     * 拿它当分区键会把新服务器的数据写进旧服务器的缓存里。直接问 [activeServer] 永远是对的。
+     */
+    override suspend fun serverId(): String =
+        (activeServer.first() ?: error("没有已激活的服务器")).id
 
     override suspend fun baseUrl(): String = resolve().endpoint.url
 

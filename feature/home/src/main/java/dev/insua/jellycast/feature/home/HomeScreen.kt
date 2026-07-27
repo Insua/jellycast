@@ -2,6 +2,7 @@ package dev.insua.jellycast.feature.home
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -13,14 +14,25 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import dev.insua.jellycast.designsystem.OfflineBanner
 import dev.insua.jellycast.designsystem.PosterCard
 import dev.insua.jellycast.model.MediaItem
 import dev.insua.jellycast.model.displaySubtitle
 import dev.insua.jellycast.network.mapper.posterUrl
+
+/** 定位节点用的测试标签,不依赖文案(文案会改)。 */
+object HomeScreenTestTags {
+    const val ERROR_RETRY = "home_error_retry"
+}
 
 /**
  * "在听"首页。三个分区自上而下:继续收听 / 下一集 / 最近添加——下一集是追剧主入口,紧跟在
@@ -39,40 +51,60 @@ fun HomeScreen(
 ) {
     val uiState by viewModel.uiState.collectAsState()
 
-    LazyColumn(
-        modifier = Modifier.padding(vertical = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-        contentPadding = PaddingValues(bottom = 96.dp), // 给底部常驻的 MiniPlayerBar 让位
-    ) {
-        // 没缓存又连不上服务器:给一个可点的重试行,而不是一片什么都没有的白屏。
-        // 只要有任何一个分区有内容(哪怕是缓存),error 就是 null,这一行不会盖住它们。
-        uiState.error?.let { message ->
-            item(key = "home_error") {
-                Text(
-                    text = "$message,点击重试",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.error,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { viewModel.retry() }
-                        .padding(horizontal = 16.dp, vertical = 24.dp),
-                )
-            }
+    // 「这一次浏览会话里已经看过离线提示了」是页面级状态,不进 ViewModel:重新进入首页
+    // (或点重试重新加载)时提示该重新出现,而不是被永久关掉。
+    var offlineNoticeDismissed by rememberSaveable { mutableStateOf(false) }
+
+    Column(modifier = Modifier.padding(vertical = 8.dp)) {
+        // 显示的是上次的内容:提示一句,但绝不挡住内容本身,也允许用户关掉。
+        //
+        // ⚠️ **必须放在 LazyColumn 外面。** 放进去(`item(key = "home_offline")`)会踩到懒列表的
+        // 锚定行为:分区是先到的,提示条是后到的(网络失败晚于读缓存),于是这一项是被**插入到
+        // 已有项之前**的。LazyListState 带 key 时会保持原来那一项的位置不动,新插入的项因此
+        // 落在视口**上方** —— 它确实被组合出来了,用户却要往上滑才看得见。真机验证时正是这个
+        // 现象:日志里 isOffline=true、屏幕上什么都没有。
+        if (uiState.isOffline && uiState.sections.isNotEmpty() && !offlineNoticeDismissed) {
+            OfflineBanner(onDismiss = { offlineNoticeDismissed = true })
         }
-        // 显示的是上次的内容:提示一句,但绝不挡住内容本身。
-        if (uiState.isOffline && uiState.sections.isNotEmpty()) {
-            item(key = "home_offline") {
-                Text(
-                    text = "离线,显示的是上次内容",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 16.dp),
-                )
+
+        LazyColumn(
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+            contentPadding = PaddingValues(bottom = 96.dp), // 给底部常驻的 MiniPlayerBar 让位
+        ) {
+            // 没缓存又连不上服务器:给一个可点的重试行,而不是一片什么都没有的白屏。
+            // 只要有任何一个分区有内容(哪怕是缓存),error 就是 null,这一行不会盖住它们。
+            uiState.error?.let { message ->
+                item(key = "home_error") {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                // 重试是一次全新的加载,离线提示的"已看过"状态跟着复位。
+                                offlineNoticeDismissed = false
+                                viewModel.retry()
+                            }
+                            .padding(horizontal = 16.dp, vertical = 24.dp)
+                            .testTag(HomeScreenTestTags.ERROR_RETRY),
+                    ) {
+                        Text(
+                            text = message,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                        Text(
+                            text = "点击重试",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                }
             }
-        }
-        for (section in uiState.sections) {
-            item(key = section.kind) {
-                HomeSectionRow(section = section, baseUrl = baseUrl, onItemClick = onItemClick)
+            for (section in uiState.sections) {
+                item(key = section.kind) {
+                    HomeSectionRow(section = section, baseUrl = baseUrl, onItemClick = onItemClick)
+                }
             }
         }
     }
