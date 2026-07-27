@@ -1,6 +1,9 @@
 package dev.insua.jellycast.feature.library
 
+import dev.insua.jellycast.model.MediaItem
+import dev.insua.jellycast.model.MediaKind
 import dev.insua.jellycast.network.JellyfinApi
+import dev.insua.jellycast.network.repository.CacheBuckets
 import dev.insua.jellycast.network.dto.BaseItemDto
 import dev.insua.jellycast.network.dto.ItemsResponseDto
 import dev.insua.jellycast.network.session.JellyfinSession
@@ -15,6 +18,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
@@ -64,8 +68,13 @@ class LibraryViewModelTest {
         return session
     }
 
-    private fun newViewModel(api: JellyfinApi, session: JellyfinSession = fakeSession()) =
-        LibraryViewModel(api, session)
+    // 取数改走 MediaRepository(缓存优先)。假仓储默认缓存为空 —— 空缓存下的行为与改动前
+    // 「直接调 API」完全一致,所以下面这些既有断言原样保留。
+    private fun newViewModel(
+        api: JellyfinApi,
+        session: JellyfinSession = fakeSession(),
+        repository: FakeMediaRepository = FakeMediaRepository(),
+    ) = LibraryViewModel(api, session, repository)
 
     private fun page(vararg names: String) =
         ItemsResponseDto(names.map { seriesDto(it) }, total = 120)
@@ -84,7 +93,7 @@ class LibraryViewModelTest {
         )
         coEvery { api.episodes("series-1", "season-1", "user-1") } returns ItemsResponseDto(items = episodes)
 
-        val viewModel = LibraryViewModel(api, fakeSession())
+        val viewModel = newViewModel(api)
         viewModel.openSeries("series-1")
         advanceUntilIdle()
 
@@ -109,7 +118,7 @@ class LibraryViewModelTest {
         )
         coEvery { api.episodes(any(), any(), any()) } returns ItemsResponseDto()
 
-        val viewModel = LibraryViewModel(api, fakeSession())
+        val viewModel = newViewModel(api)
         viewModel.openSeries("series-1")
         advanceUntilIdle()
 
@@ -127,7 +136,7 @@ class LibraryViewModelTest {
         coEvery { api.items("user-1", "Movie", any(), any(), any(), any()) } returns
             ItemsResponseDto(items = listOf(movieDto("movie-1")))
 
-        val viewModel = LibraryViewModel(api, fakeSession())
+        val viewModel = newViewModel(api)
         advanceUntilIdle()
 
         assertEquals(listOf("series-1"), viewModel.uiState.value.series.items.map { it.id })
@@ -328,5 +337,180 @@ class LibraryViewModelTest {
 
         coVerify(exactly = 0) { api.items(any(), any(), any(), any(), 50, any(), any(), "银魂") }
         coVerify(exactly = 1) { api.items(any(), "Series,Movie", any(), any(), 50, 50, any(), "银") }
+    }
+
+    // ================= 缓存优先(离线可用)=================
+    // 用户的真实问题:没开 Tailscale 打开 App 就闪退。下面这些把"打开就有内容 / 断网不崩溃"
+    // 钉在 ViewModel 这一层。浏览列表只有**第一页**走缓存,第二页起仍是纯网络(见 VM 的 KDoc)。
+
+    private fun series(id: String) = MediaItem(id = id, kind = MediaKind.SERIES, name = id)
+    private fun episode(id: String) = MediaItem(id = id, kind = MediaKind.EPISODE, name = id)
+
+    @Test fun `有缓存时第一页先显示缓存,不等网络`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), "Series", any(), any(), 0, 50, any(), null) } coAnswers {
+            delay(10_000)
+            page("网络A", "网络B")
+        }
+        val repository = FakeMediaRepository()
+        repository.seed(CacheBuckets.LIBRARY_SERIES, listOf(series("缓存A")))
+
+        val vm = newViewModel(api, repository = repository)
+        runCurrent() // 只跑到"请求已发出、正挂在 delay 上"
+
+        assertEquals(listOf("缓存A"), vm.uiState.value.series.items.map { it.name }, "缓存必须先于网络显示")
+        assertTrue(vm.uiState.value.series.isLoading, "缓存已显示,后台仍在刷新")
+
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf("网络A", "网络B"),
+            vm.uiState.value.series.items.map { it.name },
+            "新数据必须**替换**第一页,不是追加在缓存后面 —— 追加会变成重复列表",
+        )
+        assertEquals(120, vm.uiState.value.series.totalCount, "总数只能来自网络那次发射")
+        assertFalse(vm.uiState.value.series.isLoading)
+    }
+
+    @Test fun `断网但有缓存时显示缓存并标记离线`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any()) } throws
+            java.io.IOException("Unable to resolve host")
+        val repository = FakeMediaRepository()
+        repository.seed(CacheBuckets.LIBRARY_SERIES, listOf(series("缓存A")))
+
+        val vm = newViewModel(api, repository = repository)
+        advanceUntilIdle()
+
+        assertEquals(listOf("缓存A"), vm.uiState.value.series.items.map { it.name }, "刷新失败不得清空缓存内容")
+        assertNull(vm.uiState.value.series.error, "还有内容可看就不该显示错误")
+        assertTrue(vm.uiState.value.isOffline)
+        assertFalse(vm.uiState.value.series.isLoading, "刷新已失败,不能一直转圈")
+        assertTrue(repository.writes.isEmpty(), "刷新失败不得写库")
+    }
+
+    @Test fun `无缓存且断网时进入可重试的错误态而不是崩溃`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any()) } throws
+            java.io.IOException("Unable to resolve host")
+
+        val vm = newViewModel(api)
+        advanceUntilIdle() // 崩溃的话这一步就会把异常抛出来
+
+        assertTrue(vm.uiState.value.series.items.isEmpty())
+        assertNotNull(vm.uiState.value.series.error, "无缓存 + 连不上 = 可重试的错误页")
+        assertFalse(vm.uiState.value.series.isLoading, "必须收尾,不能一直转圈")
+        assertNotNull(vm.uiState.value.movies.error, "电影 Tab 同样收敛到错误态")
+    }
+
+    @Test fun `第一页失败后重试成功并写回缓存`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), "Series", any(), any(), 0, 50, any(), null) } throws
+            java.io.IOException("offline") andThen page("A", "B")
+        val repository = FakeMediaRepository()
+
+        val vm = newViewModel(api, repository = repository)
+        advanceUntilIdle()
+        assertNotNull(vm.uiState.value.series.error)
+
+        vm.retry(); advanceUntilIdle()
+
+        assertEquals(listOf("A", "B"), vm.uiState.value.series.items.map { it.name })
+        assertNull(vm.uiState.value.series.error)
+        assertEquals(
+            listOf("A", "B"),
+            repository.writes.single { it.first == CacheBuckets.LIBRARY_SERIES }.second.map { it.name },
+            "重试成功也要写回缓存,否则'重试成功了但下次断网还是白屏'",
+        )
+    }
+
+    @Test fun `第一页成功后写回缓存`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), "Series", any(), any(), 0, 50, any(), null) } returns page("A", "B")
+        val repository = FakeMediaRepository()
+
+        newViewModel(api, repository = repository); advanceUntilIdle()
+
+        assertEquals(
+            listOf("A", "B"),
+            repository.writes.single { it.first == CacheBuckets.LIBRARY_SERIES }.second.map { it.name },
+        )
+    }
+
+    @Test fun `搜索结果不进缓存`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), "Series,Movie", any(), any(), 0, 50, any(), "银魂") } returns page("银魂")
+        val repository = FakeMediaRepository()
+
+        val vm = newViewModel(api, repository = repository)
+        vm.onQueryChange("银魂"); advanceUntilIdle()
+
+        assertEquals(listOf("银魂"), vm.uiState.value.searchResults.items.map { it.name })
+        assertTrue(
+            repository.writes.none { it.second.any { item -> item.name == "银魂" } },
+            "搜索结果是'此刻针对这个词的答案',缓存它没有意义,还会塞满缓存表",
+        )
+    }
+
+    // ---- 剧集详情:季 / 集列表同样缓存优先,断网不崩溃 ----
+
+    @Test fun `剧集详情有缓存时先显示缓存的季与集`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any()) } returns ItemsResponseDto()
+        coEvery { api.seasons(any(), any()) } throws java.io.IOException("offline")
+        coEvery { api.episodes(any(), any(), any()) } throws java.io.IOException("offline")
+
+        val repository = FakeMediaRepository()
+        repository.seed(CacheBuckets.seasonsOf("series-1"), listOf(MediaItem("season-1", MediaKind.SEASON, "第一季", seasonNumber = 1)))
+        repository.seed(CacheBuckets.episodesOf("season-1"), listOf(episode("e1"), episode("e2"), episode("e3")))
+
+        val vm = newViewModel(api, repository = repository)
+        vm.openSeries("series-1"); advanceUntilIdle()
+
+        val detail = vm.uiState.value.detail
+        assertEquals(listOf("season-1"), detail?.seasons?.map { it.id })
+        assertEquals("season-1", detail?.selectedSeasonId)
+        // 离线时整季的集列表照样完整 —— 自动连播的播放队列就是它。
+        assertEquals(3, detail?.episodes?.size)
+        assertEquals(detail?.episodes, vm.queueFor(detail!!.episodes[1]))
+        assertTrue(detail.isOffline)
+        assertFalse(detail.isLoading)
+    }
+
+    @Test fun `剧集详情无缓存且断网时进错误态而不崩溃`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any()) } returns ItemsResponseDto()
+        coEvery { api.seasons(any(), any()) } throws java.io.IOException("offline")
+
+        val vm = newViewModel(api)
+        vm.openSeries("series-1"); advanceUntilIdle()
+
+        val detail = vm.uiState.value.detail
+        assertNotNull(detail)
+        assertTrue(detail!!.seasons.isEmpty())
+        assertNotNull(detail.error, "无缓存 + 连不上 = 可重试的错误态")
+        assertFalse(detail.isLoading, "必须收尾,不能一直转圈")
+    }
+
+    @Test fun `季与集刷新成功后写回各自的 bucket`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any()) } returns ItemsResponseDto()
+        coEvery { api.seasons("series-1", "user-1") } returns ItemsResponseDto(items = listOf(seasonDto("season-1", 1)))
+        coEvery { api.episodes("series-1", "season-1", "user-1") } returns
+            ItemsResponseDto(items = listOf(episodeDto("e1", 1, 1), episodeDto("e2", 1, 2)))
+        val repository = FakeMediaRepository()
+
+        val vm = newViewModel(api, repository = repository)
+        vm.openSeries("series-1"); advanceUntilIdle()
+
+        assertEquals(
+            listOf("season-1"),
+            repository.writes.single { it.first == CacheBuckets.seasonsOf("series-1") }.second.map { it.id },
+        )
+        assertEquals(
+            listOf("e1", "e2"),
+            repository.writes.single { it.first == CacheBuckets.episodesOf("season-1") }.second.map { it.id },
+        )
+        assertEquals(2, vm.uiState.value.detail?.episodes?.size)
     }
 }

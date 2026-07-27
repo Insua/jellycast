@@ -160,6 +160,10 @@ dependencies {
     implementation(project(":core:network"))
     implementation(project(":core:datastore"))
     implementation(project(":core:database"))
+    // NetworkModule 引用 JellyCastDatabase(继承自 RoomDatabase)取 CachedItemDao——:core:database
+    // 对 room-runtime 是 implementation 依赖不会传递,这里需要显式声明才能在编译期看到父类型
+    // (与 :core:player 的 PlayerModule 同样的理由)。
+    implementation(libs.room.runtime)
     implementation(project(":core:subtitle"))
     implementation(project(":core:designsystem"))
     implementation(project(":core:player"))

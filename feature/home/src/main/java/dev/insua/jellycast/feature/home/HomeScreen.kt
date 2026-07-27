@@ -1,7 +1,9 @@
 package dev.insua.jellycast.feature.home
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -42,6 +44,32 @@ fun HomeScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp),
         contentPadding = PaddingValues(bottom = 96.dp), // 给底部常驻的 MiniPlayerBar 让位
     ) {
+        // 没缓存又连不上服务器:给一个可点的重试行,而不是一片什么都没有的白屏。
+        // 只要有任何一个分区有内容(哪怕是缓存),error 就是 null,这一行不会盖住它们。
+        uiState.error?.let { message ->
+            item(key = "home_error") {
+                Text(
+                    text = "$message,点击重试",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { viewModel.retry() }
+                        .padding(horizontal = 16.dp, vertical = 24.dp),
+                )
+            }
+        }
+        // 显示的是上次的内容:提示一句,但绝不挡住内容本身。
+        if (uiState.isOffline && uiState.sections.isNotEmpty()) {
+            item(key = "home_offline") {
+                Text(
+                    text = "离线,显示的是上次内容",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                )
+            }
+        }
         for (section in uiState.sections) {
             item(key = section.kind) {
                 HomeSectionRow(section = section, baseUrl = baseUrl, onItemClick = onItemClick)

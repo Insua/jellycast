@@ -8,10 +8,14 @@ import dev.insua.jellycast.model.PageState
 import dev.insua.jellycast.network.JellyfinApi
 import dev.insua.jellycast.network.dto.ItemsResponseDto
 import dev.insua.jellycast.network.mapper.toMediaItem
+import dev.insua.jellycast.network.repository.CacheBuckets
+import dev.insua.jellycast.network.repository.ItemPage
+import dev.insua.jellycast.network.repository.MediaRepository
 import dev.insua.jellycast.network.session.JellyfinSession
 import javax.inject.Inject
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -29,6 +33,9 @@ private const val PAGE_SIZE = 50
 /** 搜索防抖窗口:用户连续输入期间不发请求,停顿这么久之后才真正发出去。 */
 private const val SEARCH_DEBOUNCE_MS = 300L
 
+/** 无缓存又连不上服务器时给用户看的话。不带技术细节——用户能做的只有"重试"。 */
+private const val OFFLINE_MESSAGE = "无法连接服务器"
+
 enum class LibraryTab { SERIES, MOVIES }
 
 /** 当前可见的分页列表是哪一个——浏览态下按 Tab 分流,搜索态下统一走 searchResults。 */
@@ -41,6 +48,10 @@ data class SeriesDetailUiState(
     val selectedSeasonId: String? = null,
     val episodes: List<MediaItem> = emptyList(),
     val isLoading: Boolean = true,
+    /** 显示的是缓存、且这次刷新没成功。用于"离线,显示的是上次内容"的提示。 */
+    val isOffline: Boolean = false,
+    /** 既没有缓存又连不上服务器时的可重试错误态。 */
+    val error: String? = null,
 )
 
 data class LibraryUiState(
@@ -50,6 +61,8 @@ data class LibraryUiState(
     val query: String = "",
     val searchResults: PageState<MediaItem> = PageState(),
     val detail: SeriesDetailUiState? = null,
+    /** 当前可见的浏览列表显示的是缓存、且这次刷新没成功。 */
+    val isOffline: Boolean = false,
 ) {
     val isSearching: Boolean get() = query.isNotBlank()
 
@@ -69,6 +82,16 @@ data class LibraryUiState(
  * `isLoading = true`,而不是在挂起协程内部才检查,否则两次连续调用会在协程真正跑起来之前
  * 都读到"未在加载"的旧状态,双双发出请求。
  *
+ * **缓存优先(本次改动)**:浏览列表的**第一页**、季列表、集列表都改走 [MediaRepository]
+ * ——先发缓存再后台刷新,断网打开看到的是上次的内容而不是白屏(设计文档 §3.1/§3.2)。
+ * 第二页起**不走缓存**:分页的下一页是"接着刚才那批往后要",离线时既没有可用的缓存页、
+ * 也没有意义(见 [ItemPage.total] 的 KDoc——总数是服务端此刻的口径,不进缓存)。
+ * 第一页的发射是**整体替换**而不是 `onPageLoaded` 追加:同一条流会先后发缓存和新数据两次,
+ * 追加语义会把两批内容拼起来变成重复列表。
+ *
+ * **搜索不缓存**:搜索结果是"这一刻针对这个词的服务端答案",缓存它没有意义(换个词就失效),
+ * 而且会把大量一次性结果塞满缓存表。所以 [applySearchResult] 这条路径与改动前完全一致。
+ *
  * **搜索**:[onQueryChange] 把新查询词写进 [queryFlow];真正发请求的是 `init` 里那条
  * `debounce + flatMapLatest` 管线——防抖负责按下请求风暴(用户连续敲字符时只有停顿超过
  * [SEARCH_DEBOUNCE_MS] 才发一次请求),`flatMapLatest` 负责取消在途请求(新查询到达时,
@@ -87,12 +110,19 @@ data class LibraryUiState(
 class LibraryViewModel @Inject constructor(
     private val api: JellyfinApi,
     private val session: JellyfinSession,
+    private val repository: MediaRepository,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(LibraryUiState())
     val uiState: StateFlow<LibraryUiState> = _uiState.asStateFlow()
 
     private val queryFlow = MutableStateFlow("")
+
+    /** 每个浏览列表当前那条"第一页"流的协程。重新加载时先取消上一条,免得两条流交替覆盖状态。 */
+    private val firstPageJobs = mutableMapOf<ListTarget, Job>()
+
+    private var seasonsJob: Job? = null
+    private var episodesJob: Job? = null
 
     /**
      * **当前 searchResults 里那批结果是哪个查询词产生的** —— 搜索分页请求的"身份证"。
@@ -133,12 +163,9 @@ class LibraryViewModel @Inject constructor(
         }
     }
 
-    /** 首屏加载:剧集 / 电影各自独立并发拉第一页。 */
+    /** 首屏加载:剧集 / 电影各自独立并发拉第一页(缓存优先)。 */
     fun loadLibrary() {
-        listOf(ListTarget.SERIES, ListTarget.MOVIES).forEach { target ->
-            updatePageState(target) { PageState<MediaItem>().startLoading() }
-            requestPage(target, startIndex = 0, searchTerm = null)
-        }
+        listOf(ListTarget.SERIES, ListTarget.MOVIES).forEach { loadFirstPage(it) }
     }
 
     fun selectTab(tab: LibraryTab) {
@@ -165,6 +192,12 @@ class LibraryViewModel @Inject constructor(
         // 更不能拿 searchTerm = null 去发请求 —— 那会退化成拉取整个未过滤的库。
         if (target == ListTarget.SEARCH && searchTerm == null) return
         val startIndex = current.loadedCount
+        // 浏览列表一条都没加载成功时,"下一页"其实就是第一页 —— 走缓存优先那条路(重试路径),
+        // 这样重试成功也会写回缓存,不会出现"重试成功了,下次断网还是白屏"。
+        if (target != ListTarget.SEARCH && startIndex == 0) {
+            loadFirstPage(target)
+            return
+        }
         updatePageState(target) { it.startLoading() }
         requestPage(target, startIndex, searchTerm)
     }
@@ -174,35 +207,79 @@ class LibraryViewModel @Inject constructor(
 
     /** 进入某部剧的详情:加载季列表(按季号排序)并自动选中第一季。 */
     fun openSeries(seriesId: String) {
+        seasonsJob?.cancel()
+        episodesJob?.cancel()
         _uiState.update { it.copy(detail = SeriesDetailUiState(seriesId = seriesId, isLoading = true)) }
-        viewModelScope.launch {
-            val userId = session.userId()
-            val seasons = runCatching {
-                api.seasons(seriesId, userId).items.mapNotNull { it.toMediaItem() }
-            }.getOrDefault(emptyList()).sortedBy { it.seasonNumber ?: Int.MAX_VALUE }
-
-            val firstSeasonId = seasons.firstOrNull()?.id
-            _uiState.update { state ->
-                state.copy(detail = state.detail?.copy(seasons = seasons, selectedSeasonId = firstSeasonId))
+        seasonsJob = viewModelScope.launch {
+            var delivered = false
+            repository.bucket(CacheBuckets.seasonsOf(seriesId)) {
+                api.seasons(seriesId, session.userId()).items
+                    .mapNotNull { it.toMediaItem() }
+                    // 排序放在写回缓存**之前**:缓存表按 position 保存顺序,存的就是排好序的样子,
+                    // 离线读回来无需再排一次,也就不会出现"在线是 1、2、3,离线变成 2、1、3"。
+                    .sortedBy { it.seasonNumber ?: Int.MAX_VALUE }
+            }.collect { cached ->
+                delivered = true
+                val seasons = cached.data
+                val previous = _uiState.value.detail?.selectedSeasonId
+                // 刷新后原来选中的季可能已经不在了(服务端删了),这时才重新落到第一季;
+                // 否则保持用户的选择不变,不能让一次后台刷新把用户正在看的季跳走。
+                val selected = previous?.takeIf { id -> seasons.any { it.id == id } }
+                    ?: seasons.firstOrNull()?.id
+                _uiState.update { state ->
+                    state.copy(
+                        detail = state.detail?.copy(
+                            seasons = seasons,
+                            selectedSeasonId = selected,
+                            isOffline = cached.refreshFailed,
+                            error = null,
+                        ),
+                    )
+                }
+                when {
+                    selected == null ->
+                        _uiState.update { s -> s.copy(detail = s.detail?.copy(isLoading = false)) }
+                    selected != previous -> selectSeason(seriesId, selected)
+                }
             }
-            if (firstSeasonId != null) selectSeason(seriesId, firstSeasonId)
-            else _uiState.update { state -> state.copy(detail = state.detail?.copy(isLoading = false)) }
+            if (!delivered) {
+                // 既没缓存又连不上:进可重试的错误态,绝不抛异常、绝不崩溃。
+                _uiState.update { state ->
+                    state.copy(detail = state.detail?.copy(isLoading = false, error = OFFLINE_MESSAGE))
+                }
+            }
         }
     }
 
     /** 切换季:重新加载该季的完整集列表(即新的播放队列)。 */
     fun selectSeason(seriesId: String, seasonId: String) {
+        episodesJob?.cancel()
         _uiState.update { state ->
             state.copy(detail = state.detail?.copy(selectedSeasonId = seasonId, isLoading = true))
         }
-        viewModelScope.launch {
-            val userId = session.userId()
-            val episodes = runCatching {
-                api.episodes(seriesId, seasonId, userId).items.mapNotNull { it.toMediaItem() }
-            }.getOrDefault(emptyList())
-
-            _uiState.update { state ->
-                state.copy(detail = state.detail?.copy(episodes = episodes, isLoading = false))
+        episodesJob = viewModelScope.launch {
+            var delivered = false
+            repository.bucket(CacheBuckets.episodesOf(seasonId)) {
+                api.episodes(seriesId, seasonId, session.userId()).items.mapNotNull { it.toMediaItem() }
+            }.collect { cached ->
+                delivered = true
+                _uiState.update { state ->
+                    val detail = state.detail ?: return@update state
+                    state.copy(
+                        detail = detail.copy(
+                            episodes = cached.data,
+                            // 缓存已到、新数据还在路上时仍算"加载中";刷新失败就别再转圈了。
+                            isLoading = cached.isStale && !cached.refreshFailed,
+                            isOffline = detail.isOffline || cached.refreshFailed,
+                            error = null,
+                        ),
+                    )
+                }
+            }
+            if (!delivered) {
+                _uiState.update { state ->
+                    state.copy(detail = state.detail?.copy(isLoading = false, error = OFFLINE_MESSAGE))
+                }
             }
         }
     }
@@ -215,7 +292,42 @@ class LibraryViewModel @Inject constructor(
     fun queueFor(episode: MediaItem): List<MediaItem> =
         _uiState.value.detail?.episodes?.takeIf { it.isNotEmpty() } ?: listOf(episode)
 
-    /** 浏览列表(剧集/电影)的分页请求:成功走 onPageLoaded(自带幂等丢弃),失败走 onError,绝不抛错。 */
+    /**
+     * 浏览列表的**第一页**:缓存优先。一条流会先后发"缓存"和"新数据"两次,所以这里是
+     * **整体替换**而不是 [PageState.onPageLoaded] 的追加语义(追加会把两批拼成重复列表)。
+     *
+     * `totalCount` 只在网络那次发射里有值——缓存不存总数(见 [ItemPage]),用 `?:` 保留旧值,
+     * 免得一次缓存发射把已知的总数抹成 null 让 `endReached` 退回 false。
+     */
+    private fun loadFirstPage(target: ListTarget) {
+        val bucket = bucketFor(target) ?: return
+        firstPageJobs[target]?.cancel()
+        updatePageState(target) { PageState<MediaItem>().startLoading() }
+        firstPageJobs[target] = viewModelScope.launch {
+            var delivered = false
+            repository.pagedBucket(bucket) {
+                val response = fetchPage(types = typesFor(target), startIndex = 0, searchTerm = null)
+                ItemPage(response.items.mapNotNull { it.toMediaItem() }, response.total)
+            }.collect { cached ->
+                delivered = true
+                updatePageState(target) { state ->
+                    state.copy(
+                        items = cached.data.items,
+                        totalCount = cached.data.total ?: state.totalCount,
+                        isLoading = cached.isStale && !cached.refreshFailed,
+                        error = null,
+                    )
+                }
+                _uiState.update { it.copy(isOffline = cached.refreshFailed) }
+            }
+            if (!delivered) {
+                // 一次都没发射 = 没缓存 + 网络失败。转成可重试的错误态,不崩溃、不空白。
+                updatePageState(target) { it.onError(OFFLINE_MESSAGE) }
+            }
+        }
+    }
+
+    /** 浏览列表(剧集/电影)**第二页起**的分页请求:成功走 onPageLoaded(自带幂等丢弃),失败走 onError,绝不抛错。 */
     private fun requestPage(target: ListTarget, startIndex: Int, searchTerm: String?) {
         viewModelScope.launch {
             val result = runCatching { fetchPage(types = typesFor(target), startIndex = startIndex, searchTerm = searchTerm) }
@@ -273,6 +385,13 @@ class LibraryViewModel @Inject constructor(
         ListTarget.SERIES -> "Series"
         ListTarget.MOVIES -> "Movie"
         ListTarget.SEARCH -> "Series,Movie"
+    }
+
+    /** 搜索结果不缓存(见类 KDoc),所以 SEARCH 没有 bucket。 */
+    private fun bucketFor(target: ListTarget): String? = when (target) {
+        ListTarget.SERIES -> CacheBuckets.LIBRARY_SERIES
+        ListTarget.MOVIES -> CacheBuckets.LIBRARY_MOVIES
+        ListTarget.SEARCH -> null
     }
 
     /**

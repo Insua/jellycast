@@ -69,6 +69,8 @@ class ActiveServerSession(
 
     override suspend fun userId(): String = resolve().userId
 
+    override suspend fun serverId(): String = resolve().serverId
+
     override suspend fun baseUrl(): String = resolve().endpoint.url
 
     override suspend fun token(): String = resolve().token
