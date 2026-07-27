@@ -14,6 +14,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import retrofit2.HttpException
+import java.io.IOException
 import java.util.UUID
 import javax.inject.Inject
 
@@ -222,7 +224,7 @@ class ServerViewModel @Inject constructor(
                 }
             } catch (e: Exception) {
                 _uiState.update {
-                    it.copy(isSubmitting = false, error = "登录失败:${e.message ?: e.javaClass.simpleName}")
+                    it.copy(isSubmitting = false, error = buildLoginErrorMessage(e))
                 }
             }
         }
@@ -309,4 +311,24 @@ internal fun buildUnreachableMessage(diagnostics: List<EndpointHealth>): String 
             append("\n检查 Tailscale 是否已连接。")
         }
     }
+}
+
+/**
+ * 登录失败(`/Users/AuthenticateByName`)的人话错误文案。
+ *
+ * 对这个接口而言 401 只有一种含义——凭据被拒绝,不是"未知错误"——所以单独给出针对性提示,
+ * 覆盖案发时验证过的两个常见根因:大小写(密码大小写敏感)和软键盘自动纠错/自动大写插入的
+ * 首尾空格(见 AddServerScreen.kt 的键盘修复)。其它 HTTP 状态码与网络层异常(IOException,
+ * 如断线/DNS 失败)分别给出可区分的文案,不折叠成同一句话,方便用户和开发自己判断故障类型。
+ * 绝不能把密码或异常堆栈拼进文案。
+ */
+internal fun buildLoginErrorMessage(e: Exception): String = when {
+    e is HttpException && e.code() == 401 ->
+        "登录失败:用户名或密码不正确。请检查密码大小写是否正确,以及首尾是否有多余的空格。"
+    e is HttpException ->
+        "登录失败:服务器返回错误(HTTP ${e.code()})。"
+    e is IOException ->
+        "登录失败:无法连接到服务器,请检查网络连接。"
+    else ->
+        "登录失败:${e.javaClass.simpleName}"
 }

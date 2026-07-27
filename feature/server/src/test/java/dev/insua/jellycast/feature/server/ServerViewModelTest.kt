@@ -20,14 +20,21 @@ import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import java.io.IOException
 import java.security.cert.X509Certificate
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import retrofit2.HttpException
+import retrofit2.Response
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ServerViewModelTest {
@@ -330,5 +337,94 @@ class ServerViewModelTest {
         // 这个 mock 匹配不上,select() 返回 null,登录会走"无法连接"分支而不是成功分支。
         coVerify(exactly = 1) { endpointSelector.select(listOf(endpoint)) }
         assertNotNull(vm.uiState.value.connectedServerId)
+    }
+
+    // ---- 401 → 人话错误文案,且与其它失败原因(500 / IO 异常)可区分 ----
+
+    private fun httpException(code: Int, message: String = "Error"): HttpException {
+        val body = "{}".toResponseBody("application/json".toMediaType())
+        return HttpException(Response.error<Any>(code, body))
+    }
+
+    @Test
+    fun `登录返回 401 时提示用户名或密码不正确`() = runTest {
+        val endpoint = lan()
+        coEvery { endpointSelector.select(listOf(endpoint)) } returns EndpointHealth(endpoint, true, 12L)
+        val fakeApi = mockk<JellyfinApi>()
+        coEvery { fakeApi.authenticate(any()) } throws httpException(401, "Unauthorized")
+        every { jellyfinApiFactory.create(endpoint) } returns fakeApi
+
+        val vm = viewModel()
+        vm.onNameChange("我的 NAS")
+        vm.fillEndpoints(endpoint)
+        vm.onUsernameChange("bob")
+        vm.onPasswordChange("wrong")
+
+        vm.submit()
+
+        val error = vm.uiState.value.error
+        assertNotNull(error)
+        assertTrue(error!!.contains("用户名或密码不正确"), error)
+        // 提示要覆盖案发根因:大小写与首尾空格,但绝不能把密码本身带出来。
+        assertTrue(error.contains("大小写") || error.contains("空格"), error)
+        assertFalse(error.contains("wrong"), "错误文案不得包含密码内容")
+        assertNull(vm.uiState.value.connectedServerId)
+    }
+
+    @Test
+    fun `登录返回 500 时提示与 401 不同`() = runTest {
+        val endpoint = lan()
+        coEvery { endpointSelector.select(listOf(endpoint)) } returns EndpointHealth(endpoint, true, 12L)
+        val fakeApi = mockk<JellyfinApi>()
+        coEvery { fakeApi.authenticate(any()) } throws httpException(500, "Internal Server Error")
+        every { jellyfinApiFactory.create(endpoint) } returns fakeApi
+
+        val vm = viewModel()
+        vm.onNameChange("我的 NAS")
+        vm.fillEndpoints(endpoint)
+        vm.onUsernameChange("bob")
+        vm.onPasswordChange("secret")
+
+        vm.submit()
+
+        val error = vm.uiState.value.error
+        assertNotNull(error)
+        assertFalse(error!!.contains("用户名或密码不正确"), error)
+        assertTrue(error.contains("500"), error)
+    }
+
+    @Test
+    fun `登录时网络异常提示与 401_500 都不同`() = runTest {
+        val endpoint = lan()
+        coEvery { endpointSelector.select(listOf(endpoint)) } returns EndpointHealth(endpoint, true, 12L)
+        val fakeApi = mockk<JellyfinApi>()
+        coEvery { fakeApi.authenticate(any()) } throws IOException("Connection reset")
+        every { jellyfinApiFactory.create(endpoint) } returns fakeApi
+
+        val vm = viewModel()
+        vm.onNameChange("我的 NAS")
+        vm.fillEndpoints(endpoint)
+        vm.onUsernameChange("bob")
+        vm.onPasswordChange("secret")
+
+        vm.submit()
+
+        val error = vm.uiState.value.error
+        assertNotNull(error)
+        assertFalse(error!!.contains("用户名或密码不正确"), error)
+        assertFalse(error.contains("500"), error)
+    }
+
+    @Test
+    fun `buildLoginErrorMessage 对 401_其它状态码_IO异常给出三种不同文案`() {
+        val unauthorized = buildLoginErrorMessage(httpException(401))
+        val serverError = buildLoginErrorMessage(httpException(503, "Service Unavailable"))
+        val ioError = buildLoginErrorMessage(IOException("timeout"))
+
+        assertNotEquals(unauthorized, serverError)
+        assertNotEquals(unauthorized, ioError)
+        assertNotEquals(serverError, ioError)
+        assertTrue(unauthorized.contains("用户名或密码不正确"), unauthorized)
+        assertTrue(serverError.contains("503"), serverError)
     }
 }
