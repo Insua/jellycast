@@ -125,6 +125,19 @@ class LibraryViewModel @Inject constructor(
     private var episodesJob: Job? = null
 
     /**
+     * 浏览列表(剧集/电影)**各自**最近一次的刷新是否失败,用来 OR 出 [LibraryUiState.isOffline]。
+     *
+     * SERIES 和 MOVIES 两个 Tab 的第一页刷新是各自独立并发的流([loadFirstPage] 对每个
+     * target 单独 launch),谁先落地谁先发射。如果 [LibraryUiState.isOffline] 直接被最新一次
+     * `cached.refreshFailed` 覆盖(不分是哪个 target 发的),后落地的那个流会把先落地的结论
+     * 冲掉——剧集刷新失败、电影刷新成功时,电影的发射（`refreshFailed = false`）如果恰好后到,
+     * 离线横幅会消失,即使屏幕上显示的仍是剧集的旧数据。跟 [HomeViewModel] 的
+     * `sectionRefreshFailed` 是同一个模式:按 target 分别记录,再 `.any { it }`,
+     * 顺序不影响结论。
+     */
+    private val listRefreshFailed = mutableMapOf<ListTarget, Boolean>()
+
+    /**
      * **当前 searchResults 里那批结果是哪个查询词产生的** —— 搜索分页请求的"身份证"。
      *
      * 搜索第一页走 `flatMapLatest`,换词自动取消;但搜索**第二页**走 [loadNextPage] →
@@ -318,7 +331,8 @@ class LibraryViewModel @Inject constructor(
                         error = null,
                     )
                 }
-                _uiState.update { it.copy(isOffline = cached.refreshFailed) }
+                listRefreshFailed[target] = cached.refreshFailed
+                _uiState.update { it.copy(isOffline = listRefreshFailed.values.any { it }) }
             }
             if (!delivered) {
                 // 一次都没发射 = 没缓存 + 网络失败。转成可重试的错误态,不崩溃、不空白。

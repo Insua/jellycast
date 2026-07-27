@@ -389,6 +389,36 @@ class LibraryViewModelTest {
         assertTrue(repository.writes.isEmpty(), "刷新失败不得写库")
     }
 
+    // ---- 剧集刷新失败、电影刷新成功时,isOffline 不该被后落地的电影发射冲掉 ----
+    // 剧集有缓存所以走"缓存 -> 刷新失败"两次发射;电影的成功响应故意挂在 CompletableDeferred
+    // 上,直到剧集那条流已经把 isOffline 置为 true 之后才放行,确保电影的发射**确实**晚于
+    // 剧集落地——如果 isOffline 是被最后一次发射直接覆盖(旧实现的问题),这里会看到 false。
+
+    @Test fun `剧集刷新失败电影刷新成功时isOffline保持true_不受着陆顺序影响`() = runTest {
+        val moviesGate = CompletableDeferred<Unit>()
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), "Series", any(), any(), 0, 50, any(), null) } throws
+            java.io.IOException("offline")
+        coEvery { api.items(any(), "Movie", any(), any(), 0, 50, any(), null) } coAnswers {
+            moviesGate.await()
+            page("电影A")
+        }
+        val repository = FakeMediaRepository()
+        repository.seed(CacheBuckets.LIBRARY_SERIES, listOf(series("缓存A")))
+
+        val vm = newViewModel(api, repository = repository)
+        runCurrent() // 剧集没有真正的挂起点(fetch 同步抛异常),这一步应该已经跑完整条剧集流
+
+        assertTrue(vm.uiState.value.isOffline, "剧集的失败发射应该已经落地")
+
+        moviesGate.complete(Unit)
+        advanceUntilIdle() // 电影的成功发射现在才落地,且严格晚于剧集的失败发射
+
+        assertTrue(vm.uiState.value.isOffline, "电影刷新成功不该覆盖剧集仍处于离线状态的事实")
+        assertEquals(listOf("电影A"), vm.uiState.value.movies.items.map { it.name })
+        assertEquals(listOf("缓存A"), vm.uiState.value.series.items.map { it.name }, "剧集显示的仍是缓存内容")
+    }
+
     @Test fun `无缓存且断网时进入可重试的错误态而不是崩溃`() = runTest {
         val api = mockk<JellyfinApi>(relaxed = true)
         coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any()) } throws
