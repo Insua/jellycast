@@ -60,7 +60,9 @@ android {
                     enableV1Signing = false
                     enableV2Signing = true
                     enableV3Signing = true
-                    enableV4Signing = true
+                    // v4 只服务于 `adb install --incremental`(开发期快速安装大包),
+                    // 它会额外产出一个 .idsig 文件。侧载安装用不到,关掉少一个文件。
+                    enableV4Signing = false
                 }
             } else {
                 logger.warn("keystore 不存在,release 将产出未签名包:${store.absolutePath}")
