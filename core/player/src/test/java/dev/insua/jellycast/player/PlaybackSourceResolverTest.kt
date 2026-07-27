@@ -139,6 +139,87 @@ class PlaybackSourceResolverTest {
         }
     }
 
+    // ---- 稳定性根因 #3:L1 探测是"这个媒体源吐不吐纯音频",不是"从第几秒开始播" ----
+
+    /**
+     * seek 实现成"带新的 startTimeTicks 重新 resolve"(转码流 `Accept-Ranges: none`,别无选择),
+     * 而每次 resolve 都会让 [HttpStreamProbe] 对 L1 候选 URL 发一次**完整 GET**。
+     *
+     * 后果:**用户每按一次快进,群晖 J4125 上就多起一个转码任务,而且随即被丢弃**
+     * (探测只读响应头就 close)。连点几下快进就是几个并发的孤儿转码在 CPU 上打架 ——
+     * 正在听的那一条也跟着卡。这正是用户报的"seek/快进卡死、播放中断"。
+     *
+     * 而这次探测的结论**和起始位置毫无关系**:「`/Audio/{item}/universal` 在这个 mediaSource 上
+     * 吐不吐纯音频」是媒体源自身的属性。所以按 mediaSourceId 记一次就够。
+     */
+    @Test fun `同一个媒体源反复 resolve 只探测一次,seek 不再起新的孤儿转码`() = runTest {
+        val probedUrls = mutableListOf<String>()
+        val countingProbe = object : StreamProbe {
+            override suspend fun isAudioOnly(url: String): Boolean {
+                probedUrls += url
+                return true
+            }
+        }
+        val resolver = newResolver(countingProbe)
+
+        resolver.resolve(TEST_ITEM_ID, TEST_USER_ID, startPositionMs = 0L)          // 开始播放
+        resolver.resolve(TEST_ITEM_ID, TEST_USER_ID, startPositionMs = 600_000L)    // 快进一次
+        resolver.resolve(TEST_ITEM_ID, TEST_USER_ID, startPositionMs = 630_000L)    // 再快进一次
+        resolver.resolve(TEST_ITEM_ID, TEST_USER_ID, startPositionMs = 660_000L)    // 再快进一次
+
+        assertEquals(
+            1,
+            probedUrls.size,
+            "一次播放 + 三次 seek 只该探测一次;实际探测了 ${probedUrls.size} 次," +
+                "等于在服务端起了 ${probedUrls.size} 个转码任务、丢弃 ${probedUrls.size - 1} 个",
+        )
+    }
+
+    /** 判定为"不是纯音频"(要走 L3)同样要记住 —— 否则每次 seek 照样白跑一次探测 GET。 */
+    @Test fun `L3 判定同样被记住,不会每次 seek 重新探测`() = runTest {
+        var probeCount = 0
+        val countingProbe = object : StreamProbe {
+            override suspend fun isAudioOnly(url: String): Boolean {
+                probeCount++
+                return false
+            }
+        }
+        val resolver = newResolver(countingProbe)
+
+        val first = resolver.resolve(TEST_ITEM_ID, TEST_USER_ID, startPositionMs = 0L)
+        val second = resolver.resolve(TEST_ITEM_ID, TEST_USER_ID, startPositionMs = 600_000L)
+
+        assertEquals(1, probeCount)
+        assertEquals(AudioDeliveryLevel.CLIENT_VIDEO_DISABLED, first.level)
+        assertEquals(AudioDeliveryLevel.CLIENT_VIDEO_DISABLED, second.level, "缓存不得改变降级判定")
+        assertTrue(second.streamUrl.contains("startTimeTicks=6000000000"), second.streamUrl)
+    }
+
+    /** 缓存的键是媒体源,不是"探测过一次就对所有条目生效"。换一个条目必须重新探测。 */
+    @Test fun `换一个条目必须重新探测`() = runTest {
+        val probedUrls = mutableListOf<String>()
+        val countingProbe = object : StreamProbe {
+            override suspend fun isAudioOnly(url: String): Boolean {
+                probedUrls += url
+                return true
+            }
+        }
+        val api = mockk<JellyfinApi>()
+        coEvery { api.playbackInfo("ep1", any(), any()) } returns
+            PlaybackInfoResponseDto(mediaSources = listOf(defaultMediaSource()), playSessionId = "s1")
+        coEvery { api.playbackInfo("ep2", any(), any()) } returns
+            PlaybackInfoResponseDto(
+                mediaSources = listOf(defaultMediaSource().copy(id = "ms2")),
+                playSessionId = "s2",
+            )
+        val resolver = newResolver(countingProbe, api = api)
+
+        resolver.resolve("ep1", TEST_USER_ID)
+        resolver.resolve("ep2", TEST_USER_ID)
+
+        assertEquals(2, probedUrls.size)
+    }
+
     @Test fun `playSessionId 透传自 PlaybackInfo 响应`() = runTest {
         val src = newResolver(probe(emptySet())).resolve(TEST_ITEM_ID, TEST_USER_ID)
         assertEquals("session-1", src.playSessionId)

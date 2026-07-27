@@ -36,6 +36,25 @@ class PlaybackSourceResolver(
     private val tokenProvider: () -> String,
     private val audioBitRateBps: Int = DEFAULT_AUDIO_BIT_RATE_BPS,
 ) {
+    /**
+     * ## 稳定性根因 #3:L1 判定按媒体源缓存
+     *
+     * seek 只能实现成"带新的 `startTimeTicks` 重新 resolve"(转码流 `Accept-Ranges: none`),
+     * 而 [HttpStreamProbe] 每次 resolve 都对 L1 候选 URL 发一次**完整 GET**:
+     * **用户每按一次快进,群晖 J4125 上就多起一个转码任务,读完响应头就被丢弃。**
+     * 连点几下快进 = 几个孤儿转码在那颗 4 核赛扬上和正在听的那一条抢 CPU —— 用户报的
+     * "seek/快进卡死、播放中断"就是这么来的。顺带还白花一整个网络往返,把 seek 拖慢一倍。
+     *
+     * 而探测结论**和起始位置无关**:「`/Audio/{item}/universal` 在这个 mediaSource 上吐不吐纯音频」
+     * 是媒体源自身的属性。所以按 (itemId, mediaSourceId) 记住,同一条流后续所有 seek 直接复用。
+     *
+     * 用 itemId + mediaSourceId 而不是只用 mediaSourceId:mediaSourceId 是服务端给的标识,
+     * 不同条目撞号时宁可多探测一次,也不要拿错的判定去播另一个条目。
+     *
+     * 键是进程内缓存,不落盘:服务端换了转码配置(装了/掉了 QSV)重启 App 就重新探测,
+     * 不需要任何失效逻辑。
+     */
+    private val audioOnlyByMediaSource = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
     suspend fun resolve(itemId: String, userId: String, startPositionMs: Long = 0L): PlaybackSource {
         val info = api.playbackInfo(itemId, userId)
         val ms = info.mediaSources.firstOrNull()
@@ -63,7 +82,7 @@ class PlaybackSourceResolver(
 
         // ---- L1:服务端纯音频(GET /Audio/{itemId}/universal) ----
         val l1 = buildAudioUniversalUrl(base, itemId, token, ms.id, audioBitRateBps, startTimeTicks)
-        if (runCatching { streamProbe.isAudioOnly(l1) }.getOrDefault(false)) {
+        if (isAudioOnly(itemId, ms.id, base, token)) {
             return PlaybackSource(
                 itemId = itemId,
                 mediaSourceId = ms.id,
@@ -88,6 +107,23 @@ class PlaybackSourceResolver(
             audioTracks = audioTracks,
             textSubtitles = subtitles,
         )
+    }
+
+    /**
+     * 见 [audioOnlyByMediaSource]。探测用的是**不带 `startTimeTicks` 的**候选 URL —— 判定和起始
+     * 位置无关,而且从 0 探测让服务端起的那个(随即被丢弃的)转码任务最轻。
+     *
+     * 探测异常照旧静默吞掉当"不是纯音频"(铁律 3:降级链必须保底可用,失败不得让用户看到错误)。
+     * 但**失败的判定不写进缓存**:那多半是一次偶发的网络抖动,记下来会把整个会话钉死在 L3
+     * (~42 倍带宽),这正是本产品最不能接受的静默降级。
+     */
+    private suspend fun isAudioOnly(itemId: String, mediaSourceId: String, base: String, token: String): Boolean {
+        val key = "$itemId/$mediaSourceId"
+        audioOnlyByMediaSource[key]?.let { return it }
+        val probeUrl = buildAudioUniversalUrl(base, itemId, token, mediaSourceId, audioBitRateBps, startTimeTicks = null)
+        val verdict = runCatching { streamProbe.isAudioOnly(probeUrl) }.getOrNull() ?: return false
+        audioOnlyByMediaSource[key] = verdict
+        return verdict
     }
 
     private fun buildAudioUniversalUrl(

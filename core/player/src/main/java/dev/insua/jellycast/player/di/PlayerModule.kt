@@ -70,7 +70,14 @@ object PlayerModule {
      * 运行中修改设置需要重启 App/进程才会用新码率,记录在任务报告里,和 [provideProgressReporter]
      * 的 serverId 快照是同一类取舍。
      */
+    /**
+     * ⚠️ 必须是 `@Singleton`。[PlaybackSourceResolver] 内部按媒体源缓存 L1 探测结论(见该类的
+     * `audioOnlyByMediaSource`);每个注入点各造一个 resolver 的话就是各缓存各的,
+     * "同一条流只探测一次"这件事当场作废,seek 照样在群晖上起孤儿转码。
+     * 顺带也让下面那次 DataStore 的 `runBlocking` 快照在整个进程里只发生一次。
+     */
     @Provides
+    @Singleton
     fun providePlaybackSourceResolver(
         api: JellyfinApi,
         streamProbe: StreamProbe,
@@ -88,6 +95,7 @@ object PlayerModule {
     }
 
     @Provides
+    @Singleton
     fun providePlaybackSourceProvider(resolver: PlaybackSourceResolver): PlaybackSourceProvider = resolver.asProvider()
 
     @Provides
