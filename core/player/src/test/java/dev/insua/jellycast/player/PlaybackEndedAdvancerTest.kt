@@ -48,7 +48,7 @@ class PlaybackEndedAdvancerTest {
     private class RecordingPlayerControl : PlayerControl {
         val urls = mutableListOf<String>()
         override val currentPositionMs: Long = 0L
-        override fun setMediaItemAndPrepare(url: String) {
+        override fun setMediaItemAndPrepare(url: String, metadata: PlaybackDisplayMetadata?) {
             urls += url
         }
         override fun release() {}

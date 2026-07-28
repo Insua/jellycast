@@ -48,7 +48,7 @@ class AudioPlaybackEngineTest {
         var released = false
         /** 流内相对位置(见 [PlayerControl.currentPositionMs]);绝对位置语义在 AbsolutePositionTest 里覆盖。 */
         override var currentPositionMs: Long = 0L
-        override fun setMediaItemAndPrepare(url: String) { preparedUrls += url }
+        override fun setMediaItemAndPrepare(url: String, metadata: PlaybackDisplayMetadata?) { preparedUrls += url }
         override fun release() { released = true }
     }
 

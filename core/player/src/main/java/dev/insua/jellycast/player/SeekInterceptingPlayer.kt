@@ -3,6 +3,8 @@ package dev.insua.jellycast.player
 import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.Player
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
@@ -24,9 +26,44 @@ fun interface SeekRouter {
 class EngineSeekRouter(
     private val engine: AudioPlaybackEngine,
     private val scope: CoroutineScope,
+    private val debounceMs: Long = DEFAULT_DEBOUNCE_MS,
 ) : SeekRouter {
+
+    /**
+     * ## seek 防抖 / 连点合并
+     *
+     * 复现见 `SeekCoalescingTest`:连点快进大约 1/7 会弹出「该条目无法播放」,而耳机里其实还在
+     * 正常出声。根因不是"迟到的结果覆盖了更新的状态"——那条路已经被
+     * [AudioPlaybackEngineImpl] 既有的 `requestSeq`/`isStale` 令牌机制挡住了。真正的根因是
+     * **每一次按键都无条件起一个新的 resolve 请求**,而群晖 J4125 只能扛有限的并发转码探测
+     * (`PlaybackSourceResolver`「稳定性根因 #3」的 KDoc)。连点两下快进,**第二下**(真正最新、
+     * 按令牌判定完全不 stale 的那一次)可能因为第一下还占着并发名额而竞争失败——它本身就是
+     * "最新",令牌机制救不了它,`state` 被打成 Error,而播放器上还在放第一下发起前的那条旧流。
+     *
+     * 这里在真正调用 [AudioPlaybackEngine.seekTo] 之前,先取消上一次还没落地的请求:如果它还在
+     * [debounceMs] 的等待窗口里,直接被取消,连 resolve 都不会发起;如果它已经在 resolve 中,
+     * 取消会让协程在下一个挂起点抛 [kotlinx.coroutines.CancellationException],
+     * [AudioPlaybackEngineImpl.resolveAndPrepare] 把它原样向上抛出、绝不会落到
+     * `catch (e: Exception)` 分支——所以被取消的那次请求**不可能**把 state 打成 Error。
+     *
+     * 这是在 [AudioPlaybackEngine] 既有的令牌机制之上叠加,不是另起一套并行方案:令牌机制继续
+     * 兜底"取消信号还没来得及生效、resolve 已经跑完"那极小的窗口;这一层从根上减少冗余请求
+     * 本身,不让陈旧请求有机会去抢并发名额。
+     */
+    @Volatile
+    private var pendingSeek: Job? = null
+
     override fun seekTo(positionMs: Long) {
-        scope.launch { engine.seekTo(positionMs) }
+        pendingSeek?.cancel()
+        pendingSeek = scope.launch {
+            if (debounceMs > 0L) delay(debounceMs)
+            engine.seekTo(positionMs)
+        }
+    }
+
+    private companion object {
+        /** 连点快进/拖动进度条的合并窗口。 */
+        const val DEFAULT_DEBOUNCE_MS = 250L
     }
 }
 
@@ -55,17 +92,26 @@ class EngineSeekRouter(
  * "上一曲"键通过 MediaSession 的 `SEEK_TO_PREVIOUS` 命令触发的路径——不覆盖的话它会绕开这一层,
  * 直接落到裸 ExoPlayer。所以和 `seekToDefaultPosition()` 一样,路由为 seek 到 0。
  *
- * 刻意不覆盖 `seekToNextMediaItem()` / `seekToPreviousMediaItem()` / `seekToNext()`:本项目不使用
- * ExoPlayer 自身的多条目播放列表(每次只 `setMediaItem` 一个条目),这三个方法在单条目、非直播
- * 场景下要么是 no-op(没有上一个/下一个条目可切),要么(`seekToNext()`)会被 `BasePlayer` 转成对
- * 当前条目的操作但**不会**触发真正的位置 seek(与 `seekToPrevious()` 的字节码路径不同)。
- * 集与集之间的连播由 [PlayQueue](Task 11)在播放器外部驱动、通过 [AudioPlaybackEngine.play]
- * 重新准备下一条目,和"当前条目内 seek"是两件不同的事。
+ * ## 上一集/下一集(设计文档 §3.3)
+ *
+ * `seekToNextMediaItem()` / `seekToPreviousMediaItem()` **现在覆盖了**(此前刻意不覆盖,理由是
+ * "本项目不使用 ExoPlayer 自身的多条目播放列表,单条目场景下这两个方法是 no-op")——但那份理由
+ * 恰恰是问题本身:`hasNextMediaItem()` 因此恒为 false,Media3 在通知栏/锁屏/蓝牙/车机上**不生成
+ * 任何上一集下一集按钮**。修正**不是**给 Media3 塞一个假的多条目播放列表(那会和"每次重新
+ * resolve"的机制冲突,见类顶部 KDoc),而是把这两个方法**委派给 [queueNavigator]**——按
+ * [PlayQueue] 的真实状态推进游标 + 经 [AudioPlaybackEngine.play] 重新准备那一条,和自动连播
+ * ([PlaybackEndedAdvancer])、`AppSessionViewModel.play()` 是同一条路。[getAvailableCommands]
+ * 同步按 [queueNavigator] 的状态在**既有**命令集合上加/删这两个命令(用 `buildUpon()`,不整体
+ * 重建),这样通知栏/锁屏/蓝牙/车机才会显示出这两个按钮,而不是 Media3 因为查不到就直接不生成。
+ *
+ * `seekToNext()`(不带 MediaItem 后缀)依旧刻意不覆盖:会被 `BasePlayer` 转成对当前条目的操作但
+ * **不会**触发真正的位置 seek(与 `seekToPrevious()` 的字节码路径不同,见上一段),留着无害。
  */
 class SeekInterceptingPlayer(
     player: Player,
     private val seekRouter: SeekRouter,
     private val absoluteTimeline: AbsoluteTimeline = AbsoluteTimeline.Unknown,
+    private val queueNavigator: QueueNavigator = QueueNavigator.None,
 ) : ForwardingPlayer(player) {
 
     /**
@@ -106,6 +152,47 @@ class SeekInterceptingPlayer(
 
     override fun seekTo(mediaItemIndex: Int, positionMs: Long) {
         seekRouter.seekTo(positionMs)
+    }
+
+    /**
+     * 设计文档 §3.3:在**既有**命令集合上加/删这两个命令,不整体重建——`buildUpon()` 保留了
+     * Media3/底层 player 需要的其它命令(播放/暂停/音量……),这里只按 [queueNavigator] 的真实
+     * 状态决定 `COMMAND_SEEK_TO_NEXT_MEDIA_ITEM` / `COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM` 在不在。
+     * 没有这一步,`hasNextMediaItem()`/`hasPreviousMediaItem()` 恒为 false,Media3 在通知栏/锁屏/
+     * 蓝牙/车机上根本不会生成上一集下一集按钮。
+     *
+     * ⚠️ `Player.Commands.Builder` 内部用 `android.util.SparseBooleanArray` 存储,在本模块
+     * `testOptions.unitTests.isReturnDefaultValues = true` 的纯 JVM 环境下是静默空桩——
+     * `.add()`/`.contains()` 都不报错但也不是真的在存取。所以这个方法本身**加/删的正确性**未做
+     * JVM 单测(和 [ExoPlayerControl] 里 `Uri.parse` 是同一类环境限制,真机/流体云验收),
+     * `SeekInterceptingPlayerTest` 只能可靠验证到"确实查询了 [queueNavigator] 的状态"这一层。
+     */
+    override fun getAvailableCommands(): Player.Commands {
+        val builder = super.getAvailableCommands().buildUpon()
+        if (queueNavigator.hasNext()) {
+            builder.add(Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
+        } else {
+            builder.remove(Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
+        }
+        if (queueNavigator.hasPrevious()) {
+            builder.add(Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
+        } else {
+            builder.remove(Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
+        }
+        return builder.build()
+    }
+
+    /** 委派给 [queueNavigator]——见类顶部"上一集/下一集"一节。 */
+    override fun seekToNextMediaItem() {
+        queueNavigator.next()
+    }
+
+    /**
+     * 委派给 [queueNavigator]。⚠️ 和 [seekToPrevious](不带 MediaItem 后缀,下方覆写)是两个不同的
+     * 方法、两套不同的语义——不要合并到一起。
+     */
+    override fun seekToPreviousMediaItem() {
+        queueNavigator.previous()
     }
 
     // 注意:下面两个方法里的 `currentPosition` 是本类覆写的那个(绝对位置),不是底层 player 的

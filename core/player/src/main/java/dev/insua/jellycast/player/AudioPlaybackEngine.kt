@@ -34,7 +34,12 @@ interface PlayerControl {
      */
     val currentPositionMs: Long
 
-    fun setMediaItemAndPrepare(url: String)
+    /**
+     * [metadata] 是 Task「媒体元数据」的落地点:锁屏/通知/蓝牙/流体云共同的前提。可以是 `null`
+     * (没有对应的 [PlaybackDisplayMetadata] 时,比如引擎还不认识这个 itemId)——生产实现
+     * ([ExoPlayerControl])对 `null` 的处理是"标题/副标题/封面都不设",不是崩溃或抛错。
+     */
+    fun setMediaItemAndPrepare(url: String, metadata: PlaybackDisplayMetadata?)
     fun release()
 }
 
@@ -147,6 +152,14 @@ fun AudioPlaybackEngine.asAbsoluteTimeline(durationProvider: () -> Long? = { nul
 class AudioPlaybackEngineImpl(
     private val sourceProvider: PlaybackSourceProvider,
     private val playerControl: PlayerControl,
+    /**
+     * 按 itemId 查一份 [PlaybackDisplayMetadata] 给 [PlayerControl.setMediaItemAndPrepare]。
+     * 引擎本身不认识 `:core:model` 之外的任何东西、也不持有"当前队列都有哪些条目"这份状态——
+     * 生产实现由 `PlayerModule` 接到 [PlayQueue.current](和 [AbsoluteTimeline] 的
+     * `durationProvider` 是同一种"外部只读查表"模式)。默认返回 `null`:不接这根线的调用方
+     * (绝大多数既有单测)行为不变,元数据整体缺失时降级为"标题/副标题/封面都不设",不影响播放。
+     */
+    private val metadataProvider: (itemId: String) -> PlaybackDisplayMetadata? = { null },
 ) : AudioPlaybackEngine {
 
     private val _state = MutableStateFlow<PlaybackEngineState>(PlaybackEngineState.Idle)
@@ -209,7 +222,7 @@ class AudioPlaybackEngineImpl(
         try {
             val source = sourceProvider.resolve(itemId, userId, startPositionMs)
             if (isStale(token)) return
-            playerControl.setMediaItemAndPrepare(source.streamUrl)
+            playerControl.setMediaItemAndPrepare(source.streamUrl, metadataProvider(itemId))
             // 顺序要紧:先换基准,再发 Ready。反过来的话观察 Ready 的进度上报可能读到旧基准 + 已归零
             // 的流内位置,报出一个"倒退"的绝对位置。
             currentStartPositionMs = startPositionMs

@@ -39,11 +39,13 @@ import javax.inject.Inject
  * Media3 默认回调会把 seek 命令直接转发给 `player.seekTo()`,而 Spike 实测转码流
  * `Accept-Ranges: none`,`seekTo()` 在这条流上不可靠(见 [SeekInterceptingPlayer] 类注释)。
  * 这里用 [SeekInterceptingPlayer] 包一层 ExoPlayer 再交给 `MediaSession.Builder`,所有 seek
- * 家族调用都被结构性地拦截,委派给 [bindEngine] 注入的 [AudioPlaybackEngine]。
+ * 家族调用都被结构性地拦截,委派给注入的 [playbackEngine]([AudioPlaybackEngine])。
  *
- * ⚠️ 修正 §1(a)/(b)(已闭合):[exoPlayer] / [engine] / [autoPlayNextController] /
+ * ⚠️ 修正 §1(a)/(b)(已闭合):[exoPlayer] / [playbackEngine] / [autoPlayNextController] /
  * [jellyfinSession] 全部经 Hilt 的 `PlayerModule`(见 `di/PlayerModule.kt`)装配注入,不再是
- * "写好了但没有生产调用方"的死代码——[onCreate] 里真的调用了 [bindEngine],`engine` 就是
+ * "写好了但没有生产调用方"的死代码——[onCreate] 直接把注入到手的 [playbackEngine] 交给
+ * [EngineSeekRouter] / [EngineQueueNavigator](原先经一个可空的 `engine` 字段 + `bindEngine()`
+ * 间接绕一手,注入本身已经保证非空,这层间接是多余的,已删除),它就是
  * [Player.STATE_ENDED] 那一刻驱动自动连播的同一个实例,和 `exoPlayer` 也是同一个单例
  * (见 `PlayerModule.provideExoPlayer` 的 KDoc)。
  *
@@ -99,9 +101,6 @@ class PlaybackService : MediaSessionService() {
      */
     private val shutdownScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    @Volatile
-    private var engine: AudioPlaybackEngine? = null
-
     /**
      * 复审 Important 3:`exoPlayer` 是 `@Singleton`,**比本 Service 活得久**。所以在 Service 上注册的
      * 监听器必须在 [onDestroy] 里摘掉——否则每次 Service 重建都往同一个播放器上再挂一份,
@@ -136,9 +135,27 @@ class PlaybackService : MediaSessionService() {
 
     override fun onCreate() {
         super.onCreate()
-        val router = SeekRouter { positionMs ->
-            engine?.let { e -> serviceScope.launch { e.seekTo(positionMs) } }
-        }
+
+        // 唯一的登录用户 id 来源:自动连播(下方 playbackEndedAdvancer)和上一集/下一集
+        // (queueNavigator)都要用同一份——读取失败(未登录/断网)时安全地返回 null,
+        // 调用方各自静默降级(不连播 / 不切集),不向上抛错(铁律 3/4 的同一条精神)。
+        val userIdProvider: suspend () -> String? = { runCatching { jellyfinSession.userId() }.getOrNull() }
+
+        // 生产实现见 EngineSeekRouter 的类注释:连点快进/拖动进度条在这里被合并(seek 防抖),
+        // 只有最后一次真正触发 AudioPlaybackEngine.seekTo,避免群晖 J4125 上堆孤儿转码任务
+        // (也就避免了"连点后偶发弹出「该条目无法播放」"那个竞态,见 SeekCoalescingTest)。
+        val router = EngineSeekRouter(playbackEngine, serviceScope)
+
+        // 设计文档 §3.3:不给 Media3 塞假播放列表(会和"每次重新 resolve"冲突),让
+        // SeekInterceptingPlayer 按 PlayQueue 的真实状态声明/执行上一集下一集命令,通知栏/锁屏/
+        // 蓝牙/车机才会显示出这两个按钮。
+        val queueNavigator = EngineQueueNavigator(
+            playQueue = playQueue,
+            engine = playbackEngine,
+            userIdProvider = userIdProvider,
+            scope = serviceScope,
+        )
+
         // 复审 Critical 1:交给 MediaSession 的这个 Player 必须报**条目内绝对位置**和**元数据总时长**。
         // 锁屏/通知栏/蓝牙的进度条与快进快退全部读它;底层 ExoPlayer 报的是转码流内的相对位置
         // (每次 seek/续播归零)和常为 C.TIME_UNSET 的时长,两个都不能直接用。
@@ -148,12 +165,9 @@ class PlaybackService : MediaSessionService() {
             exoPlayer,
             router,
             playbackEngine.asAbsoluteTimeline { playQueue.current.value?.runTimeMs },
+            queueNavigator,
         )
         mediaSession = MediaSession.Builder(this, sessionPlayer).build()
-
-        // 修正 §1(a):真正的生产调用方——没有这一行,锁屏/通知栏/蓝牙拖进度条会被
-        // SeekInterceptingPlayer 拦截后静默丢弃(engine 恒为 null)。
-        bindEngine(playbackEngine)
 
         // 修正 §1(b)/Finding 1:自动连播接到 Player.STATE_ENDED。播完一集后,拿当前登录用户 id 问
         // AutoPlayNextController 要不要接着播下一条——它内部已经处理好"关闭自动连播/播完本集
@@ -163,7 +177,7 @@ class PlaybackService : MediaSessionService() {
         val playbackEndedAdvancer = PlaybackEndedAdvancer(
             engine = playbackEngine,
             autoPlayNextController = autoPlayNextController,
-            userIdProvider = { runCatching { jellyfinSession.userId() }.getOrNull() },
+            userIdProvider = userIdProvider,
         )
         val stateListener = object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -340,11 +354,6 @@ class PlaybackService : MediaSessionService() {
         }
     }
 
-    /** 播放会话真正开始时由上层(驱动实际播放的模块)调用,把 seek 接到真实的重新 resolve 逻辑。 */
-    fun bindEngine(engine: AudioPlaybackEngine) {
-        this.engine = engine
-    }
-
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
 
     /**
@@ -389,7 +398,6 @@ class PlaybackService : MediaSessionService() {
 
         mediaSession?.release()
         mediaSession = null
-        engine = null
         foregroundLifecycle?.stop()
         foregroundLifecycle = null
         serviceScope.cancel()

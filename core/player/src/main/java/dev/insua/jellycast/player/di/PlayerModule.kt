@@ -28,6 +28,7 @@ import dev.insua.jellycast.player.ProgressReporter
 import dev.insua.jellycast.player.StreamProbe
 import dev.insua.jellycast.player.asProvider
 import dev.insua.jellycast.player.createAudioOnlyPlayer
+import dev.insua.jellycast.player.toPlaybackDisplayMetadata
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
@@ -119,12 +120,34 @@ object PlayerModule {
     @Singleton
     fun provideExoPlayer(@ApplicationContext context: Context): ExoPlayer = createAudioOnlyPlayer(context)
 
+    /**
+     * `metadataProvider` 是「媒体元数据」任务的接线点:锁屏/通知/蓝牙/流体云共同的前提。
+     * 按 itemId 到 [PlayQueue.current] 里查——[PlayQueue] 已经在 `engine.play()` 之前被调用方
+     * (`AppSessionViewModel.play()` / [dev.insua.jellycast.player.PlaybackEndedAdvancer])
+     * 设成目标条目,所以这里查到的永远是"即将/正在播的那一条",不是陈旧数据。查不到
+     * (itemId 对不上,理论上不会发生但防御性地处理)时返回 `null`,[ExoPlayerControl] 对 `null`
+     * 的处理是"标题/副标题/封面都不设",不影响播放。
+     *
+     * 封面 URL 复用 `:core:network` 的 `posterUrl`(经 [toPlaybackDisplayMetadata]),baseUrl 取
+     * [JellyfinSession.cachedBaseUrlOrNull]——和 [providePlaybackSourceResolver] 的
+     * `baseUrlProvider` 同一份缓存值,同步、非阻塞。
+     */
     @Provides
     @Singleton
     fun provideAudioPlaybackEngine(
         exoPlayer: ExoPlayer,
         sourceProvider: PlaybackSourceProvider,
-    ): AudioPlaybackEngine = AudioPlaybackEngineImpl(sourceProvider, ExoPlayerControl(exoPlayer))
+        playQueue: PlayQueue,
+        session: JellyfinSession,
+    ): AudioPlaybackEngine = AudioPlaybackEngineImpl(
+        sourceProvider = sourceProvider,
+        playerControl = ExoPlayerControl(exoPlayer),
+        metadataProvider = { itemId ->
+            playQueue.current.value
+                ?.takeIf { it.id == itemId }
+                ?.toPlaybackDisplayMetadata(session.cachedBaseUrlOrNull().orEmpty())
+        },
+    )
 
     @Provides
     @Singleton
