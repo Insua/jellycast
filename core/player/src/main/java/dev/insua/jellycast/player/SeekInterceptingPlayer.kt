@@ -164,6 +164,43 @@ class SeekInterceptingPlayer(
     override fun getContentDuration(): Long =
         absoluteTimeline.absoluteDurationMs()?.takeIf { it > 0L } ?: super.getContentDuration()
 
+    /**
+     * ## 🔴 缺陷「一加流体云胶囊不显示播放时间」的根因(设计文档 §4 第二项,真机取证后确认)
+     *
+     * 播放进行中 `adb shell dumpsys media_session`:
+     * ```
+     * state=PlaybackState {state=PLAYING(3), position=-1, buffered position=-1, speed=0.0, ...}
+     * ```
+     * 位置 `-1`(`PLAYBACK_POSITION_UNKNOWN`)、速度 `0.0` —— 系统侧既没有位置也没有速度可以外推,
+     * 于是流体云/锁屏/车机全都显示不出"已听多久"。总时长本身是好的(经 [getDuration] 报的
+     * 元数据 `runTimeMs`),缺的正是位置和速度。
+     *
+     * 核对 media3 1.10.1 `MediaSessionLegacyStub.createPlaybackStateCompat` 的字节码:
+     * ```
+     * canReadPosition = isCommandAvailable(COMMAND_GET_CURRENT_MEDIA_ITEM) && !isCurrentMediaItemLive()
+     * position = canReadPosition ? currentPosition : -1
+     * speed    = (isPlaying && canReadPosition) ? playbackParameters.speed : 0f
+     * ```
+     * 真机实测 `exo.live=true`:没有 `Content-Length` 的 chunked 转码流被 ExoPlayer 当成**直播**,
+     * `canReadPosition` 因此恒为 false。
+     *
+     * **JellyCast 只播点播条目。** 元数据给了权威总时长时,这条流就不是直播,这里如实纠正。
+     * 拿不到总时长时不撒谎、退回底层判定(那种情况下进度条本来也是禁用的,
+     * 见 `PlayerScreen.ProgressSection`)。
+     */
+    override fun isCurrentMediaItemLive(): Boolean =
+        if (hasAuthoritativeDuration()) false else super.isCurrentMediaItemLive()
+
+    /**
+     * 和 [getAvailableCommands] 里声明 `COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM` 保持自洽:
+     * 本类**自己实现了 seek**(委派 [seekRouter] → 重新 resolve 一条带 `startTimeTicks` 的新流)。
+     * 底层那条字节流不支持 Range 请求是另一回事,不该由它来回答"这个 Player 能不能 seek"。
+     */
+    override fun isCurrentMediaItemSeekable(): Boolean =
+        if (hasAuthoritativeDuration()) true else super.isCurrentMediaItemSeekable()
+
+    private fun hasAuthoritativeDuration(): Boolean = (absoluteTimeline.absoluteDurationMs() ?: 0L) > 0L
+
     override fun seekToDefaultPosition() {
         seekRouter.seekTo(0L)
     }
@@ -187,14 +224,42 @@ class SeekInterceptingPlayer(
      * 没有这一步,`hasNextMediaItem()`/`hasPreviousMediaItem()` 恒为 false,Media3 在通知栏/锁屏/
      * 蓝牙/车机上根本不会生成上一集下一集按钮。
      *
+     * ## 🔴 缺陷「拖动进度条也不好使」的根因(设计文档 §4 第一项,真机取证后确认)
+     *
+     * 模拟器 + 真实服务器实测(`SeekBufferDiagnosticsTest`):
+     * ```
+     * exo.seekable=false exo.live=true exo.duration=TIME_UNSET
+     * exo.cmdSeekInItem=false  ctl.cmdSeekInItem=false ctl.cmdSeekBack=false ctl.cmdSeekFwd=false
+     * W MCImplBase: Controller isn't allowed to call command= 5
+     * SEEK landedAfterMs=-1        ← 20 秒内位置一步没动
+     * ```
+     *
+     * 转码流 `Accept-Ranges: none` 且没有 `Content-Length`,ExoPlayer 于是判定当前条目不可 seek、
+     * 时长未知,把 `COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM`(5)/`COMMAND_SEEK_BACK`(11)/
+     * `COMMAND_SEEK_FORWARD`(12) 从可用命令里**摘掉**。而 App 里所有 seek 都经 `MediaController`
+     * (播放页拖进度条、±15s/±30s、锁屏、通知栏、蓝牙),`MediaController` 在发命令前先查可用性,
+     * 查不到就打一行 warning **直接返回** —— 请求根本到不了本类的 [seekTo],那一整套"重新 resolve"
+     * 从来没有被触发过。用户看到的不是"慢",是**完全没反应**。
+     *
+     * 所以这里必须**如实声明本类自己实现了的那几条 seek 命令**。这不是绕过 Media3 的检查:
+     * "底层字节流不支持 Range 请求"和"这个 Player 支持 seek"两件事同时为真,而 `getAvailableCommands()`
+     * 描述的是**后者**。它们各自的覆写([seekTo] / [seekBack] / [seekForward] / [seekToDefaultPosition])
+     * 从不调用 `super`,只走 [seekRouter],所以声明它们不会把任何请求引到底层的字节级 seek 上。
+     *
      * ⚠️ `Player.Commands.Builder` 内部用 `android.util.SparseBooleanArray` 存储,在本模块
-     * `testOptions.unitTests.isReturnDefaultValues = true` 的纯 JVM 环境下是静默空桩——
-     * `.add()`/`.contains()` 都不报错但也不是真的在存取。所以这个方法本身**加/删的正确性**未做
-     * JVM 单测(和 [ExoPlayerControl] 里 `Uri.parse` 是同一类环境限制,真机/流体云验收),
-     * `SeekInterceptingPlayerTest` 只能可靠验证到"确实查询了 [queueNavigator] 的状态"这一层。
+     * `testOptions.unitTests.isReturnDefaultValues = true` 的纯 JVM 环境下是静默空桩。所以这个方法
+     * 的加/删正确性用 Robolectric 提供真实 shadow 来测(见 `SeekInterceptingPlayerCommandsTest` /
+     * `SeekInterceptingPlayerSeekCommandsTest`),不是普通 JVM 单测。
      */
     override fun getAvailableCommands(): Player.Commands {
         val builder = super.getAvailableCommands().buildUpon()
+        // 见上:本类自己实现了这几条,底层流可不可 seek 与它们无关。
+        builder.addAll(
+            Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM,
+            Player.COMMAND_SEEK_TO_DEFAULT_POSITION,
+            Player.COMMAND_SEEK_BACK,
+            Player.COMMAND_SEEK_FORWARD,
+        )
         if (queueNavigator.hasNext()) {
             builder.add(Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
         } else {
@@ -246,5 +311,132 @@ class SeekInterceptingPlayer(
 
     override fun seekToPrevious() {
         seekRouter.seekTo(0L)
+    }
+
+    // ------------------------------------------------------------------ 命令变更通知的纠正
+
+    /**
+     * ## 🔴 缺陷「拖动进度条也不好使」的第二层根因
+     *
+     * 只覆写 [getAvailableCommands] **不够**:真机复测后 `MediaController` 依然打
+     * `Controller isn't allowed to call command= 5`。核对 media3 1.10.1 字节码,`MediaController`
+     * 手里的可用命令是**推**过去的、不是现查的:
+     * ```
+     * MediaSessionImpl$PlayerListener.onAvailableCommandsChanged(Commands c)
+     *     → dispatchOnAvailableCommandsChangedFromPlayer(c)          ← 用的是回调参数 c
+     * MediaControllerImplBase.onAvailableCommandsChangedFromPlayer(c)
+     *     → intersectedPlayerCommands = intersect(playerCommandsFromSession, c)
+     * ```
+     * 而 `ForwardingPlayer$ForwardingListener.onAvailableCommandsChanged(c)` 把**底层播放器的原始
+     * 集合原样**往上传(它只替换事件里的 `Player` 引用,不替换这个参数)。于是推给控制器的仍然是
+     * ExoPlayer 那份摘掉了 seek 的集合,[getAvailableCommands] 在这条路上被整个绕过。
+     *
+     * 因此注册进来的每个监听器都包一层:`onAvailableCommandsChanged` 改报本类的集合,其余回调
+     * **逐个原样透传**。
+     *
+     * ⚠️ 这里**不能**用 Kotlin 的 `Player.Listener by delegate` 接口委派 —— 实测(本类第一版)
+     * 一个回调都没转发出去:`Player.Listener` 的成员**全部是 Java default 方法**,Kotlin 的委派只为
+     * *抽象* 成员生成转发,default 方法直接继承 Java 那份空实现,于是所有事件被静默吞掉。
+     * 也不用 `java.lang.reflect.Proxy`(按方法名匹配,一旦开启混淆就会失效)。
+     *
+     * 手写 37 个覆写的代价是"media3 升级新增回调时可能漏掉一个",这一点由
+     * `SeekInterceptingPlayerListenerTest` 里的反射守卫钉死:该测试遍历 `Player.Listener` 声明的
+     * 每一个方法,要求本类都覆写过,漏一个就红。
+     */
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION", "TooManyFunctions")
+    private class CommandCorrectingListener(
+        private val delegate: Player.Listener,
+        private val correctedCommands: () -> Player.Commands,
+    ) : Player.Listener {
+
+        /** 唯一被改写的那一个:见类外层 KDoc。 */
+        override fun onAvailableCommandsChanged(availableCommands: Player.Commands) =
+            delegate.onAvailableCommandsChanged(correctedCommands())
+
+        // 以下全部原样透传。顺序与 Player.Listener 的声明顺序一致,便于和反射守卫对照。
+        override fun onEvents(player: Player, events: Player.Events) = delegate.onEvents(player, events)
+        override fun onTimelineChanged(timeline: androidx.media3.common.Timeline, reason: Int) =
+            delegate.onTimelineChanged(timeline, reason)
+        override fun onMediaItemTransition(mediaItem: androidx.media3.common.MediaItem?, reason: Int) =
+            delegate.onMediaItemTransition(mediaItem, reason)
+        override fun onTracksChanged(tracks: androidx.media3.common.Tracks) = delegate.onTracksChanged(tracks)
+        override fun onMediaMetadataChanged(mediaMetadata: androidx.media3.common.MediaMetadata) =
+            delegate.onMediaMetadataChanged(mediaMetadata)
+        override fun onPlaylistMetadataChanged(mediaMetadata: androidx.media3.common.MediaMetadata) =
+            delegate.onPlaylistMetadataChanged(mediaMetadata)
+        override fun onIsLoadingChanged(isLoading: Boolean) = delegate.onIsLoadingChanged(isLoading)
+        override fun onLoadingChanged(isLoading: Boolean) = delegate.onLoadingChanged(isLoading)
+        override fun onTrackSelectionParametersChanged(
+            parameters: androidx.media3.common.TrackSelectionParameters,
+        ) = delegate.onTrackSelectionParametersChanged(parameters)
+        override fun onPlayerStateChanged(playWhenReady: Boolean, playbackState: Int) =
+            delegate.onPlayerStateChanged(playWhenReady, playbackState)
+        override fun onPlaybackStateChanged(playbackState: Int) = delegate.onPlaybackStateChanged(playbackState)
+        override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) =
+            delegate.onPlayWhenReadyChanged(playWhenReady, reason)
+        override fun onPlaybackSuppressionReasonChanged(reason: Int) =
+            delegate.onPlaybackSuppressionReasonChanged(reason)
+        override fun onIsPlayingChanged(isPlaying: Boolean) = delegate.onIsPlayingChanged(isPlaying)
+        override fun onRepeatModeChanged(repeatMode: Int) = delegate.onRepeatModeChanged(repeatMode)
+        override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) =
+            delegate.onShuffleModeEnabledChanged(shuffleModeEnabled)
+        override fun onPlayerError(error: androidx.media3.common.PlaybackException) = delegate.onPlayerError(error)
+        override fun onPlayerErrorChanged(error: androidx.media3.common.PlaybackException?) =
+            delegate.onPlayerErrorChanged(error)
+        override fun onPositionDiscontinuity(reason: Int) = delegate.onPositionDiscontinuity(reason)
+        override fun onPositionDiscontinuity(
+            oldPosition: Player.PositionInfo,
+            newPosition: Player.PositionInfo,
+            reason: Int,
+        ) = delegate.onPositionDiscontinuity(oldPosition, newPosition, reason)
+        override fun onPlaybackParametersChanged(
+            playbackParameters: androidx.media3.common.PlaybackParameters,
+        ) = delegate.onPlaybackParametersChanged(playbackParameters)
+        override fun onSeekBackIncrementChanged(seekBackIncrementMs: Long) =
+            delegate.onSeekBackIncrementChanged(seekBackIncrementMs)
+        override fun onSeekForwardIncrementChanged(seekForwardIncrementMs: Long) =
+            delegate.onSeekForwardIncrementChanged(seekForwardIncrementMs)
+        override fun onMaxSeekToPreviousPositionChanged(maxSeekToPreviousPositionMs: Long) =
+            delegate.onMaxSeekToPreviousPositionChanged(maxSeekToPreviousPositionMs)
+        override fun onAudioSessionIdChanged(audioSessionId: Int) =
+            delegate.onAudioSessionIdChanged(audioSessionId)
+        override fun onAudioAttributesChanged(audioAttributes: androidx.media3.common.AudioAttributes) =
+            delegate.onAudioAttributesChanged(audioAttributes)
+        override fun onVolumeChanged(volume: Float) = delegate.onVolumeChanged(volume)
+        override fun onSkipSilenceEnabledChanged(skipSilenceEnabled: Boolean) =
+            delegate.onSkipSilenceEnabledChanged(skipSilenceEnabled)
+        override fun onDeviceInfoChanged(deviceInfo: androidx.media3.common.DeviceInfo) =
+            delegate.onDeviceInfoChanged(deviceInfo)
+        override fun onDeviceVolumeChanged(volume: Int, muted: Boolean) =
+            delegate.onDeviceVolumeChanged(volume, muted)
+        override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) =
+            delegate.onVideoSizeChanged(videoSize)
+        override fun onSurfaceSizeChanged(width: Int, height: Int) =
+            delegate.onSurfaceSizeChanged(width, height)
+        override fun onRenderedFirstFrame() = delegate.onRenderedFirstFrame()
+        override fun onCues(cues: MutableList<androidx.media3.common.text.Cue>) = delegate.onCues(cues)
+        override fun onCues(cueGroup: androidx.media3.common.text.CueGroup) = delegate.onCues(cueGroup)
+        override fun onMetadata(metadata: androidx.media3.common.Metadata) = delegate.onMetadata(metadata)
+    }
+
+    /**
+     * 原监听器 → 包装器。[removeListener] 必须摘掉当初注册进底层的**同一个实例**,否则监听器永远
+     * 摘不掉:`PlaybackService` 每次重建都会往 `@Singleton` 播放器上再挂一份(见其 `onDestroy` 注释)。
+     *
+     * 线程契约:所有 add/remove 都在 ExoPlayer 的 application thread(本项目 = 主线程)上发生,
+     * 和播放器自身的约束一致,所以这里用普通 `LinkedHashMap` 即可。
+     */
+    private val listenerWrappers = LinkedHashMap<Player.Listener, Player.Listener>()
+
+    override fun addListener(listener: Player.Listener) {
+        val wrapper = listenerWrappers.getOrPut(listener) {
+            CommandCorrectingListener(listener) { availableCommands }
+        }
+        super.addListener(wrapper)
+    }
+
+    override fun removeListener(listener: Player.Listener) {
+        val wrapper = listenerWrappers.remove(listener) ?: listener
+        super.removeListener(wrapper)
     }
 }
