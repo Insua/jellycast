@@ -57,6 +57,8 @@ object HomeScreenTestTags {
     const val ACCOUNT_BUTTON = "home_top_bar_account"
     const val TAB_ROW = "home_tab_row"
     const val FAVORITES_EMPTY = "home_favorites_empty"
+
+    fun item(id: String) = "home_item_$id"
 }
 
 /**
@@ -70,6 +72,13 @@ object HomeScreenTestTags {
  * [onLibraryClick] 点击库卡片/分组标题时回调库 id,交给调用方(导航层)决定跳去哪个库——
  * 这里不认识具体的路由。
  *
+ * [onItemClick] 第二个参数是**播放队列**(修正 §3.2:"没有上一集")——继续收听/下一集/
+ * 最近添加分组点开某一项时,传出去的是**整个分区/分组**(见 [HomeSection.playQueueFor]/
+ * [RecentlyAddedGroup.playQueueFor]),被点的那一项作为起点,而不是只含它自己的单项队列。
+ * 以前导航层固定传 `listOf(item)`,`PlayQueue` 长度恒为 1,系统媒体控制的"上一集"按钮因此
+ * 恒不可用。「我的最爱」标签页不是"分区"(混排不同来源的收藏,彼此没有先后关系),继续沿用
+ * 单项队列。
+ *
  * [baseUrl] 是当前激活服务器的接入地址,用于拼封面 URL([dev.insua.jellycast.network.mapper.posterUrl]);
  * 默认空串——:feature:home 目前还没有接入"当前激活服务器"的会话解析(Task 22 导航装配的职责),
  * 空串时不拼 URL,PosterCard 走占位背景兜底,不会拼出一个必 404 的地址。
@@ -81,7 +90,7 @@ object HomeScreenTestTags {
  */
 @Composable
 fun HomeScreen(
-    onItemClick: (MediaItem) -> Unit,
+    onItemClick: (MediaItem, List<MediaItem>) -> Unit,
     onLibraryClick: (String) -> Unit = {},
     onSearchClick: () -> Unit = {},
     onAccountClick: () -> Unit = {},
@@ -89,7 +98,40 @@ fun HomeScreen(
     viewModel: HomeViewModel = hiltViewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsState()
+    HomeScreenContent(
+        uiState = uiState,
+        onItemClick = onItemClick,
+        onLibraryClick = onLibraryClick,
+        onSearchClick = onSearchClick,
+        onAccountClick = onAccountClick,
+        baseUrl = baseUrl,
+        onSelectTab = viewModel::selectTab,
+        onRetry = viewModel::retry,
+        onToggleFavorite = viewModel::toggleFavorite,
+        onActionErrorShown = viewModel::consumeActionError,
+    )
+}
 
+/**
+ * 真正的界面(纯函数、不依赖 ViewModel/Hilt/网络),方便 Compose UI 测试直接喂手工构造的
+ * [HomeUiState]——与 `:feature:library` 的 `LibraryScreenContent`/`LibraryContentsScreenContent`
+ * 同样的拆分理由,尤其是修正 §3.2("没有上一集")需要在 Compose 树上证明"点击分区第二项,
+ * [onItemClick] 收到的队列确实是整个分区"这件事,单靠纯逻辑单测(见 [HomeScreenTest]的
+ * `playQueueFor` 断言)测不出真正的接线是不是对的。
+ */
+@Composable
+fun HomeScreenContent(
+    uiState: HomeUiState,
+    onItemClick: (MediaItem, List<MediaItem>) -> Unit,
+    onLibraryClick: (String) -> Unit = {},
+    onSearchClick: () -> Unit = {},
+    onAccountClick: () -> Unit = {},
+    baseUrl: String = "",
+    onSelectTab: (HomeTab) -> Unit = {},
+    onRetry: () -> Unit = {},
+    onToggleFavorite: (MediaItem) -> Unit = {},
+    onActionErrorShown: () -> Unit = {},
+) {
     // 「这一次浏览会话里已经看过离线提示了」是页面级状态,不进 ViewModel:重新进入首页
     // (或点重试重新加载)时提示该重新出现,而不是被永久关掉。
     var offlineNoticeDismissed by rememberSaveable { mutableStateOf(false) }
@@ -106,12 +148,12 @@ fun HomeScreen(
         ) {
             Tab(
                 selected = uiState.tab == HomeTab.FEED,
-                onClick = { viewModel.selectTab(HomeTab.FEED) },
+                onClick = { onSelectTab(HomeTab.FEED) },
                 text = { Text("首页") },
             )
             Tab(
                 selected = uiState.tab == HomeTab.FAVORITES,
-                onClick = { viewModel.selectTab(HomeTab.FAVORITES) },
+                onClick = { onSelectTab(HomeTab.FAVORITES) },
                 text = { Text("我的最爱") },
             )
         }
@@ -138,19 +180,21 @@ fun HomeScreen(
                 onLibraryClick = onLibraryClick,
                 onRetry = {
                     offlineNoticeDismissed = false
-                    viewModel.retry()
+                    onRetry()
                 },
             )
             HomeTab.FAVORITES -> FavoritesGrid(
                 favorites = uiState.favorites,
                 baseUrl = baseUrl,
-                onItemClick = onItemClick,
-                onToggleFavorite = viewModel::toggleFavorite,
+                // 「我的最爱」不是"分区"——混排各种来源的收藏,彼此没有先后关系,不构造队列,
+                // 沿用点哪个就单独播哪个(与改动前行为一致)。
+                onItemClick = { item -> onItemClick(item, listOf(item)) },
+                onToggleFavorite = onToggleFavorite,
             )
         }
     }
 
-    ActionMessageHost(message = uiState.actionError, onMessageShown = viewModel::consumeActionError)
+    ActionMessageHost(message = uiState.actionError, onMessageShown = onActionErrorShown)
     }
 }
 
@@ -185,7 +229,7 @@ private fun HomeTopBar(onSearchClick: () -> Unit, onAccountClick: () -> Unit) {
 private fun HomeFeed(
     uiState: HomeUiState,
     baseUrl: String,
-    onItemClick: (MediaItem) -> Unit,
+    onItemClick: (MediaItem, List<MediaItem>) -> Unit,
     onLibraryClick: (String) -> Unit,
     onRetry: () -> Unit,
 ) {
@@ -224,13 +268,14 @@ private fun HomeFeed(
                 HomeSectionRow(
                     section = section,
                     baseUrl = baseUrl,
-                    // 「我的媒体」的卡片点的是库,不是可播放条目——回调换成 onLibraryClick,
-                    // 其余分区(继续收听/下一集)行为不变。
+                    // 「我的媒体」的卡片点的是库,不是可播放条目——回调换成 onLibraryClick。
+                    // 其余分区(继续收听/下一集)把整个分区作为播放队列传出(修正 §3.2),
+                    // 被点的那一项是起点——见 [HomeSection.playQueueFor] 的 KDoc。
                     onItemClick = { mediaItem ->
                         if (section.kind == HomeSectionKind.LIBRARIES) {
                             onLibraryClick(mediaItem.id)
                         } else {
-                            onItemClick(mediaItem)
+                            onItemClick(mediaItem, section.playQueueFor(mediaItem))
                         }
                     },
                 )
@@ -243,7 +288,8 @@ private fun HomeFeed(
                 RecentlyAddedGroupRow(
                     group = group,
                     baseUrl = baseUrl,
-                    onItemClick = onItemClick,
+                    // 同一个库分组内的条目就是队列(修正 §3.2)——见 [RecentlyAddedGroup.playQueueFor]。
+                    onItemClick = { mediaItem -> onItemClick(mediaItem, group.playQueueFor(mediaItem)) },
                     onLibraryClick = onLibraryClick,
                 )
             }
@@ -322,6 +368,7 @@ private fun HomeSectionRow(section: HomeSection, baseUrl: String, onItemClick: (
                     subtitle = mediaItem.displaySubtitle.ifBlank { null },
                     imageUrl = if (baseUrl.isBlank()) null else mediaItem.posterUrl(baseUrl),
                     onClick = { onItemClick(mediaItem) },
+                    modifier = Modifier.testTag(HomeScreenTestTags.item(mediaItem.id)),
                     progress = mediaItem.resumeProgressFraction(),
                 )
             }
@@ -332,6 +379,7 @@ private fun HomeSectionRow(section: HomeSection, baseUrl: String, onItemClick: (
                     subtitle = mediaItem.displaySubtitle.ifBlank { null },
                     imageUrl = if (baseUrl.isBlank()) null else mediaItem.posterUrl(baseUrl),
                     onClick = { onItemClick(mediaItem) },
+                    modifier = Modifier.testTag(HomeScreenTestTags.item(mediaItem.id)),
                 )
             }
         }
@@ -381,6 +429,7 @@ private fun RecentlyAddedGroupRow(
                     subtitle = mediaItem.displaySubtitle.ifBlank { null },
                     imageUrl = if (baseUrl.isBlank()) null else mediaItem.posterUrl(baseUrl),
                     onClick = { onItemClick(mediaItem) },
+                    modifier = Modifier.testTag(HomeScreenTestTags.item(mediaItem.id)),
                 )
                 mediaItem.unplayedBadgeCountOrNull()?.let { count ->
                     UnplayedBadge(count = count, modifier = Modifier.align(Alignment.TopEnd))
@@ -406,6 +455,20 @@ private fun UnplayedBadge(count: Int, modifier: Modifier = Modifier) {
         )
     }
 }
+
+/**
+ * 分区里某一项被点击时应该传给 [onItemClick] 的播放队列(修正 §3.2:"没有上一集")——原样返回
+ * 整份分区列表,而不是只含被点的那一项。以前导航层传的是 `listOf(item)`,`PlayQueue` 长度
+ * 恒为 1,系统媒体控制的"上一集"因此恒不可用(见 `core/player` 的 `PlayQueueTest`:队列长度
+ * 够、起点不在队首,`hasPrevious()` 才会是 true)。和剧集详情页"整季即队列"
+ * ([dev.insua.jellycast.feature.library.LibraryViewModel.queueFor])是同一个模式,只是这里的
+ * "季"换成了"分区"。[tapped] 目前不参与运算,保留是为了和 `queueFor(episode)` 同样的调用形状,
+ * 便于以后需要按起点过滤/排序时不用改调用方。
+ */
+internal fun HomeSection.playQueueFor(tapped: MediaItem): List<MediaItem> = items
+
+/** 同上,针对"最近添加"按库分组的那一行——同一个库分组内的条目就是队列。 */
+internal fun RecentlyAddedGroup.playQueueFor(tapped: MediaItem): List<MediaItem> = items
 
 /**
  * "听过比例"的纯换算:输入输出全是毫秒/Float,不接触 ticks、不依赖 Android,可离线单测。

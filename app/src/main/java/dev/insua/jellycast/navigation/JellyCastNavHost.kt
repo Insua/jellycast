@@ -142,8 +142,11 @@ fun JellyCastNavHost(
             }
             composable(Routes.HOME) {
                 HomeScreen(
-                    onItemClick = { item ->
-                        sessionViewModel.play(item, listOf(item))
+                    // 队列(修正 §3.2,"没有上一集"):HomeScreen 按点击来源(继续收听/下一集/
+                    // 最近添加分组)算好整份队列传出来,这里原样转给 sessionViewModel.play——
+                    // 不能再退化成 listOf(item),否则 PlayQueue 长度恒为 1、上一集恒不可用。
+                    onItemClick = { item, queue ->
+                        sessionViewModel.play(item, queue)
                         playerExpanded = true
                     },
                     // 「我的媒体」库卡片(修正 §3.1):之前这里没接,走了 HomeScreen 参数的默认空
