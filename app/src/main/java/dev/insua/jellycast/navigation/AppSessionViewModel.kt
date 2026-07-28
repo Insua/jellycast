@@ -43,6 +43,10 @@ data class MiniPlayerUiState(
     val posterUrl: String?,
     val isPlaying: Boolean,
     val progress: Float,
+    // 队列还有没有下一条可以推进(设计文档 §3.6:迷你条下一集按钮)。直接读 Player.hasNextMediaItem()——
+    // 这个值是 SeekInterceptingPlayer 按 QueueNavigator.hasNext() 声明 COMMAND_SEEK_TO_NEXT_MEDIA_ITEM
+    // 之后 Media3 自己算出来的,和通知栏/锁屏"下一集"按钮是否出现同一个权威来源,不会互相打架。
+    val hasNext: Boolean = false,
 )
 
 /**
@@ -193,6 +197,7 @@ class AppSessionViewModel @Inject constructor(
                             positionMs = audioPlaybackEngine.absolutePositionMs,
                             durationMs = info.mediaItem.runTimeMs,
                         ),
+                        hasNext = player?.hasNextMediaItem() == true,
                     )
                     delay(MINI_PLAYER_POLL_INTERVAL_MS)
                 }
@@ -202,6 +207,11 @@ class AppSessionViewModel @Inject constructor(
 
     fun onMiniPlayerPlayPause() {
         playerConnection.player.value?.let { player -> if (player.isPlaying) player.pause() else player.play() }
+    }
+
+    /** 迷你条下一集按钮:复用和通知栏/锁屏/全屏播放页同一条路径([PlayerConnection.skipToNext])。 */
+    fun onMiniPlayerSkipNext() {
+        playerConnection.skipToNext()
     }
 
     /**

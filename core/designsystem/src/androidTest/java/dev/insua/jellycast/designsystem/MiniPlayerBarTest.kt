@@ -1,5 +1,6 @@
 package dev.insua.jellycast.designsystem
 
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
@@ -26,7 +27,9 @@ class MiniPlayerBarTest {
                     posterUrl = null,
                     isPlaying = false,
                     progress = 0.3f,
+                    hasNext = true,
                     onPlayPause = { playPauseClicked = true },
+                    onSkipNext = {},
                     onExpand = {},
                 )
             }
@@ -49,7 +52,9 @@ class MiniPlayerBarTest {
                     posterUrl = null,
                     isPlaying = false,
                     progress = 0.3f,
+                    hasNext = true,
                     onPlayPause = { playPauseClicked = true },
+                    onSkipNext = {},
                     onExpand = { expandClicked = true },
                 )
             }
@@ -71,12 +76,63 @@ class MiniPlayerBarTest {
                     posterUrl = null,
                     isPlaying = true,
                     progress = 0.3f,
+                    hasNext = true,
                     onPlayPause = {},
+                    onSkipNext = {},
                     onExpand = {},
                 )
             }
         }
 
         composeTestRule.onNodeWithContentDescription("暂停").assertExists()
+    }
+
+    @Test
+    fun hasNext为true时点击下一集按钮触发onSkipNext而不触发onPlayPause或onExpand() {
+        var skipNextClicked = false
+        var playPauseClicked = false
+        var expandClicked = false
+        composeTestRule.setContent {
+            JellyCastTheme {
+                MiniPlayerBar(
+                    title = "第一集",
+                    subtitle = "示例剧名 · S01E01",
+                    posterUrl = null,
+                    isPlaying = false,
+                    progress = 0.3f,
+                    hasNext = true,
+                    onPlayPause = { playPauseClicked = true },
+                    onSkipNext = { skipNextClicked = true },
+                    onExpand = { expandClicked = true },
+                )
+            }
+        }
+
+        composeTestRule.onNodeWithTag(MiniPlayerBarTestTags.SKIP_NEXT_BUTTON).performClick()
+
+        assert(skipNextClicked) { "点击下一集按钮应触发 onSkipNext" }
+        assert(!playPauseClicked) { "点击下一集按钮不应触发 onPlayPause" }
+        assert(!expandClicked) { "点击下一集按钮不应触发 onExpand(不冒泡到整条)" }
+    }
+
+    @Test
+    fun hasNext为false时下一集按钮禁用() {
+        composeTestRule.setContent {
+            JellyCastTheme {
+                MiniPlayerBar(
+                    title = "第一集",
+                    subtitle = "示例剧名 · S01E01",
+                    posterUrl = null,
+                    isPlaying = false,
+                    progress = 0.3f,
+                    hasNext = false,
+                    onPlayPause = {},
+                    onSkipNext = {},
+                    onExpand = {},
+                )
+            }
+        }
+
+        composeTestRule.onNodeWithTag(MiniPlayerBarTestTags.SKIP_NEXT_BUTTON).assertIsNotEnabled()
     }
 }

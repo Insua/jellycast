@@ -106,7 +106,9 @@ fun JellyCastNavHost(
                             posterUrl = state.posterUrl,
                             isPlaying = state.isPlaying,
                             progress = state.progress,
+                            hasNext = state.hasNext,
                             onPlayPause = sessionViewModel::onMiniPlayerPlayPause,
+                            onSkipNext = sessionViewModel::onMiniPlayerSkipNext,
                             onExpand = { playerExpanded = true },
                         )
                     }
