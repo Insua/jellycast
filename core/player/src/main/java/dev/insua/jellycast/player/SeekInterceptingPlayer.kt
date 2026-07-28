@@ -201,6 +201,33 @@ class SeekInterceptingPlayer(
 
     private fun hasAuthoritativeDuration(): Boolean = (absoluteTimeline.absoluteDurationMs() ?: 0L) > 0L
 
+    /**
+     * 位置改报条目内绝对位置之后,**缓冲位置也必须跟着换算**,否则系统侧拿到的是一对自相矛盾的数字。
+     * 修好 [isCurrentMediaItemLive] 之后真机实测:
+     * ```
+     * state=PlaybackState {state=PLAYING(3), position=913290, buffered position=5077, speed=1.0}
+     * ```
+     * 缓冲位置(5 秒)远小于播放位置(15 分钟)—— 底层报的是**这条转码流内**的相对值,每次
+     * seek/续播换流就归零(和 `currentPosition` 是同一个坑,见 [AudioPlaybackEngine.absolutePositionMs])。
+     * 锁屏/通知栏/流体云的缓冲条据此渲染会一直显示"几乎没缓冲"。
+     *
+     * 换算:绝对位置 + (流内缓冲位置 − 流内播放位置),也就是"从当前位置往前还缓冲了多久";
+     * 有权威总时长时钳在结尾,不越过条目末尾。拿不到绝对位置就原样退回底层值。
+     */
+    override fun getBufferedPosition(): Long = absoluteBufferedPosition(super.getBufferedPosition())
+        ?: super.getBufferedPosition()
+
+    override fun getContentBufferedPosition(): Long =
+        absoluteBufferedPosition(super.getContentBufferedPosition()) ?: super.getContentBufferedPosition()
+
+    private fun absoluteBufferedPosition(streamBufferedMs: Long): Long? {
+        val absolutePositionMs = absoluteTimeline.absolutePositionMs() ?: return null
+        val aheadMs = (streamBufferedMs - super.getCurrentPosition()).coerceAtLeast(0L)
+        val durationMs = absoluteTimeline.absoluteDurationMs()?.takeIf { it > 0L }
+        val buffered = absolutePositionMs + aheadMs
+        return if (durationMs != null) buffered.coerceAtMost(durationMs) else buffered
+    }
+
     override fun seekToDefaultPosition() {
         seekRouter.seekTo(0L)
     }

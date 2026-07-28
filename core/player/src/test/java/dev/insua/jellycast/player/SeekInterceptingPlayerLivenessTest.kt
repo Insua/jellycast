@@ -3,6 +3,7 @@ package dev.insua.jellycast.player
 import io.mockk.every
 import io.mockk.mockk
 import androidx.media3.common.Player
+import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -87,5 +88,65 @@ class SeekInterceptingPlayerLivenessTest {
 
         assertTrue(sessionPlayer.isCurrentMediaItemLive, "不知道总时长就没有依据说它不是直播")
         assertFalse(sessionPlayer.isCurrentMediaItemSeekable)
+    }
+}
+
+/**
+ * 位置改报"条目内绝对位置"之后,**缓冲位置也必须跟着换算**,否则系统侧拿到的是一对矛盾的数字。
+ *
+ * 真机实测(修好 [SeekInterceptingPlayer.isCurrentMediaItemLive] 之后):
+ * ```
+ * state=PlaybackState {state=PLAYING(3), position=913290, buffered position=5077, speed=1.0}
+ * ```
+ * 缓冲位置(5 秒)远小于播放位置(15 分钟) —— 因为 `getBufferedPosition()` 报的是**这条转码流内**
+ * 的相对值,而 seek/续播每换一条流就归零(和 `currentPosition` 是同一个坑,见
+ * [AudioPlaybackEngine.absolutePositionMs])。锁屏/胶囊的缓冲条据此渲染会看起来"缓冲一直是 0"。
+ *
+ * 换算方式:绝对位置 + (流内缓冲位置 − 流内播放位置),即"从当前位置往前还缓冲了多久"。
+ */
+class SeekInterceptingPlayerBufferedPositionTest {
+
+    private fun underlying(streamPositionMs: Long, streamBufferedMs: Long): Player =
+        mockk<Player>(relaxed = true).also {
+            every { it.currentPosition } returns streamPositionMs
+            every { it.bufferedPosition } returns streamBufferedMs
+            every { it.contentBufferedPosition } returns streamBufferedMs
+        }
+
+    private fun timeline(positionMs: Long?, durationMs: Long?) = object : AbsoluteTimeline {
+        override fun absolutePositionMs(): Long? = positionMs
+        override fun absoluteDurationMs(): Long? = durationMs
+    }
+
+    @Test fun `缓冲位置必须换算成条目内绝对时间轴上的位置`() {
+        val sessionPlayer = SeekInterceptingPlayer(
+            underlying(streamPositionMs = 5_000L, streamBufferedMs = 65_000L),
+            SeekRouter { },
+            timeline(positionMs = 913_290L, durationMs = 1_826_581L),
+        )
+
+        // 流内已经缓冲到第 65 秒、播到第 5 秒 —— 也就是"往前还有 60 秒"。
+        assertEquals(913_290L + 60_000L, sessionPlayer.bufferedPosition)
+        assertEquals(913_290L + 60_000L, sessionPlayer.contentBufferedPosition)
+    }
+
+    @Test fun `缓冲位置不得越过条目总时长`() {
+        val sessionPlayer = SeekInterceptingPlayer(
+            underlying(streamPositionMs = 0L, streamBufferedMs = 240_000L),
+            SeekRouter { },
+            timeline(positionMs = 1_800_000L, durationMs = 1_826_581L),
+        )
+
+        assertEquals(1_826_581L, sessionPlayer.bufferedPosition)
+    }
+
+    @Test fun `拿不到绝对位置时退回底层的流内缓冲位置`() {
+        val sessionPlayer = SeekInterceptingPlayer(
+            underlying(streamPositionMs = 5_000L, streamBufferedMs = 65_000L),
+            SeekRouter { },
+            timeline(positionMs = null, durationMs = null),
+        )
+
+        assertEquals(65_000L, sessionPlayer.bufferedPosition)
     }
 }
