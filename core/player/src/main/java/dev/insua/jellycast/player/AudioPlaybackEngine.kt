@@ -74,6 +74,18 @@ interface AudioPlaybackEngine {
      */
     val absolutePositionMs: Long
 
+    /**
+     * "此刻引擎认为自己该播哪个条目" —— [play] 一被调用就同步更新,不等 resolve 落地成功/失败。
+     * `null` = 还没有任何 [play] 发生过(Idle)。
+     *
+     * ⚠️ 复审 Finding 1(v3):和 [state] 里 `Ready`/`Error` 携带的 itemId **不是**一回事——那两个
+     * 只在一次 resolve **完成**(成功或失败)之后才更新,存在滞后,读不到"`play()` 刚被调用、
+     * resolve 还没跑完"这个窗口。[EngineSeekRouter] 的防抖 seek 落地前必须核对的正是这个同步更新的
+     * 值:如果拿 [state] 去判断,`play()` 触发的新 resolve 还没完成时,`state` 仍然是旧条目的
+     * `Ready`,防抖 seek 会误以为"条目没变"而照常拿旧位置去 resolve 新条目。
+     */
+    val currentItemId: String?
+
     suspend fun play(itemId: String, userId: String, startPositionMs: Long = 0L)
     suspend fun seekTo(positionMs: Long)
 
@@ -165,7 +177,9 @@ class AudioPlaybackEngineImpl(
     private val _state = MutableStateFlow<PlaybackEngineState>(PlaybackEngineState.Idle)
     override val state: StateFlow<PlaybackEngineState> = _state.asStateFlow()
 
-    private var currentItemId: String? = null
+    /** 见接口 [AudioPlaybackEngine.currentItemId]:对外只读,`play`/`reset` 在本类内部写。 */
+    override var currentItemId: String? = null
+        private set
     private var currentUserId: String? = null
 
     /**

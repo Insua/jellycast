@@ -49,14 +49,40 @@ class EngineSeekRouter(
      * 这是在 [AudioPlaybackEngine] 既有的令牌机制之上叠加,不是另起一套并行方案:令牌机制继续
      * 兜底"取消信号还没来得及生效、resolve 已经跑完"那极小的窗口;这一层从根上减少冗余请求
      * 本身,不让陈旧请求有机会去抢并发名额。
+     *
+     * ## v3 复审 Finding 1(Important):悬而未决的 seek 不能落到发起它时以外的条目上
+     *
+     * 上面这套防抖只解决了"同一个条目内连点"。debounce 的等待窗口有 250ms,而
+     * [EngineQueueNavigator.next]/[EngineQueueNavigator.previous](锁屏/通知栏的上一集下一集按钮)
+     * 随时可能在这 250ms 里把 [AudioPlaybackEngine.currentItemId] 切到另一条目——它们各自新起一次
+     * `engine.play(...)`,不会去取消这里的 [pendingSeek]。等防抖窗口到期,这次 seek 执行
+     * `engine.seekTo(oldPositionMs)`:[AudioPlaybackEngineImpl.seekTo] 内部按**此刻**的
+     * `currentItemId` 隐式取值(它的签名不接收调用方传入的 itemId),于是拿着"拖动进度条那一刻"的
+     * 旧位置,重新 resolve 出**已经切换到的新条目**——新条目会从旧集数的播放进度开始,而不是从头播。
+     *
+     * 既有的 `requestSeq`/`isStale` 令牌机制挡不住这次:它落地时没有更晚的同类型请求跟它抢——它自己
+     * 就是最新的一次请求,令牌机制只防"迟到的旧结果覆盖新结果",不认识"这次请求从一开始问的就是
+     * 错误的条目"这件事。
+     *
+     * **取舍:在发起 seek 的这一刻捕获目标 itemId,落地前重新核对,对不上就整条丢弃**,而不是反过来
+     * 让 [EngineQueueNavigator] 去取消这里的 [pendingSeek]——后者需要给 [QueueNavigator] 接口开一个
+     * "我知道 EngineSeekRouter 存在"的洞,并且任何将来新增的、会移动 `currentItemId` 的路径
+     * (`PlaybackEndedAdvancer` 自动连播、`AppSessionViewModel.play()` 直接点开另一集……)都要记得
+     * 同样去取消,一旦漏掉一处就是同一个缺陷的另一个变种。捕获-核对的写法把"落地前核实条目没变"的
+     * 责任收在这一个方法里,谁移动 `currentItemId` 都自动被挡住,不需要挨个通知。
      */
     @Volatile
     private var pendingSeek: Job? = null
 
     override fun seekTo(positionMs: Long) {
         pendingSeek?.cancel()
+        val targetItemId = engine.currentItemId
         pendingSeek = scope.launch {
             if (debounceMs > 0L) delay(debounceMs)
+            // 落地前核对:如果 currentItemId 已经不是发起这次 seek 时的那个条目,说明期间发生过
+            // play()(切集/自动连播),这次悬而未决的请求已经问错了对象——整条丢弃,不发起 resolve,
+            // 不调用 engine.seekTo。engine 的状态此刻已经由那次 play() 正确接管。
+            if (engine.currentItemId != targetItemId) return@launch
             engine.seekTo(positionMs)
         }
     }
