@@ -33,9 +33,12 @@ fun BaseItemDto.toMediaItem(): MediaItem? {
         runTimeMs = runTimeTicks?.let { it / TICKS_PER_MS },
         resumePositionMs = (userData?.positionTicks ?: 0L) / TICKS_PER_MS,
         imageTag = imageTags?.get("Primary"),
+        unplayedItemCount = userData?.unplayedItemCount,
     )
 }
 
+// "CollectionFolder" / "UserView" 是 GET /UserViews(「我的媒体」库入口)返回条目的
+// BaseItemKind,核对自 docs/jellyfin-openapi.json 的 BaseItemKind 枚举(两者都在列)。
 private fun String.toMediaKindOrNull(): MediaKind? = when (this) {
     "Series" -> MediaKind.SERIES
     "Season" -> MediaKind.SEASON
@@ -44,6 +47,8 @@ private fun String.toMediaKindOrNull(): MediaKind? = when (this) {
     // 合集(设计文档 §3.7)。BaseItemKind 枚举里的精确拼写 "BoxSet" 已用
     // jq '.components.schemas.BaseItemKind.enum | index("BoxSet")' docs/jellyfin-openapi.json 核对。
     "BoxSet" -> MediaKind.COLLECTION
+    // 「我的媒体」库入口:/UserViews 返回的类型。
+    "CollectionFolder", "UserView" -> MediaKind.LIBRARY
     else -> null
 }
 

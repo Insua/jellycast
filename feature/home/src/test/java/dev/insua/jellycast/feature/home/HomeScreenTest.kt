@@ -54,4 +54,29 @@ class HomeScreenTest {
 
         assertEquals(1f, fraction, "服务端上报的位置理论上不应该超过总时长,但客户端必须钳制,不能画出超过 100% 的进度条")
     }
+
+    // ---- Change 2:未看数角标 —— 纯逻辑部分 ----
+    // unplayedBadgeCountOrNull 决定"要不要画角标",输入输出全是 Int?,不接触 Compose,可离线单测。
+
+    private fun episodeWithUnplayed(unplayedItemCount: Int?) = MediaItem(
+        id = "1",
+        kind = MediaKind.EPISODE,
+        name = "第一集",
+        unplayedItemCount = unplayedItemCount,
+    )
+
+    @Test
+    fun `未看数大于0时显示角标`() {
+        assertEquals(5, episodeWithUnplayed(5).unplayedBadgeCountOrNull())
+    }
+
+    @Test
+    fun `未看数为0时不显示角标`() {
+        assertNull(episodeWithUnplayed(0).unplayedBadgeCountOrNull(), "写着'0'的角标毫无意义,不该画出来")
+    }
+
+    @Test
+    fun `未看数为null时不显示角标`() {
+        assertNull(episodeWithUnplayed(null).unplayedBadgeCountOrNull(), "服务端没给这个字段时不该编造一个角标")
+    }
 }

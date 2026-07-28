@@ -19,3 +19,6 @@ keystore.properties
 
 # 端到端测试用的真实服务器与账号,绝不提交
 testing.properties
+
+# 子代理隔离用的 git worktree,不进版本库
+.claude/worktrees/

@@ -100,4 +100,37 @@ class MediaItemMapperTest {
         val dto = BaseItemDto(id = "m1", name = "Movie", type = "Movie", imageTags = null)
         assertNull(dto.toMediaItem()!!.posterUrl("https://jelly.example.com"))
     }
+
+    // ---- 「我的媒体」库入口:GET /UserViews 返回条目的 Type 是 CollectionFolder/UserView
+    //      (核对自 docs/jellyfin-openapi.json 的 BaseItemKind 枚举),不是 Series/Season/
+    //      Episode/Movie 之一,原来的 when 会把它们当"未知类型"整个丢弃。 ----
+
+    @Test
+    fun `CollectionFolder 类型映射为 LIBRARY`() {
+        val dto = BaseItemDto(id = "lib1", name = "电视剧", type = "CollectionFolder")
+        assertEquals(MediaKind.LIBRARY, dto.toMediaItem()?.kind)
+    }
+
+    @Test
+    fun `UserView 类型映射为 LIBRARY`() {
+        val dto = BaseItemDto(id = "lib2", name = "电影", type = "UserView")
+        assertEquals(MediaKind.LIBRARY, dto.toMediaItem()?.kind)
+    }
+
+    // ---- 未看数角标:UserItemDataDto.UnplayedItemCount(核对见 UserDataDto 上的注释)----
+
+    @Test
+    fun `UnplayedItemCount 映射到 unplayedItemCount`() {
+        val dto = BaseItemDto(
+            id = "e1", name = "E1", type = "Episode",
+            userData = UserDataDto(unplayedItemCount = 3),
+        )
+        assertEquals(3, dto.toMediaItem()?.unplayedItemCount)
+    }
+
+    @Test
+    fun `没有 UserData 时 unplayedItemCount 为 null`() {
+        val dto = BaseItemDto(id = "e1", name = "E1", type = "Episode", userData = null)
+        assertNull(dto.toMediaItem()?.unplayedItemCount)
+    }
 }
