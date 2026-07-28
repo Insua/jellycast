@@ -48,6 +48,8 @@ class HomeViewModelTest {
 
     private fun episodeDto(id: String) = BaseItemDto(id = id, name = id, type = "Episode")
     private fun movieDto(id: String) = BaseItemDto(id = id, name = id, type = "Movie")
+    private fun libraryDto(id: String, name: String) = BaseItemDto(id = id, name = name, type = "CollectionFolder")
+
     private fun fakeSession(userId: String = "user-1"): JellyfinSession {
         val session = mockk<JellyfinSession>()
         coEvery { session.userId() } returns userId
@@ -59,12 +61,17 @@ class HomeViewModelTest {
     private fun newViewModel(api: JellyfinApi, repository: FakeMediaRepository = FakeMediaRepository()) =
         HomeViewModel(api, fakeSession(), repository)
 
-    // ---- 修正 §1 场景 1:三个分区并发加载互不阻塞 ----
-    // 三个接口各自耗时 100ms(虚拟时间)。如果 HomeViewModel 串行 await 它们,总耗时会是 300ms;
+    /** 「我的媒体」不参与某个测试的断言时,给个空库列表,免得节外生枝。 */
+    private fun stubNoLibraries(api: JellyfinApi) {
+        coEvery { api.userViews(any()) } returns ItemsResponseDto()
+    }
+
+    // ---- 修正 §1 场景 1:四个分区并发加载互不阻塞 ----
+    // 四个接口各自耗时 100ms(虚拟时间)。如果 HomeViewModel 串行 await 它们,总耗时会累加;
     // 如果并发(各自 async 后再 await),总耗时约等于单个请求耗时 100ms。用 currentTime 直接证明。
 
     @Test
-    fun `三个分区并发加载互不阻塞`() = runTest(testDispatcher) {
+    fun `四个分区并发加载互不阻塞`() = runTest(testDispatcher) {
         val api = mockk<JellyfinApi>()
         coEvery { api.resume(any()) } coAnswers {
             delay(100)
@@ -78,12 +85,16 @@ class HomeViewModelTest {
             delay(100)
             ItemsResponseDto(items = listOf(movieDto("recent-1")))
         }
+        coEvery { api.userViews(any()) } coAnswers {
+            delay(100)
+            ItemsResponseDto(items = listOf(libraryDto("lib-1", "电视剧")))
+        }
 
         val viewModel = newViewModel(api)
         advanceUntilIdle()
 
-        assertEquals(100L, currentTime, "三个分区应并发发起,总耗时应约等于单个请求耗时而非三者相加")
-        assertEquals(3, viewModel.uiState.value.sections.size)
+        assertEquals(100L, currentTime, "四个分区应并发发起,总耗时应约等于单个请求耗时而非四者相加")
+        assertEquals(4, viewModel.uiState.value.sections.size)
     }
 
     // ---- 修正 §1 场景 2:某个分区失败时其余仍正常展示,一个 500 不能让整页空白 ----
@@ -95,6 +106,7 @@ class HomeViewModelTest {
         coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto(items = listOf(episodeDto("next-1")))
         coEvery { api.items(any(), any(), any(), any(), any(), any()) } returns
             ItemsResponseDto(items = listOf(movieDto("recent-1")))
+        coEvery { api.userViews(any()) } returns ItemsResponseDto(items = listOf(libraryDto("lib-1", "电视剧")))
 
         val viewModel = newViewModel(api)
         advanceUntilIdle()
@@ -103,6 +115,7 @@ class HomeViewModelTest {
         assertTrue(sections.none { it.kind == HomeSectionKind.RESUME }, "失败的分区不应出现")
         assertTrue(sections.any { it.kind == HomeSectionKind.NEXT_UP }, "下一集分区应正常展示")
         assertTrue(sections.any { it.kind == HomeSectionKind.RECENTLY_ADDED }, "最近添加分区应正常展示")
+        assertTrue(sections.any { it.kind == HomeSectionKind.LIBRARIES }, "我的媒体分区应正常展示")
         assertFalse(viewModel.uiState.value.isLoading)
     }
 
@@ -114,6 +127,7 @@ class HomeViewModelTest {
         coEvery { api.resume(any()) } returns ItemsResponseDto(items = emptyList())
         coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto(items = listOf(episodeDto("next-1")))
         coEvery { api.items(any(), any(), any(), any(), any(), any()) } returns ItemsResponseDto(items = emptyList())
+        stubNoLibraries(api)
 
         val viewModel = newViewModel(api)
         advanceUntilIdle()
@@ -133,6 +147,7 @@ class HomeViewModelTest {
         coEvery {
             api.items(any(), any(), any(), any(), any(), any(), any(), any())
         } returns ItemsResponseDto(items = emptyList())
+        stubNoLibraries(api)
 
         val viewModel = newViewModel(api)
         advanceUntilIdle()
@@ -146,31 +161,72 @@ class HomeViewModelTest {
         }
     }
 
+    // ================= Change 1:「我的媒体」库入口(GET /UserViews)=================
+
+    @Test
+    fun `我的媒体分区从 UserViews 加载库列表`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto()
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
+        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any()) } returns ItemsResponseDto()
+        coEvery { api.userViews(any()) } returns ItemsResponseDto(
+            items = listOf(libraryDto("lib-1", "电视剧"), libraryDto("lib-2", "电影")),
+        )
+
+        val viewModel = newViewModel(api)
+        advanceUntilIdle()
+
+        val libraries = viewModel.uiState.value.sections.single { it.kind == HomeSectionKind.LIBRARIES }
+        assertEquals("我的媒体", libraries.title)
+        assertEquals(listOf("lib-1", "lib-2"), libraries.items.map { it.id })
+        assertEquals(listOf("电视剧", "电影"), libraries.items.map { it.name })
+        assertTrue(libraries.items.all { it.kind == MediaKind.LIBRARY }, "库入口条目应映射为 MediaKind.LIBRARY")
+    }
+
+    @Test
+    fun `我的媒体请求失败时其余分区不受影响`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto(items = listOf(episodeDto("resume-1")))
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
+        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any()) } returns ItemsResponseDto()
+        coEvery { api.userViews(any()) } throws RuntimeException("500")
+
+        val viewModel = newViewModel(api)
+        advanceUntilIdle()
+
+        val sections = viewModel.uiState.value.sections
+        assertTrue(sections.none { it.kind == HomeSectionKind.LIBRARIES })
+        assertTrue(sections.any { it.kind == HomeSectionKind.RESUME }, "「我的媒体」挂了不该拖累继续收听")
+        assertNull(viewModel.uiState.value.error, "还有内容可看就不该进错误态")
+    }
+
     // ================= 缓存优先(离线可用)=================
     // 用户的真实问题:没开 Tailscale 打开 App 就闪退。下面四条把"打开就有内容 / 断网不崩溃"
     // 钉在 ViewModel 这一层。
 
     private fun episode(id: String) = MediaItem(id = id, kind = MediaKind.EPISODE, name = id)
 
-    /** 三个接口全部当场抛错,模拟"VPN 没开,一个都连不上"。 */
+    /** 四个接口全部当场抛错,模拟"VPN 没开,一个都连不上"。 */
     private fun offlineApi(): JellyfinApi {
         val api = mockk<JellyfinApi>()
         coEvery { api.resume(any()) } throws IOException("Unable to resolve host")
         coEvery { api.nextUp(any(), any()) } throws IOException("Unable to resolve host")
         coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any()) } throws
             IOException("Unable to resolve host")
+        coEvery { api.userViews(any()) } throws IOException("Unable to resolve host")
         return api
     }
 
     @Test
     fun `有缓存时第一次发射就是缓存,不等网络返回`() = runTest(testDispatcher) {
         val api = mockk<JellyfinApi>()
-        // 三个接口都很慢。缓存必须在它们返回之前就已经显示出来。
+        // 四个接口都很慢。缓存必须在它们返回之前就已经显示出来。
         coEvery { api.resume(any()) } coAnswers { delay(10_000); ItemsResponseDto(items = listOf(episodeDto("net-1"))) }
         coEvery { api.nextUp(any(), any()) } coAnswers { delay(10_000); ItemsResponseDto() }
         coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
             delay(10_000); ItemsResponseDto()
         }
+        coEvery { api.userViews(any()) } coAnswers { delay(10_000); ItemsResponseDto() }
 
         val repository = FakeMediaRepository()
         repository.seed(CacheBuckets.HOME_RESUME, listOf(episode("cached-1")))
@@ -227,6 +283,7 @@ class HomeViewModelTest {
         coEvery { api.resume(any()) } throws IOException("offline")
         coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto(items = listOf(episodeDto("next-1")))
         coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any()) } returns ItemsResponseDto()
+        stubNoLibraries(api)
 
         val repository = FakeMediaRepository()
         repository.seed(CacheBuckets.HOME_RESUME, listOf(episode("cached-1")))
@@ -246,6 +303,7 @@ class HomeViewModelTest {
         coEvery { api.resume(any()) } returns ItemsResponseDto(items = listOf(episodeDto("resume-1")))
         coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
         coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any()) } returns ItemsResponseDto()
+        stubNoLibraries(api)
 
         val repository = FakeMediaRepository()
         newViewModel(api, repository)

@@ -2,7 +2,8 @@ package dev.insua.jellycast.model
 
 import java.util.Locale
 
-enum class MediaKind { SERIES, SEASON, EPISODE, MOVIE }
+/** LIBRARY = 「我的媒体」库入口本身(GET /UserViews 返回的 CollectionFolder/UserView)。 */
+enum class MediaKind { SERIES, SEASON, EPISODE, MOVIE, LIBRARY }
 
 data class MediaItem(
     val id: String,

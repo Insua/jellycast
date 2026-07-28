@@ -36,11 +36,14 @@ fun BaseItemDto.toMediaItem(): MediaItem? {
     )
 }
 
+// "CollectionFolder" / "UserView" 是 GET /UserViews(「我的媒体」库入口)返回条目的
+// BaseItemKind,核对自 docs/jellyfin-openapi.json 的 BaseItemKind 枚举(两者都在列)。
 private fun String.toMediaKindOrNull(): MediaKind? = when (this) {
     "Series" -> MediaKind.SERIES
     "Season" -> MediaKind.SEASON
     "Episode" -> MediaKind.EPISODE
     "Movie" -> MediaKind.MOVIE
+    "CollectionFolder", "UserView" -> MediaKind.LIBRARY
     else -> null
 }
 

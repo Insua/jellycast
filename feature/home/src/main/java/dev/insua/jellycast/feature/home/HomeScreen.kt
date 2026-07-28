@@ -35,9 +35,12 @@ object HomeScreenTestTags {
 }
 
 /**
- * "在听"首页。三个分区自上而下:继续收听 / 下一集 / 最近添加——下一集是追剧主入口,紧跟在
- * 继续收听之后,点开就能直接播放,呼应设计文档"3 次点击内开始播放下一集"的成功标准。
+ * "在听"首页。四个分区自上而下:继续收听 / 下一集 / 最近添加 / 我的媒体——下一集是追剧主入口,
+ * 紧跟在继续收听之后,点开就能直接播放,呼应设计文档"3 次点击内开始播放下一集"的成功标准。
  * 全程不渲染视频画面,封面用 [PosterCard](海报卡,内部走 Coil AsyncImage)。
+ *
+ * [onLibraryClick] 点击「我的媒体」的库卡片时回调库 id,交给调用方(导航层)决定跳去哪个库——
+ * 这里不认识具体的路由。
  *
  * [baseUrl] 是当前激活服务器的接入地址,用于拼封面 URL([dev.insua.jellycast.network.mapper.posterUrl]);
  * 默认空串——:feature:home 目前还没有接入"当前激活服务器"的会话解析(Task 22 导航装配的职责),
@@ -46,6 +49,7 @@ object HomeScreenTestTags {
 @Composable
 fun HomeScreen(
     onItemClick: (MediaItem) -> Unit,
+    onLibraryClick: (String) -> Unit = {},
     baseUrl: String = "",
     viewModel: HomeViewModel = hiltViewModel(),
 ) {
@@ -103,7 +107,19 @@ fun HomeScreen(
             }
             for (section in uiState.sections) {
                 item(key = section.kind) {
-                    HomeSectionRow(section = section, baseUrl = baseUrl, onItemClick = onItemClick)
+                    HomeSectionRow(
+                        section = section,
+                        baseUrl = baseUrl,
+                        // 「我的媒体」的卡片点的是库,不是可播放条目——回调换成 onLibraryClick,
+                        // 其余分区(继续收听/下一集/最近添加)行为不变。
+                        onItemClick = { mediaItem ->
+                            if (section.kind == HomeSectionKind.LIBRARIES) {
+                                onLibraryClick(mediaItem.id)
+                            } else {
+                                onItemClick(mediaItem)
+                            }
+                        },
+                    )
                 }
             }
         }
@@ -113,7 +129,7 @@ fun HomeScreen(
 @Composable
 private fun HomeSectionRow(section: HomeSection, baseUrl: String, onItemClick: (MediaItem) -> Unit) {
     // 下一集是追剧主入口(设计文档"3 次点击内开始播放下一集"的成功标准),标题用主题色 + 加粗
-    // 突出显示,和另外两个分区(继续收听/最近添加)区分开——只是排版上的强调,不改变布局结构。
+    // 突出显示,和另外分区区分开——只是排版上的强调,不改变布局结构。
     val isPrimarySection = section.kind == HomeSectionKind.NEXT_UP
     Text(
         text = section.title,
@@ -132,8 +148,8 @@ private fun HomeSectionRow(section: HomeSection, baseUrl: String, onItemClick: (
                 subtitle = mediaItem.displaySubtitle.ifBlank { null },
                 imageUrl = if (baseUrl.isBlank()) null else mediaItem.posterUrl(baseUrl),
                 onClick = { onItemClick(mediaItem) },
-                // 只有继续收听分区传听过比例——下一集/最近添加不是"进行中"的语义,保持不传,
-                // PosterCard 收到 null 就什么都不画。
+                // 只有继续收听分区传听过比例——下一集/最近添加/我的媒体不是"进行中"的语义,
+                // 保持不传,PosterCard 收到 null 就什么都不画。
                 progress = if (section.kind == HomeSectionKind.RESUME) mediaItem.resumeProgressFraction() else null,
             )
         }

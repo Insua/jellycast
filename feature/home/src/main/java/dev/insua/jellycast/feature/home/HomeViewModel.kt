@@ -22,13 +22,14 @@ import javax.inject.Inject
 /** 无缓存又连不上服务器时给用户看的话。不带技术细节——用户能做的只有"重试"。 */
 internal const val OFFLINE_MESSAGE = "无法连接服务器"
 
-enum class HomeSectionKind { RESUME, NEXT_UP, RECENTLY_ADDED }
+enum class HomeSectionKind { RESUME, NEXT_UP, RECENTLY_ADDED, LIBRARIES }
 
 private val HomeSectionKind.bucket: String
     get() = when (this) {
         HomeSectionKind.RESUME -> CacheBuckets.HOME_RESUME
         HomeSectionKind.NEXT_UP -> CacheBuckets.HOME_NEXT_UP
         HomeSectionKind.RECENTLY_ADDED -> CacheBuckets.HOME_RECENTLY_ADDED
+        HomeSectionKind.LIBRARIES -> CacheBuckets.HOME_LIBRARIES
     }
 
 private val HomeSectionKind.title: String
@@ -36,6 +37,7 @@ private val HomeSectionKind.title: String
         HomeSectionKind.RESUME -> "继续收听"
         HomeSectionKind.NEXT_UP -> "下一集"
         HomeSectionKind.RECENTLY_ADDED -> "最近添加"
+        HomeSectionKind.LIBRARIES -> "我的媒体"
     }
 
 data class HomeSection(
@@ -49,16 +51,17 @@ data class HomeUiState(
     val sections: List<HomeSection> = emptyList(),
     /** 至少有一个分区这次没刷新成功,屏幕上显示的是上次的内容。用于顶部那条"离线"提示。 */
     val isOffline: Boolean = false,
-    /** 三个分区**一个都没拿到数据**(没缓存 + 全部请求失败)时的可重试错误态。 */
+    /** 四个分区**一个都没拿到数据**(没缓存 + 全部请求失败)时的可重试错误态。 */
     val error: String? = null,
 )
 
 /**
- * "在听"首页:继续收听 / 下一集 / 最近添加,自上而下。设计文档的成功标准之一是
+ * "在听"首页:继续收听 / 下一集 / 最近添加 / 我的媒体,自上而下。设计文档的成功标准之一是
  * "打开 App 到开始播放'下一集'不超过 3 次点击"——下一集分区是追剧主入口,必须显眼、可直接点播
- * (由 [HomeScreen] 负责布局上的强调,这里只负责把数据摆出来)。
+ * (由 [HomeScreen] 负责布局上的强调,这里只负责把数据摆出来)。「我的媒体」是新增的库入口分区
+ * (设计文档 §3.6,GET /UserViews),点击某个库交给 [HomeScreen] 的 onLibraryClick 回调处理导航。
  *
- * 三个分区各自独立取数、各自独立失败:一个接口的 500 绝不能把整页拖空白,所以每个分区是一条
+ * 四个分区各自独立取数、各自独立失败:一个接口的 500 绝不能把整页拖空白,所以每个分区是一条
  * 独立的 [MediaRepository] 流、独立 launch,互不影响;并且并发发起(而不是顺序 await),
  * 不让一个慢接口拖慢其余分区。空分区不出现在 [HomeUiState.sections] 里,标题也就不会显示——
  * 由调用方(这里)决定,而不是交给 Compose 层做"list.isEmpty() 就不画标题"这种容易漏的判断。
@@ -68,7 +71,7 @@ data class HomeUiState(
  * 取数不再是"调 API → 显示",而是走 [MediaRepository]:**先发缓存,再后台刷新**。
  * 用户没开 VPN 打开 App 时,看到的是上次的内容而不是白屏或崩溃(设计文档 §3.2)。
  * 每个分区自己经历"缓存 → 新数据"两次发射,[applySection] 每次都重新拼一遍 sections,
- * 所以三个分区可以各自以不同的节奏落地,谁先到谁先显示。
+ * 所以四个分区可以各自以不同的节奏落地,谁先到谁先显示。
  *
  * [error] 只在**一个分区都没拿到数据**时置位(既没有缓存、网络也全挂了)。只要有任何一个分区
  * 有内容可显示,就不该拿一整页错误盖住它——那正是"一个 500 拖空整页"的老毛病换个形式复发。
@@ -110,7 +113,7 @@ class HomeViewModel @Inject constructor(
         loadJob = viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true, isOffline = false, error = null) }
 
-            // 三个分区同时发起,再一起 join——并发而非串行。
+            // 四个分区同时发起,再一起 join——并发而非串行。
             HomeSectionKind.entries
                 .map { kind ->
                     launch {
@@ -141,6 +144,7 @@ class HomeViewModel @Inject constructor(
             // 库里有 8744 集,不带 limit 会一次性拉全量并渲染。
             HomeSectionKind.RECENTLY_ADDED ->
                 api.items(userId, types = "Episode,Movie", sortBy = "DateCreated", limit = 20)
+            HomeSectionKind.LIBRARIES -> api.userViews(userId)
         }
         return response.items.mapNotNull { it.toMediaItem() }
     }

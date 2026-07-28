@@ -12,6 +12,9 @@ object CacheBuckets {
     const val HOME_NEXT_UP = "home.nextup"
     const val HOME_RECENTLY_ADDED = "home.recent"
 
+    /** 「我的媒体」库入口列表(GET /UserViews)。 */
+    const val HOME_LIBRARIES = "home.libraries"
+
     const val LIBRARY_SERIES = "library.series"
     const val LIBRARY_MOVIES = "library.movies"
 
