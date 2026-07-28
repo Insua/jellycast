@@ -17,6 +17,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -38,6 +39,12 @@ object PosterCardTestTags {
     const val PROGRESS_BAR = "poster_card_progress_bar"
     const val FAVORITE_BUTTON = "poster_card_favorite_button"
     const val PLAYED_BUTTON = "poster_card_played_button"
+}
+
+/** [PosterCardWideTest] 用来定位宽幅卡片的测试标签。 */
+object PosterCardWideTestTags {
+    const val PROGRESS_BAR = "poster_card_wide_progress_bar"
+    const val PLAY_OVERLAY = "poster_card_wide_play_overlay"
 }
 
 /**
@@ -155,6 +162,104 @@ fun PosterCard(
                             modifier = Modifier.size(18.dp),
                         )
                     }
+                }
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (subtitle != null) {
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+/**
+ * "继续收听"用的宽幅卡:16:9 缩略图 + 底边通栏进度条 + 居中播放三角形叠层,参照 Jellyfin Web
+ * mobile 的继续收听卡片(设计文档 §3.6)。**不是** [PosterCard] 的替代——剧库网格/下一集/最近添加
+ * 仍然用 1:1 的 [PosterCard],这里是加一个新的组合,不改任何既有调用点。
+ *
+ * [progress] 语义和 [PosterCard] 的同名参数一致(听过比例 0f~1f,由调用方用
+ * `resumePositionMs / runTimeMs` 算好传入,null/0 总时长的退化已经在调用方处理——这里只管画):
+ * 非 null 且 > 0 才画进度条,避免出现一条 0 宽的空条。播放三角形叠层始终显示,不随进度变化——
+ * 它标识"这是可以继续播放的一集",不是当前播放状态。
+ */
+@Composable
+fun PosterCardWide(
+    title: String,
+    subtitle: String?,
+    imageUrl: String?,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    progress: Float? = null,
+) {
+    Column(
+        modifier = modifier
+            .width(220.dp)
+            .clickable(onClick = onClick),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(16f / 9f)
+                .clip(RoundedCornerShape(12.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+        ) {
+            AsyncImage(
+                model = imageUrl,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(16f / 9f),
+            )
+
+            Box(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .size(40.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.45f))
+                    .testTag(PosterCardWideTestTags.PLAY_OVERLAY),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.PlayArrow,
+                    contentDescription = "播放",
+                    tint = Color.White,
+                    modifier = Modifier.size(24.dp),
+                )
+            }
+
+            if (progress != null && progress > 0f) {
+                val fraction = progress.coerceIn(0f, 1f)
+                // 通栏进度条,贴底边、不做左右内边距——呼应 Jellyfin Web mobile 继续收听卡片的读法,
+                // 和 [PosterCard] 那条内缩的窄条是刻意不同的两种视觉语言。
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .height(3.dp)
+                        .background(Color.Black.copy(alpha = 0.35f))
+                        .testTag(PosterCardWideTestTags.PROGRESS_BAR),
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth(fraction)
+                            .height(3.dp)
+                            .background(MaterialTheme.colorScheme.primary),
+                    )
                 }
             }
         }

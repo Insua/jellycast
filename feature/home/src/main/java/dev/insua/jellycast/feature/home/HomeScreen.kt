@@ -37,6 +37,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import dev.insua.jellycast.designsystem.ActionMessageHost
 import dev.insua.jellycast.designsystem.OfflineBanner
 import dev.insua.jellycast.designsystem.PosterCard
+import dev.insua.jellycast.designsystem.PosterCardWide
 import dev.insua.jellycast.model.MediaItem
 import dev.insua.jellycast.model.displaySubtitle
 import dev.insua.jellycast.network.mapper.posterUrl
@@ -266,16 +267,27 @@ private fun HomeSectionRow(section: HomeSection, baseUrl: String, onItemClick: (
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         contentPadding = PaddingValues(horizontal = 16.dp),
     ) {
-        items(section.items, key = { it.id }) { mediaItem ->
-            PosterCard(
-                title = mediaItem.name,
-                subtitle = mediaItem.displaySubtitle.ifBlank { null },
-                imageUrl = if (baseUrl.isBlank()) null else mediaItem.posterUrl(baseUrl),
-                onClick = { onItemClick(mediaItem) },
-                // 只有继续收听分区传听过比例——下一集/我的媒体不是"进行中"的语义,保持不传,
-                // PosterCard 收到 null 就什么都不画。
-                progress = if (section.kind == HomeSectionKind.RESUME) mediaItem.resumeProgressFraction() else null,
-            )
+        if (section.kind == HomeSectionKind.RESUME) {
+            // 继续收听改 16:9 宽幅卡 + 通栏进度条(设计文档 §3.6,参照 Jellyfin Web mobile)——
+            // 其余分区(下一集/我的媒体)保持原来的 1:1 [PosterCard],不受影响。
+            items(section.items, key = { it.id }) { mediaItem ->
+                PosterCardWide(
+                    title = mediaItem.name,
+                    subtitle = mediaItem.displaySubtitle.ifBlank { null },
+                    imageUrl = if (baseUrl.isBlank()) null else mediaItem.posterUrl(baseUrl),
+                    onClick = { onItemClick(mediaItem) },
+                    progress = mediaItem.resumeProgressFraction(),
+                )
+            }
+        } else {
+            items(section.items, key = { it.id }) { mediaItem ->
+                PosterCard(
+                    title = mediaItem.name,
+                    subtitle = mediaItem.displaySubtitle.ifBlank { null },
+                    imageUrl = if (baseUrl.isBlank()) null else mediaItem.posterUrl(baseUrl),
+                    onClick = { onItemClick(mediaItem) },
+                )
+            }
         }
     }
 }
