@@ -60,6 +60,11 @@ import kotlinx.serialization.Serializable
     @SerialName("Language") val language: String? = null,
     @SerialName("DisplayTitle") val displayTitle: String? = null,
     @SerialName("IsTextSubtitleStream") val isTextSubtitle: Boolean = false,
+    // 缺陷 1(docs/superpowers/specs/2026-07-28-crash-and-usability-design.md §3.3):区分外挂
+    // 字幕(含弹幕文件)与内嵌字幕轨的信号。字段名已 jq 核对 docs/jellyfin-openapi.json:
+    // `jq '.components.schemas.MediaStream.properties | keys[] | select(test("external";"i"))'`
+    // → "IsExternal"(boolean)。
+    @SerialName("IsExternal") val isExternal: Boolean = false,
 )
 
 @Serializable data class PlaybackInfoResponseDto(
