@@ -52,7 +52,7 @@ class SeekInterceptingPlayerTest {
         val preparedUrls = mutableListOf<String>()
         val playerControl = object : PlayerControl {
             override val currentPositionMs: Long = 0L
-            override fun setMediaItemAndPrepare(url: String) { preparedUrls += url }
+            override fun setMediaItemAndPrepare(url: String, metadata: PlaybackDisplayMetadata?) { preparedUrls += url }
             override fun release() {}
         }
         val engine = AudioPlaybackEngineImpl(provider, playerControl)
@@ -229,7 +229,7 @@ class SeekInterceptingPlayerTest {
         val preparedUrls = mutableListOf<String>()
         val playerControl = object : PlayerControl {
             override val currentPositionMs: Long = 0L
-            override fun setMediaItemAndPrepare(url: String) { preparedUrls += url }
+            override fun setMediaItemAndPrepare(url: String, metadata: PlaybackDisplayMetadata?) { preparedUrls += url }
             override fun release() {}
         }
         val engine = AudioPlaybackEngineImpl(provider, playerControl)

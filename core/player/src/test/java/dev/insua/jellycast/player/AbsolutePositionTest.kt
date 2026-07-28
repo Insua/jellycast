@@ -44,7 +44,7 @@ class AbsolutePositionTest {
     /** 流内相对位置可变的假 PlayerControl:模拟"每换一条流就从 0 重新计时"。 */
     private class StreamRelativeControl(override var currentPositionMs: Long = 0L) : PlayerControl {
         val preparedUrls = mutableListOf<String>()
-        override fun setMediaItemAndPrepare(url: String) {
+        override fun setMediaItemAndPrepare(url: String, metadata: PlaybackDisplayMetadata?) {
             preparedUrls += url
             currentPositionMs = 0L      // 新流刚 prepare,流内相对位置归零
         }
