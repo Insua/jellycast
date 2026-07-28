@@ -33,6 +33,7 @@ internal data class CachedItemPayloadV1(
     val runTimeMs: Long? = null,
     val resumePositionMs: Long = 0L,
     val imageTag: String? = null,
+    val unplayedItemCount: Int? = null,
 )
 
 internal object CachedItemPayload {
@@ -53,6 +54,7 @@ internal object CachedItemPayload {
             runTimeMs = item.runTimeMs,
             resumePositionMs = item.resumePositionMs,
             imageTag = item.imageTag,
+            unplayedItemCount = item.unplayedItemCount,
         ),
     )
 
@@ -74,6 +76,7 @@ internal object CachedItemPayload {
             runTimeMs = payload.runTimeMs,
             resumePositionMs = payload.resumePositionMs,
             imageTag = payload.imageTag,
+            unplayedItemCount = payload.unplayedItemCount,
         )
     }.getOrNull()
 }

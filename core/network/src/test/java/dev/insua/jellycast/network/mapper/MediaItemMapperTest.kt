@@ -104,4 +104,21 @@ class MediaItemMapperTest {
         val dto = BaseItemDto(id = "lib2", name = "电影", type = "UserView")
         assertEquals(MediaKind.LIBRARY, dto.toMediaItem()?.kind)
     }
+
+    // ---- 未看数角标:UserItemDataDto.UnplayedItemCount(核对见 UserDataDto 上的注释)----
+
+    @Test
+    fun `UnplayedItemCount 映射到 unplayedItemCount`() {
+        val dto = BaseItemDto(
+            id = "e1", name = "E1", type = "Episode",
+            userData = UserDataDto(unplayedItemCount = 3),
+        )
+        assertEquals(3, dto.toMediaItem()?.unplayedItemCount)
+    }
+
+    @Test
+    fun `没有 UserData 时 unplayedItemCount 为 null`() {
+        val dto = BaseItemDto(id = "e1", name = "E1", type = "Episode", userData = null)
+        assertNull(dto.toMediaItem()?.unplayedItemCount)
+    }
 }

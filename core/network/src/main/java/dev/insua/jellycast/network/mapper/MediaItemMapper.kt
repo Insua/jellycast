@@ -33,6 +33,7 @@ fun BaseItemDto.toMediaItem(): MediaItem? {
         runTimeMs = runTimeTicks?.let { it / TICKS_PER_MS },
         resumePositionMs = (userData?.positionTicks ?: 0L) / TICKS_PER_MS,
         imageTag = imageTags?.get("Primary"),
+        unplayedItemCount = userData?.unplayedItemCount,
     )
 }
 

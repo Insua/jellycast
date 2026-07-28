@@ -43,6 +43,10 @@ import kotlinx.serialization.Serializable
 @Serializable data class UserDataDto(
     @SerialName("PlaybackPositionTicks") val positionTicks: Long = 0,
     @SerialName("Played") val played: Boolean = false,
+    // 精确大小写核对自 docs/jellyfin-openapi.json UserItemDataDto.properties:
+    // `jq '.components.schemas.UserItemDataDto.properties | keys[] | select(test("unplayed";"i"))'`
+    // → "UnplayedItemCount"(驼峰全大写开头,和本文件其余字段一致)。
+    @SerialName("UnplayedItemCount") val unplayedItemCount: Int? = null,
 )
 
 @Serializable data class MediaStreamDto(

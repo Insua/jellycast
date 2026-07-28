@@ -6,6 +6,7 @@ import dev.insua.jellycast.network.JellyfinApi
 import dev.insua.jellycast.network.repository.CacheBuckets
 import dev.insua.jellycast.network.dto.BaseItemDto
 import dev.insua.jellycast.network.dto.ItemsResponseDto
+import dev.insua.jellycast.network.dto.UserDataDto
 import dev.insua.jellycast.network.session.JellyfinSession
 import io.mockk.coEvery
 import io.mockk.coVerify
@@ -49,6 +50,10 @@ class HomeViewModelTest {
     private fun episodeDto(id: String) = BaseItemDto(id = id, name = id, type = "Episode")
     private fun movieDto(id: String) = BaseItemDto(id = id, name = id, type = "Movie")
     private fun libraryDto(id: String, name: String) = BaseItemDto(id = id, name = name, type = "CollectionFolder")
+    private fun episodeDtoWithUnplayed(id: String, unplayed: Int) = BaseItemDto(
+        id = id, name = id, type = "Episode",
+        userData = UserDataDto(unplayedItemCount = unplayed),
+    )
 
     private fun fakeSession(userId: String = "user-1"): JellyfinSession {
         val session = mockk<JellyfinSession>()
@@ -61,17 +66,19 @@ class HomeViewModelTest {
     private fun newViewModel(api: JellyfinApi, repository: FakeMediaRepository = FakeMediaRepository()) =
         HomeViewModel(api, fakeSession(), repository)
 
-    /** 「我的媒体」不参与某个测试的断言时,给个空库列表,免得节外生枝。 */
+    /** 「我的媒体」不参与某个测试的断言时,给个空库列表,免得第二阶段(按库拉最近添加)节外生枝。 */
     private fun stubNoLibraries(api: JellyfinApi) {
         coEvery { api.userViews(any()) } returns ItemsResponseDto()
     }
 
-    // ---- 修正 §1 场景 1:四个分区并发加载互不阻塞 ----
-    // 四个接口各自耗时 100ms(虚拟时间)。如果 HomeViewModel 串行 await 它们,总耗时会累加;
+    // ---- 修正 §1 场景 1:三个 flat 分区(继续收听/下一集/我的媒体)并发加载互不阻塞 ----
+    // 三个接口各自耗时 100ms(虚拟时间)。如果 HomeViewModel 串行 await 它们,总耗时会是 300ms;
     // 如果并发(各自 async 后再 await),总耗时约等于单个请求耗时 100ms。用 currentTime 直接证明。
+    // 「我的媒体」这里刻意回空列表——把测量范围限定在第一阶段,不让第二阶段(按库拉最近添加)
+    // 混进耗时。第二阶段自己的并发单独有一条测试(见下方"最近添加按库并发加载互不阻塞")。
 
     @Test
-    fun `四个分区并发加载互不阻塞`() = runTest(testDispatcher) {
+    fun `三个分区并发加载互不阻塞`() = runTest(testDispatcher) {
         val api = mockk<JellyfinApi>()
         coEvery { api.resume(any()) } coAnswers {
             delay(100)
@@ -81,20 +88,16 @@ class HomeViewModelTest {
             delay(100)
             ItemsResponseDto(items = listOf(episodeDto("next-1")))
         }
-        coEvery { api.items(any(), any(), any(), any(), any(), any()) } coAnswers {
-            delay(100)
-            ItemsResponseDto(items = listOf(movieDto("recent-1")))
-        }
         coEvery { api.userViews(any()) } coAnswers {
             delay(100)
-            ItemsResponseDto(items = listOf(libraryDto("lib-1", "电视剧")))
+            ItemsResponseDto()
         }
 
         val viewModel = newViewModel(api)
         advanceUntilIdle()
 
-        assertEquals(100L, currentTime, "四个分区应并发发起,总耗时应约等于单个请求耗时而非四者相加")
-        assertEquals(4, viewModel.uiState.value.sections.size)
+        assertEquals(100L, currentTime, "三个分区应并发发起,总耗时应约等于单个请求耗时而非三者相加")
+        assertEquals(2, viewModel.uiState.value.sections.size, "继续收听 + 下一集,「我的媒体」这次是空的不出现")
     }
 
     // ---- 修正 §1 场景 2:某个分区失败时其余仍正常展示,一个 500 不能让整页空白 ----
@@ -104,9 +107,10 @@ class HomeViewModelTest {
         val api = mockk<JellyfinApi>()
         coEvery { api.resume(any()) } throws RuntimeException("500")
         coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto(items = listOf(episodeDto("next-1")))
-        coEvery { api.items(any(), any(), any(), any(), any(), any()) } returns
-            ItemsResponseDto(items = listOf(movieDto("recent-1")))
         coEvery { api.userViews(any()) } returns ItemsResponseDto(items = listOf(libraryDto("lib-1", "电视剧")))
+        coEvery {
+            api.items(any(), any(), any(), any(), any(), any(), any(), any())
+        } returns ItemsResponseDto(items = listOf(movieDto("recent-1")))
 
         val viewModel = newViewModel(api)
         advanceUntilIdle()
@@ -114,7 +118,6 @@ class HomeViewModelTest {
         val sections = viewModel.uiState.value.sections
         assertTrue(sections.none { it.kind == HomeSectionKind.RESUME }, "失败的分区不应出现")
         assertTrue(sections.any { it.kind == HomeSectionKind.NEXT_UP }, "下一集分区应正常展示")
-        assertTrue(sections.any { it.kind == HomeSectionKind.RECENTLY_ADDED }, "最近添加分区应正常展示")
         assertTrue(sections.any { it.kind == HomeSectionKind.LIBRARIES }, "我的媒体分区应正常展示")
         assertFalse(viewModel.uiState.value.isLoading)
     }
@@ -126,7 +129,6 @@ class HomeViewModelTest {
         val api = mockk<JellyfinApi>()
         coEvery { api.resume(any()) } returns ItemsResponseDto(items = emptyList())
         coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto(items = listOf(episodeDto("next-1")))
-        coEvery { api.items(any(), any(), any(), any(), any(), any()) } returns ItemsResponseDto(items = emptyList())
         stubNoLibraries(api)
 
         val viewModel = newViewModel(api)
@@ -137,30 +139,6 @@ class HomeViewModelTest {
         assertEquals(HomeSectionKind.NEXT_UP, sections.single().kind)
     }
 
-    // ---- 库里有 8744 集,「最近添加」不带 limit 会一次性拉全量并渲染 ----
-
-    @Test
-    fun `最近添加带加载上限,不拉全量`() = runTest(testDispatcher) {
-        val api = mockk<JellyfinApi>()
-        coEvery { api.resume(any()) } returns ItemsResponseDto(items = emptyList())
-        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto(items = emptyList())
-        coEvery {
-            api.items(any(), any(), any(), any(), any(), any(), any(), any())
-        } returns ItemsResponseDto(items = emptyList())
-        stubNoLibraries(api)
-
-        val viewModel = newViewModel(api)
-        advanceUntilIdle()
-
-        coVerify {
-            api.items(
-                userId = any(), types = "Episode,Movie", recursive = any(),
-                sortBy = "DateCreated", startIndex = any(), limit = 20,
-                parentId = any(), searchTerm = any(),
-            )
-        }
-    }
-
     // ================= Change 1:「我的媒体」库入口(GET /UserViews)=================
 
     @Test
@@ -168,7 +146,6 @@ class HomeViewModelTest {
         val api = mockk<JellyfinApi>()
         coEvery { api.resume(any()) } returns ItemsResponseDto()
         coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
-        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any()) } returns ItemsResponseDto()
         coEvery { api.userViews(any()) } returns ItemsResponseDto(
             items = listOf(libraryDto("lib-1", "电视剧"), libraryDto("lib-2", "电影")),
         )
@@ -188,7 +165,6 @@ class HomeViewModelTest {
         val api = mockk<JellyfinApi>()
         coEvery { api.resume(any()) } returns ItemsResponseDto(items = listOf(episodeDto("resume-1")))
         coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
-        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any()) } returns ItemsResponseDto()
         coEvery { api.userViews(any()) } throws RuntimeException("500")
 
         val viewModel = newViewModel(api)
@@ -198,6 +174,188 @@ class HomeViewModelTest {
         assertTrue(sections.none { it.kind == HomeSectionKind.LIBRARIES })
         assertTrue(sections.any { it.kind == HomeSectionKind.RESUME }, "「我的媒体」挂了不该拖累继续收听")
         assertNull(viewModel.uiState.value.error, "还有内容可看就不该进错误态")
+    }
+
+    // ================= Change 2:最近添加按库分组 + 未看数角标 =================
+
+    @Test
+    fun `最近添加按库分组并携带未看数`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto()
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
+        coEvery { api.userViews(any()) } returns ItemsResponseDto(
+            items = listOf(libraryDto("lib-1", "电视剧"), libraryDto("lib-2", "电影")),
+        )
+        coEvery {
+            api.items(
+                userId = any(), types = any(), recursive = any(), sortBy = any(),
+                startIndex = any(), limit = any(), parentId = "lib-1", searchTerm = any(),
+            )
+        } returns ItemsResponseDto(items = listOf(episodeDtoWithUnplayed("e-1", 3)))
+        coEvery {
+            api.items(
+                userId = any(), types = any(), recursive = any(), sortBy = any(),
+                startIndex = any(), limit = any(), parentId = "lib-2", searchTerm = any(),
+            )
+        } returns ItemsResponseDto(items = listOf(movieDto("m-1")))
+
+        val viewModel = newViewModel(api)
+        advanceUntilIdle()
+
+        val groups = viewModel.uiState.value.recentlyAddedGroups
+        assertEquals(listOf("lib-1", "lib-2"), groups.map { it.libraryId }, "分组顺序应与「我的媒体」库顺序一致")
+        assertEquals(listOf("电视剧", "电影"), groups.map { it.libraryName })
+        assertEquals(3, groups.single { it.libraryId == "lib-1" }.items.single().unplayedItemCount)
+        assertNull(
+            groups.single { it.libraryId == "lib-2" }.items.single().unplayedItemCount,
+            "服务端没给这个字段时不该编造一个数字",
+        )
+    }
+
+    @Test
+    fun `最近添加按库并发加载互不阻塞`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto()
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
+        coEvery { api.userViews(any()) } returns ItemsResponseDto(
+            items = listOf(libraryDto("lib-1", "电视剧"), libraryDto("lib-2", "电影")),
+        )
+        coEvery {
+            api.items(
+                userId = any(), types = any(), recursive = any(), sortBy = any(),
+                startIndex = any(), limit = any(), parentId = "lib-1", searchTerm = any(),
+            )
+        } coAnswers { delay(100); ItemsResponseDto(items = listOf(episodeDto("e-1"))) }
+        coEvery {
+            api.items(
+                userId = any(), types = any(), recursive = any(), sortBy = any(),
+                startIndex = any(), limit = any(), parentId = "lib-2", searchTerm = any(),
+            )
+        } coAnswers { delay(100); ItemsResponseDto(items = listOf(movieDto("m-1"))) }
+
+        val viewModel = newViewModel(api)
+        advanceUntilIdle()
+
+        assertEquals(100L, currentTime, "两个库的「最近添加」应并发发起,不应叠加耗时")
+        assertEquals(2, viewModel.uiState.value.recentlyAddedGroups.size)
+    }
+
+    @Test
+    fun `某个库的最近添加请求失败不影响其他库(无缓存时该库不出现)`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto()
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
+        coEvery { api.userViews(any()) } returns ItemsResponseDto(
+            items = listOf(libraryDto("lib-1", "电视剧"), libraryDto("lib-2", "电影")),
+        )
+        coEvery {
+            api.items(
+                userId = any(), types = any(), recursive = any(), sortBy = any(),
+                startIndex = any(), limit = any(), parentId = "lib-1", searchTerm = any(),
+            )
+        } throws IOException("offline")
+        coEvery {
+            api.items(
+                userId = any(), types = any(), recursive = any(), sortBy = any(),
+                startIndex = any(), limit = any(), parentId = "lib-2", searchTerm = any(),
+            )
+        } returns ItemsResponseDto(items = listOf(movieDto("m-1")))
+
+        val viewModel = newViewModel(api)
+        advanceUntilIdle()
+
+        val groups = viewModel.uiState.value.recentlyAddedGroups
+        assertEquals(listOf("lib-2"), groups.map { it.libraryId }, "失败的库不该出现,但不能连累另一个库")
+        assertNull(viewModel.uiState.value.error, "还有内容可看就不该拿错误页盖住它")
+    }
+
+    @Test
+    fun `某个库最近添加断网但有缓存时显示缓存并标记整体离线`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto()
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
+        coEvery { api.userViews(any()) } returns ItemsResponseDto(
+            items = listOf(libraryDto("lib-1", "电视剧"), libraryDto("lib-2", "电影")),
+        )
+        coEvery {
+            api.items(
+                userId = any(), types = any(), recursive = any(), sortBy = any(),
+                startIndex = any(), limit = any(), parentId = "lib-1", searchTerm = any(),
+            )
+        } throws IOException("offline")
+        coEvery {
+            api.items(
+                userId = any(), types = any(), recursive = any(), sortBy = any(),
+                startIndex = any(), limit = any(), parentId = "lib-2", searchTerm = any(),
+            )
+        } returns ItemsResponseDto(items = listOf(movieDto("m-1")))
+
+        val repository = FakeMediaRepository()
+        repository.seed(CacheBuckets.recentlyAddedOf("lib-1"), listOf(episode("cached-recent-1")))
+        val viewModel = newViewModel(api, repository)
+        advanceUntilIdle()
+
+        val groups = viewModel.uiState.value.recentlyAddedGroups
+        assertEquals(
+            listOf("cached-recent-1"),
+            groups.single { it.libraryId == "lib-1" }.items.map { it.id },
+            "刷新失败绝不能清掉已经显示出来的缓存内容",
+        )
+        assertTrue(viewModel.uiState.value.isOffline, "有分组没刷新成功,整体就算离线")
+        assertNull(viewModel.uiState.value.error, "还有内容可看就不该拿错误页盖住它")
+    }
+
+    @Test
+    fun `某个库最近添加为空时不出现该分组`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto()
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
+        coEvery { api.userViews(any()) } returns ItemsResponseDto(
+            items = listOf(libraryDto("lib-1", "电视剧"), libraryDto("lib-2", "电影")),
+        )
+        coEvery {
+            api.items(
+                userId = any(), types = any(), recursive = any(), sortBy = any(),
+                startIndex = any(), limit = any(), parentId = "lib-1", searchTerm = any(),
+            )
+        } returns ItemsResponseDto(items = emptyList())
+        coEvery {
+            api.items(
+                userId = any(), types = any(), recursive = any(), sortBy = any(),
+                startIndex = any(), limit = any(), parentId = "lib-2", searchTerm = any(),
+            )
+        } returns ItemsResponseDto(items = listOf(movieDto("m-1")))
+
+        val viewModel = newViewModel(api)
+        advanceUntilIdle()
+
+        val groups = viewModel.uiState.value.recentlyAddedGroups
+        assertEquals(listOf("lib-2"), groups.map { it.libraryId }, "确实没内容的库不该显示一个空分组标题")
+    }
+
+    // ---- 库里有 8744 集,「最近添加」不带 limit 会一次性拉全量并渲染;现在按库分组,
+    //      每个库各自的请求仍必须带上限,并且用 parentId 限定在这一个库内 ----
+
+    @Test
+    fun `最近添加按库分组时仍带加载上限并限定库范围`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto()
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
+        coEvery { api.userViews(any()) } returns ItemsResponseDto(items = listOf(libraryDto("lib-1", "电视剧")))
+        coEvery {
+            api.items(any(), any(), any(), any(), any(), any(), any(), any())
+        } returns ItemsResponseDto(items = emptyList())
+
+        val viewModel = newViewModel(api)
+        advanceUntilIdle()
+
+        coVerify {
+            api.items(
+                userId = any(), types = "Episode,Movie", recursive = any(),
+                sortBy = "DateCreated", startIndex = any(), limit = 20,
+                parentId = "lib-1", searchTerm = any(),
+            )
+        }
     }
 
     // ================= 缓存优先(离线可用)=================
@@ -211,21 +369,18 @@ class HomeViewModelTest {
         val api = mockk<JellyfinApi>()
         coEvery { api.resume(any()) } throws IOException("Unable to resolve host")
         coEvery { api.nextUp(any(), any()) } throws IOException("Unable to resolve host")
+        coEvery { api.userViews(any()) } throws IOException("Unable to resolve host")
         coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any()) } throws
             IOException("Unable to resolve host")
-        coEvery { api.userViews(any()) } throws IOException("Unable to resolve host")
         return api
     }
 
     @Test
     fun `有缓存时第一次发射就是缓存,不等网络返回`() = runTest(testDispatcher) {
         val api = mockk<JellyfinApi>()
-        // 四个接口都很慢。缓存必须在它们返回之前就已经显示出来。
+        // 接口都很慢。缓存必须在它们返回之前就已经显示出来。
         coEvery { api.resume(any()) } coAnswers { delay(10_000); ItemsResponseDto(items = listOf(episodeDto("net-1"))) }
         coEvery { api.nextUp(any(), any()) } coAnswers { delay(10_000); ItemsResponseDto() }
-        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any()) } coAnswers {
-            delay(10_000); ItemsResponseDto()
-        }
         coEvery { api.userViews(any()) } coAnswers { delay(10_000); ItemsResponseDto() }
 
         val repository = FakeMediaRepository()
@@ -282,7 +437,6 @@ class HomeViewModelTest {
         val api = mockk<JellyfinApi>()
         coEvery { api.resume(any()) } throws IOException("offline")
         coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto(items = listOf(episodeDto("next-1")))
-        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any()) } returns ItemsResponseDto()
         stubNoLibraries(api)
 
         val repository = FakeMediaRepository()
@@ -302,7 +456,6 @@ class HomeViewModelTest {
         val api = mockk<JellyfinApi>()
         coEvery { api.resume(any()) } returns ItemsResponseDto(items = listOf(episodeDto("resume-1")))
         coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
-        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any()) } returns ItemsResponseDto()
         stubNoLibraries(api)
 
         val repository = FakeMediaRepository()

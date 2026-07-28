@@ -10,13 +10,15 @@ package dev.insua.jellycast.network.repository
 object CacheBuckets {
     const val HOME_RESUME = "home.resume"
     const val HOME_NEXT_UP = "home.nextup"
-    const val HOME_RECENTLY_ADDED = "home.recent"
 
     /** 「我的媒体」库入口列表(GET /UserViews)。 */
     const val HOME_LIBRARIES = "home.libraries"
 
     const val LIBRARY_SERIES = "library.series"
     const val LIBRARY_MOVIES = "library.movies"
+
+    /** 某个库的"最近添加"分组——按库分区,而不是首页一条拉全部库混排的扁平列表。 */
+    fun recentlyAddedOf(libraryId: String): String = "home.recent.$libraryId"
 
     /** 某部剧的季列表。 */
     fun seasonsOf(seriesId: String): String = "series.$seriesId.seasons"
