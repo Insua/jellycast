@@ -183,6 +183,7 @@ dependencies {
     implementation(project(":core:subtitle"))
     implementation(project(":core:designsystem"))
     implementation(project(":core:player"))
+    implementation(project(":core:diagnostics"))
     implementation(project(":feature:server"))
     implementation(project(":feature:home"))
     implementation(project(":feature:library"))

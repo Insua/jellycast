@@ -8,6 +8,7 @@ import okio.Path.Companion.toOkioPath
 import coil3.SingletonImageLoader
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import dagger.hilt.android.HiltAndroidApp
+import dev.insua.jellycast.diagnostics.DiagnosticsInstaller
 import dev.insua.jellycast.network.di.TrustAwareHttpClient
 import okhttp3.OkHttpClient
 import javax.inject.Inject
@@ -31,6 +32,18 @@ class JellyCastApp : Application(), SingletonImageLoader.Factory {
     @Inject
     @TrustAwareHttpClient
     lateinit var trustAwareHttpClient: OkHttpClient
+
+    /**
+     * Task 5 / design doc §5:进程启动就把诊断日志的未捕获异常处理器接上,越早越好——晚接上的话,
+     * 早期(比如 DI 图还没建完)崩溃就抓不到,而这恰恰是最难用别的手段复现的一类崩溃。
+     */
+    @Inject
+    lateinit var diagnosticsInstaller: DiagnosticsInstaller
+
+    override fun onCreate() {
+        super.onCreate()
+        diagnosticsInstaller.install()
+    }
 
     override fun newImageLoader(context: PlatformContext): ImageLoader =
         ImageLoader.Builder(context)
