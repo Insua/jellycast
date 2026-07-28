@@ -49,6 +49,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import dev.insua.jellycast.designsystem.ActionMessageHost
 import dev.insua.jellycast.designsystem.OfflineBanner
 import dev.insua.jellycast.designsystem.PosterCard
 import dev.insua.jellycast.model.MediaItem
@@ -106,6 +107,9 @@ fun LibraryScreen(
         onSortByChange = viewModel::setSortBy,
         onSortOrderChange = viewModel::setSortOrder,
         onFiltersChange = viewModel::setFilters,
+        onToggleFavorite = viewModel::toggleFavorite,
+        onTogglePlayed = viewModel::togglePlayed,
+        onActionErrorShown = viewModel::consumeActionError,
     )
 }
 
@@ -134,12 +138,16 @@ fun LibraryScreenContent(
     onSortByChange: (LibrarySortBy) -> Unit = {},
     onSortOrderChange: (LibrarySortOrder) -> Unit = {},
     onFiltersChange: (LibraryFilters) -> Unit = {},
+    onToggleFavorite: (MediaItem) -> Unit = {},
+    onTogglePlayed: (MediaItem) -> Unit = {},
+    onActionErrorShown: () -> Unit = {},
 ) {
     val visible = uiState.visible
 
     // 见 [HomeScreen]:关闭状态是页面级的,不进 ViewModel。
     var offlineNoticeDismissed by rememberSaveable { mutableStateOf(false) }
 
+    Box {
     Column {
         OutlinedTextField(
             value = uiState.query,
@@ -249,6 +257,10 @@ fun LibraryScreenContent(
                         }
                     },
                     modifier = Modifier.testTag(LibraryScreenTestTags.item(mediaItem.id)),
+                    isFavorite = mediaItem.isFavorite,
+                    onToggleFavorite = { onToggleFavorite(mediaItem) },
+                    isPlayed = mediaItem.isPlayed,
+                    onTogglePlayed = { onTogglePlayed(mediaItem) },
                 )
             }
 
@@ -300,6 +312,11 @@ fun LibraryScreenContent(
                 }
             }
         }
+    }
+
+    // 收藏/已看乐观更新失败时的一次性提示——见 [ActionMessageHost] 的 KDoc,故意不嵌第二层
+    // Scaffold。放在最外层 Box 里,盖在 LazyVerticalGrid 之上但不拦截它的点击/滚动手势。
+    ActionMessageHost(message = uiState.actionError, onMessageShown = onActionErrorShown)
     }
 }
 

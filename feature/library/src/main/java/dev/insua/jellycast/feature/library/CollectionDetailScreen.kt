@@ -2,6 +2,7 @@ package dev.insua.jellycast.feature.library
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -23,6 +24,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import dev.insua.jellycast.designsystem.ActionMessageHost
 import dev.insua.jellycast.designsystem.OfflineBanner
 import dev.insua.jellycast.designsystem.PosterCard
 import dev.insua.jellycast.model.MediaItem
@@ -50,6 +52,7 @@ fun CollectionDetailScreen(
 
     var offlineNoticeDismissed by rememberSaveable(collectionId) { mutableStateOf(false) }
 
+    Box {
     Column {
         detail.error?.let { message ->
             Column(
@@ -95,8 +98,15 @@ fun CollectionDetailScreen(
                     onClick = {
                         if (mediaItem.kind == MediaKind.SERIES) onSeriesClick(mediaItem.id) else onPlay(mediaItem)
                     },
+                    isFavorite = mediaItem.isFavorite,
+                    onToggleFavorite = { viewModel.toggleFavorite(mediaItem) },
+                    isPlayed = mediaItem.isPlayed,
+                    onTogglePlayed = { viewModel.togglePlayed(mediaItem) },
                 )
             }
         }
+    }
+
+    ActionMessageHost(message = uiState.actionError, onMessageShown = viewModel::consumeActionError)
     }
 }

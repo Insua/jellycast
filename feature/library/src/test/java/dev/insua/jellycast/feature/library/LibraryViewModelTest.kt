@@ -79,6 +79,20 @@ class LibraryViewModelTest {
     private fun page(vararg names: String) =
         ItemsResponseDto(names.map { seriesDto(it) }, total = 120)
 
+    /**
+     * 收藏/已看的乐观更新测试只关心"缓存里已有的这一条",不关心刷新——网络那一趟故意让它失败,
+     * 这样第一次发射(缓存)之后不会被第二次发射(网络新数据)覆盖掉,断言时读到的就是种进去的
+     * 那一份带着期望初始状态(isFavorite/isPlayed/resumePositionMs)的条目,而不是 [seriesDto]
+     * 默认值(全部 false/0)覆盖后的样子。
+     */
+    private fun defaultApiWithFailingSeriesRefresh(): JellyfinApi {
+        val api = defaultApi()
+        coEvery {
+            api.items(any(), "Series", any(), any(), any(), any(), any(), any(), any(), any(), any(), any())
+        } throws java.io.IOException("offline")
+        return api
+    }
+
     // ---- 修正 §1 场景 1:点击某集时把整季作为队列传出,自动连播依赖它 ----
 
     @Test
@@ -839,5 +853,154 @@ class LibraryViewModelTest {
 
         assertTrue(vm.uiState.value.isOffline, "合集 Tab 有缓存但刷新失败,也应该体现在整体离线横幅上")
         assertEquals(listOf("剧集A"), vm.uiState.value.series.items.map { it.name }, "剧集 Tab 本身仍正常显示")
+    }
+
+    // ================= 收藏 / 已看:乐观更新 + 失败回滚(设计文档 §3.7)=================
+
+    @Test
+    fun `收藏成功时立即乐观更新_网络返回后写透缓存`() = runTest(testDispatcher) {
+        val api = defaultApiWithFailingSeriesRefresh()
+        coEvery { api.addFavorite("series-1", "user-1") } returns Unit
+        val repository = FakeMediaRepository()
+        repository.seed(CacheBuckets.LIBRARY_SERIES, listOf(series("series-1")))
+
+        val viewModel = newViewModel(api, repository = repository)
+        advanceUntilIdle()
+        val target = viewModel.uiState.value.series.items.single { it.id == "series-1" }
+        assertFalse(target.isFavorite)
+
+        viewModel.toggleFavorite(target)
+        // 乐观更新是同步的 state 变更,不需要等协程跑完就该立刻看见。
+        assertTrue(
+            viewModel.uiState.value.series.items.single { it.id == "series-1" }.isFavorite,
+            "点击后必须立刻反映在 UI 上,不等网络返回",
+        )
+
+        advanceUntilIdle()
+        coVerify { api.addFavorite("series-1", "user-1") }
+        assertTrue(viewModel.uiState.value.series.items.single { it.id == "series-1" }.isFavorite)
+        assertEquals(listOf("series-1"), repository.patchedItemIds, "成功要写透缓存,离线时才不会看到收藏状态弹回去")
+        assertNull(viewModel.uiState.value.actionError)
+    }
+
+    @Test
+    fun `收藏失败时回滚乐观更新并提示错误_不写缓存`() = runTest(testDispatcher) {
+        val api = defaultApiWithFailingSeriesRefresh()
+        coEvery { api.addFavorite("series-1", "user-1") } throws java.io.IOException("offline")
+        val repository = FakeMediaRepository()
+        repository.seed(CacheBuckets.LIBRARY_SERIES, listOf(series("series-1")))
+
+        val viewModel = newViewModel(api, repository = repository)
+        advanceUntilIdle()
+        val target = viewModel.uiState.value.series.items.single { it.id == "series-1" }
+
+        viewModel.toggleFavorite(target)
+        advanceUntilIdle()
+
+        assertFalse(
+            viewModel.uiState.value.series.items.single { it.id == "series-1" }.isFavorite,
+            "失败必须回滚——停在乐观更新的状态,下次刷新又变回去,比现在直接报错更让人困惑",
+        )
+        assertNotNull(viewModel.uiState.value.actionError, "失败要可见地告诉用户,不能静默复原")
+        assertTrue(repository.patchedItemIds.isEmpty(), "失败不该写透缓存")
+    }
+
+    @Test
+    fun `取消收藏调用DELETE接口`() = runTest(testDispatcher) {
+        val api = defaultApiWithFailingSeriesRefresh()
+        coEvery { api.removeFavorite("series-1", "user-1") } returns Unit
+        val repository = FakeMediaRepository()
+        repository.seed(CacheBuckets.LIBRARY_SERIES, listOf(series("series-1").copy(isFavorite = true)))
+
+        val viewModel = newViewModel(api, repository = repository)
+        advanceUntilIdle()
+        val target = viewModel.uiState.value.series.items.single { it.id == "series-1" }
+
+        viewModel.toggleFavorite(target)
+        advanceUntilIdle()
+
+        coVerify { api.removeFavorite("series-1", "user-1") }
+        assertFalse(viewModel.uiState.value.series.items.single { it.id == "series-1" }.isFavorite)
+    }
+
+    @Test
+    fun `标记已看成功时清零听过进度并写透缓存`() = runTest(testDispatcher) {
+        val api = defaultApiWithFailingSeriesRefresh()
+        coEvery { api.markPlayed("series-1", "user-1") } returns Unit
+        val repository = FakeMediaRepository()
+        repository.seed(CacheBuckets.LIBRARY_SERIES, listOf(series("series-1").copy(resumePositionMs = 60_000)))
+
+        val viewModel = newViewModel(api, repository = repository)
+        advanceUntilIdle()
+        val target = viewModel.uiState.value.series.items.single { it.id == "series-1" }
+
+        viewModel.togglePlayed(target)
+        val optimistic = viewModel.uiState.value.series.items.single { it.id == "series-1" }
+        assertTrue(optimistic.isPlayed)
+        assertEquals(0L, optimistic.resumePositionMs, "标为已看后不该继续显示一条听了一半的进度条,UI 不能自相矛盾")
+
+        advanceUntilIdle()
+        coVerify { api.markPlayed("series-1", "user-1") }
+        assertEquals(listOf("series-1"), repository.patchedItemIds)
+    }
+
+    @Test
+    fun `标记已看失败时把已看状态与听过进度一起回滚`() = runTest(testDispatcher) {
+        val api = defaultApiWithFailingSeriesRefresh()
+        coEvery { api.markPlayed("series-1", "user-1") } throws java.io.IOException("offline")
+        val repository = FakeMediaRepository()
+        repository.seed(CacheBuckets.LIBRARY_SERIES, listOf(series("series-1").copy(resumePositionMs = 60_000)))
+
+        val viewModel = newViewModel(api, repository = repository)
+        advanceUntilIdle()
+        val target = viewModel.uiState.value.series.items.single { it.id == "series-1" }
+
+        viewModel.togglePlayed(target)
+        advanceUntilIdle()
+
+        val rolledBack = viewModel.uiState.value.series.items.single { it.id == "series-1" }
+        assertFalse(rolledBack.isPlayed)
+        assertEquals(60_000L, rolledBack.resumePositionMs, "回滚要把进度也还原,不能只回滚 isPlayed 留下自相矛盾的状态")
+        assertNotNull(viewModel.uiState.value.actionError)
+    }
+
+    @Test
+    fun `取消已看调用DELETE接口`() = runTest(testDispatcher) {
+        val api = defaultApiWithFailingSeriesRefresh()
+        coEvery { api.markUnplayed("series-1", "user-1") } returns Unit
+        val repository = FakeMediaRepository()
+        repository.seed(CacheBuckets.LIBRARY_SERIES, listOf(series("series-1").copy(isPlayed = true)))
+
+        val viewModel = newViewModel(api, repository = repository)
+        advanceUntilIdle()
+        val target = viewModel.uiState.value.series.items.single { it.id == "series-1" }
+
+        viewModel.togglePlayed(target)
+        advanceUntilIdle()
+
+        coVerify { api.markUnplayed("series-1", "user-1") }
+        assertFalse(viewModel.uiState.value.series.items.single { it.id == "series-1" }.isPlayed)
+    }
+
+    @Test
+    fun `收藏切换同步更新剧集详情里的同一集`() = runTest(testDispatcher) {
+        val api = defaultApi()
+        coEvery { api.seasons("series-1", "user-1") } returns
+            ItemsResponseDto(items = listOf(seasonDto("season-1", 1)))
+        coEvery { api.episodes("series-1", "season-1", "user-1") } returns
+            ItemsResponseDto(items = listOf(episodeDto("e1", 1, 1)))
+        coEvery { api.addFavorite("e1", "user-1") } returns Unit
+
+        val viewModel = newViewModel(api)
+        viewModel.openSeries("series-1")
+        advanceUntilIdle()
+
+        val episode = viewModel.uiState.value.detail!!.episodes.single { it.id == "e1" }
+        viewModel.toggleFavorite(episode)
+
+        assertTrue(
+            viewModel.uiState.value.detail!!.episodes.single { it.id == "e1" }.isFavorite,
+            "剧集详情页里的这一集也要立刻反映乐观更新,不能只改浏览列表",
+        )
     }
 }

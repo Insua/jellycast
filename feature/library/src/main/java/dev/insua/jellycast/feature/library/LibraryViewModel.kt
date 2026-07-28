@@ -169,6 +169,12 @@ data class LibraryUiState(
     val collectionDetail: CollectionDetailUiState? = null,
     /** 当前可见的浏览列表显示的是缓存、且这次刷新没成功。 */
     val isOffline: Boolean = false,
+    /**
+     * 收藏/已看乐观更新失败时给用户看的一次性提示(见 [LibraryViewModel.toggleFavorite]/
+     * [LibraryViewModel.togglePlayed])。[LibraryScreen] 用 `ActionMessageHost` 显示一次后
+     * 调 [LibraryViewModel.consumeActionError] 清空,不然重组会重复弹出同一条。
+     */
+    val actionError: String? = null,
 ) {
     val isSearching: Boolean get() = query.isNotBlank()
 
@@ -483,6 +489,92 @@ class LibraryViewModel @Inject constructor(
         _uiState.value.collectionDetail?.collectionId?.let { openCollection(it) }
     }
 
+    /** [LibraryUiState.actionError] 显示过一次后由 [LibraryScreen] 调这个清空。 */
+    fun consumeActionError() {
+        _uiState.update { it.copy(actionError = null) }
+    }
+
+    /**
+     * 收藏 / 取消收藏(设计文档 §3.7)。**乐观更新**:先同步改 [item] 在浏览列表/搜索结果/
+     * 剧集详情/合集详情里所有出现的那一份(见 [mutateItem]),点击立刻有反馈,不等网络。
+     *
+     * 成功:调 [MediaRepository.patchItem] 把这份状态写透缓存——否则下次离线打开,缓存里
+     * 还是收藏前的旧值,乐观更新等于白做(见类 KDoc 对缓存交互的要求)。
+     * 失败:把[item]**原样**改回去(它是闭包捕获的、切换前的快照,天然就是"回滚目标"),
+     * 并把 [LibraryUiState.actionError] 置位——一个静默复原的收藏比明确报错更让人困惑
+     * (下次刷新前用户会一直以为收藏成功了)。绝不写缓存:半途而废的乐观状态不该落盘。
+     */
+    fun toggleFavorite(item: MediaItem) {
+        val target = !item.isFavorite
+        mutateItem(item.id) { it.copy(isFavorite = target) }
+        viewModelScope.launch {
+            val result = runCatching {
+                val userId = session.userId()
+                if (target) api.addFavorite(item.id, userId) else api.removeFavorite(item.id, userId)
+            }
+            if (result.isSuccess) {
+                repository.patchItem(item.id) { it.copy(isFavorite = target) }
+            } else {
+                mutateItem(item.id) { item }
+                _uiState.update {
+                    it.copy(actionError = if (target) "收藏失败,请重试" else "取消收藏失败,请重试")
+                }
+            }
+        }
+    }
+
+    /**
+     * 标记已看 / 未看(设计文档 §3.7)。同 [toggleFavorite] 的乐观更新 + 失败回滚模式,
+     * 多一步:标为已看时**同时把 [MediaItem.resumePositionMs] 清零**——服务端的
+     * `POST UserPlayedItems` 语义就是"这一集听完了",继续显示一条听了一半的进度条会让 UI
+     * 自相矛盾(铁律:标记已看不能让界面自己打自己脸)。标为未看不去猜一个新的进度,原样保留。
+     *
+     * 未看数角标(季/剧集级别的 `UnplayedItemCount`)是服务端聚合出来的,单条集的已看状态变化
+     * 不在客户端重新计算它——那需要知道"这一集属于哪一季/剧"并重新拉一次父级聚合,成本远超
+     * 这个操作本身。留给"该 bucket 的下一次自然刷新"去更新(任务说明里明确允许这个取舍)。
+     */
+    fun togglePlayed(item: MediaItem) {
+        val target = !item.isPlayed
+        mutateItem(item.id) { it.copy(isPlayed = target, resumePositionMs = if (target) 0L else it.resumePositionMs) }
+        viewModelScope.launch {
+            val result = runCatching {
+                val userId = session.userId()
+                if (target) api.markPlayed(item.id, userId) else api.markUnplayed(item.id, userId)
+            }
+            if (result.isSuccess) {
+                repository.patchItem(item.id) {
+                    it.copy(isPlayed = target, resumePositionMs = if (target) 0L else it.resumePositionMs)
+                }
+            } else {
+                // item 是切换前的快照——原样放回去,连听过进度一起回滚,不留半改的矛盾状态。
+                mutateItem(item.id) { item }
+                _uiState.update {
+                    it.copy(actionError = if (target) "标记已看失败,请重试" else "标记未看失败,请重试")
+                }
+            }
+        }
+    }
+
+    /**
+     * 把 [transform] 应用到 [itemId] 在**当前 UI 状态**里出现的每一处:三个浏览列表、搜索结果、
+     * 剧集详情的集列表、合集详情的条目列表——收藏/已看是条目自身的属性,同一个条目可能同时出现
+     * 在好几处(比如"搜索结果"和"剧集详情"),都要保持一致,不能只改点击发生的那一处。
+     */
+    private fun mutateItem(itemId: String, transform: (MediaItem) -> MediaItem) {
+        _uiState.update { state ->
+            state.copy(
+                series = state.series.mapItems(itemId, transform),
+                movies = state.movies.mapItems(itemId, transform),
+                collections = state.collections.mapItems(itemId, transform),
+                searchResults = state.searchResults.mapItems(itemId, transform),
+                detail = state.detail?.copy(episodes = state.detail.episodes.replaceIfMatches(itemId, transform)),
+                collectionDetail = state.collectionDetail?.copy(
+                    items = state.collectionDetail.items.replaceIfMatches(itemId, transform),
+                ),
+            )
+        }
+    }
+
     /**
      * 合集内的直接子条目:`parentId` 定位到这个合集,`recursive=false` 只要直接子项
      * (合集本身可能混装电影和整部剧集,不需要也不应该展开到季/集那一层)。
@@ -668,3 +760,11 @@ class LibraryViewModel @Inject constructor(
         }
     }
 }
+
+/** [LibraryViewModel.mutateItem] 用:某个分页列表里,把命中 id 的那一条换成 [transform] 的结果。 */
+private fun PageState<MediaItem>.mapItems(itemId: String, transform: (MediaItem) -> MediaItem): PageState<MediaItem> =
+    copy(items = items.replaceIfMatches(itemId, transform))
+
+/** [LibraryViewModel.mutateItem] 用:普通列表(季/集、合集条目)里同样的替换语义。 */
+private fun List<MediaItem>.replaceIfMatches(itemId: String, transform: (MediaItem) -> MediaItem): List<MediaItem> =
+    map { if (it.id == itemId) transform(it) else it }
