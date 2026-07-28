@@ -48,6 +48,16 @@ interface MediaRepository {
 
     /** 分页列表的**第一页**。第二页起不走缓存(见 [ItemPage.total] 的说明)。 */
     fun pagedBucket(bucket: String, fetch: suspend () -> ItemPage): Flow<Cached<ItemPage>>
+
+    /**
+     * 就地改写某个条目在**所有**已缓存 bucket 里的那一行(用 [transform] 变换),不整体替换
+     * 任何 bucket、不触碰 `cache_bucket_meta`。收藏/已看这类"属于条目本身、可能同时出现在多个
+     * 列表里"的状态用这个——乐观更新时不知道也不需要知道 itemId 具体落在哪些 bucket。
+     *
+     * 找不到激活服务器,或这个条目当前根本不在任何缓存里,都安静地什么都不做——**不是错误**,
+     * 调用方(ViewModel)只是把它当"写透缓存"的一步,乐观更新本身已经改了内存态的 UI。
+     */
+    suspend fun patchItem(itemId: String, transform: (MediaItem) -> MediaItem)
 }
 
 /**
@@ -104,6 +114,20 @@ class CachingMediaRepository(
             fetch = fetch,
             writeThrough = { page -> resolvedServerId?.let { writeThrough(it, bucket, page.items) } },
         )
+    }
+
+    override suspend fun patchItem(itemId: String, transform: (MediaItem) -> MediaItem) {
+        // 找不到激活服务器就安静跳过——和 bucket()/pagedBucket() 读缓存那一步的取舍一致
+        // (见类 KDoc):不知道该改哪台服务器名下的缓存,宁可不改。
+        val serverId = runCatching { session.serverId() }.getOrNull() ?: return
+        val rows = dao.findByItemId(serverId, itemId)
+        if (rows.isEmpty()) return
+        val now = System.currentTimeMillis()
+        val updated = rows.mapNotNull { row ->
+            val item = CachedItemPayload.decode(row.payloadJson) ?: return@mapNotNull null
+            row.copy(payloadJson = CachedItemPayload.encode(transform(item)), updatedAt = now)
+        }
+        if (updated.isNotEmpty()) dao.insertAll(updated)
     }
 
     /**

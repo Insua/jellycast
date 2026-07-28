@@ -47,6 +47,10 @@ import kotlinx.serialization.Serializable
     // `jq '.components.schemas.UserItemDataDto.properties | keys[] | select(test("unplayed";"i"))'`
     // → "UnplayedItemCount"(驼峰全大写开头,和本文件其余字段一致)。
     @SerialName("UnplayedItemCount") val unplayedItemCount: Int? = null,
+    // 收藏状态。核对同上一批(2026-07-28):
+    // `jq '.components.schemas.UserItemDataDto.properties | keys[] | select(test("favorit";"i"))'`
+    // → "IsFavorite"。
+    @SerialName("IsFavorite") val isFavorite: Boolean = false,
 )
 
 @Serializable data class MediaStreamDto(

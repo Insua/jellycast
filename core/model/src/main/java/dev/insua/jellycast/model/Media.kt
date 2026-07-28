@@ -22,6 +22,10 @@ data class MediaItem(
     // 未看集数(UserItemDataDto.UnplayedItemCount)——只对"最近添加"里的剧集条目有意义,
     // null 表示服务端没给这个字段,0 表示确实没有未看,两者都不该画角标(由 UI 层判断)。
     val unplayedItemCount: Int? = null,
+    // 收藏 / 已看状态(UserItemDataDto.IsFavorite / Played)。默认 false——服务端没给
+    // UserData 时(理论上不该发生,但防御性地)不冒充"已收藏"/"已看"。
+    val isFavorite: Boolean = false,
+    val isPlayed: Boolean = false,
 )
 
 /** 播放页展示用的标题组合 */

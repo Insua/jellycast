@@ -34,6 +34,10 @@ internal data class CachedItemPayloadV1(
     val resumePositionMs: Long = 0L,
     val imageTag: String? = null,
     val unplayedItemCount: Int? = null,
+    // 收藏 / 已看:同样只增不改,默认值让老缓存(没有这两个字段的行)照常解码成"未收藏/未看",
+    // 而不是解析失败。
+    val isFavorite: Boolean = false,
+    val isPlayed: Boolean = false,
 )
 
 internal object CachedItemPayload {
@@ -55,6 +59,8 @@ internal object CachedItemPayload {
             resumePositionMs = item.resumePositionMs,
             imageTag = item.imageTag,
             unplayedItemCount = item.unplayedItemCount,
+            isFavorite = item.isFavorite,
+            isPlayed = item.isPlayed,
         ),
     )
 
@@ -77,6 +83,8 @@ internal object CachedItemPayload {
             resumePositionMs = payload.resumePositionMs,
             imageTag = payload.imageTag,
             unplayedItemCount = payload.unplayedItemCount,
+            isFavorite = payload.isFavorite,
+            isPlayed = payload.isPlayed,
         )
     }.getOrNull()
 }

@@ -133,4 +133,26 @@ class MediaItemMapperTest {
         val dto = BaseItemDto(id = "e1", name = "E1", type = "Episode", userData = null)
         assertNull(dto.toMediaItem()?.unplayedItemCount)
     }
+
+    // ---- 收藏 / 已看:UserItemDataDto.IsFavorite / Played(核对见 UserDataDto 上的注释)----
+
+    @Test
+    fun `IsFavorite 映射到 isFavorite`() {
+        val dto = BaseItemDto(id = "e1", name = "E1", type = "Episode", userData = UserDataDto(isFavorite = true))
+        assertEquals(true, dto.toMediaItem()?.isFavorite)
+    }
+
+    @Test
+    fun `Played 映射到 isPlayed`() {
+        val dto = BaseItemDto(id = "e1", name = "E1", type = "Episode", userData = UserDataDto(played = true))
+        assertEquals(true, dto.toMediaItem()?.isPlayed)
+    }
+
+    @Test
+    fun `没有 UserData 时 isFavorite 与 isPlayed 均为 false`() {
+        val dto = BaseItemDto(id = "e1", name = "E1", type = "Episode", userData = null)
+        val item = dto.toMediaItem()
+        assertEquals(false, item?.isFavorite)
+        assertEquals(false, item?.isPlayed)
+    }
 }

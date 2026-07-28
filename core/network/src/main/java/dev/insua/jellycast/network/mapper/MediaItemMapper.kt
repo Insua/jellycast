@@ -34,6 +34,8 @@ fun BaseItemDto.toMediaItem(): MediaItem? {
         resumePositionMs = (userData?.positionTicks ?: 0L) / TICKS_PER_MS,
         imageTag = imageTags?.get("Primary"),
         unplayedItemCount = userData?.unplayedItemCount,
+        isFavorite = userData?.isFavorite ?: false,
+        isPlayed = userData?.played ?: false,
     )
 }
 

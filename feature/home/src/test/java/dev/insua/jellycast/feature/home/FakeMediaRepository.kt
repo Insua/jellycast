@@ -22,6 +22,9 @@ class FakeMediaRepository : MediaRepository {
     /** 每一次写回缓存,用来断言"网络成功才写库"。 */
     val writes = mutableListOf<Pair<String, List<MediaItem>>>()
 
+    /** 每一次 [patchItem] 调用改到的 itemId,用来断言"乐观更新确实写透了缓存"。 */
+    val patchedItemIds = mutableListOf<String>()
+
     /** 预置"上次成功刷新留下的缓存"。 */
     fun seed(bucket: String, items: List<MediaItem>) {
         cache[bucket] = items
@@ -47,4 +50,11 @@ class FakeMediaRepository : MediaRepository {
                 writes += bucket to page.items
             },
         )
+
+    override suspend fun patchItem(itemId: String, transform: (MediaItem) -> MediaItem) {
+        patchedItemIds += itemId
+        for ((bucket, items) in cache) {
+            cache[bucket] = items.map { if (it.id == itemId) transform(it) else it }
+        }
+    }
 }
