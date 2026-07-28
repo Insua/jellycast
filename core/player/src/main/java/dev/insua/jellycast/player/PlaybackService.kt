@@ -44,8 +44,8 @@ import javax.inject.Inject
  * ⚠️ 修正 §1(a)/(b)(已闭合):[exoPlayer] / [playbackEngine] / [autoPlayNextController] /
  * [jellyfinSession] 全部经 Hilt 的 `PlayerModule`(见 `di/PlayerModule.kt`)装配注入,不再是
  * "写好了但没有生产调用方"的死代码——[onCreate] 直接把注入到手的 [playbackEngine] 交给
- * [EngineSeekRouter](原先经一个可空的 `engine` 字段 + `bindEngine()` 间接绕一手,注入本身已经
- * 保证非空,这层间接是多余的,已删除),它就是
+ * [EngineSeekRouter] / [EngineQueueNavigator](原先经一个可空的 `engine` 字段 + `bindEngine()`
+ * 间接绕一手,注入本身已经保证非空,这层间接是多余的,已删除),它就是
  * [Player.STATE_ENDED] 那一刻驱动自动连播的同一个实例,和 `exoPlayer` 也是同一个单例
  * (见 `PlayerModule.provideExoPlayer` 的 KDoc)。
  *
@@ -136,14 +136,25 @@ class PlaybackService : MediaSessionService() {
     override fun onCreate() {
         super.onCreate()
 
-        // 唯一的登录用户 id 来源:自动连播(下方 playbackEndedAdvancer)读取失败(未登录/断网)时
-        // 安全地返回 null,调用方静默降级(不连播),不向上抛错(铁律 3/4 的同一条精神)。
+        // 唯一的登录用户 id 来源:自动连播(下方 playbackEndedAdvancer)和上一集/下一集
+        // (queueNavigator)都要用同一份——读取失败(未登录/断网)时安全地返回 null,
+        // 调用方各自静默降级(不连播 / 不切集),不向上抛错(铁律 3/4 的同一条精神)。
         val userIdProvider: suspend () -> String? = { runCatching { jellyfinSession.userId() }.getOrNull() }
 
         // 生产实现见 EngineSeekRouter 的类注释:连点快进/拖动进度条在这里被合并(seek 防抖),
         // 只有最后一次真正触发 AudioPlaybackEngine.seekTo,避免群晖 J4125 上堆孤儿转码任务
         // (也就避免了"连点后偶发弹出「该条目无法播放」"那个竞态,见 SeekCoalescingTest)。
         val router = EngineSeekRouter(playbackEngine, serviceScope)
+
+        // 设计文档 §3.3:不给 Media3 塞假播放列表(会和"每次重新 resolve"冲突),让
+        // SeekInterceptingPlayer 按 PlayQueue 的真实状态声明/执行上一集下一集命令,通知栏/锁屏/
+        // 蓝牙/车机才会显示出这两个按钮。
+        val queueNavigator = EngineQueueNavigator(
+            playQueue = playQueue,
+            engine = playbackEngine,
+            userIdProvider = userIdProvider,
+            scope = serviceScope,
+        )
 
         // 复审 Critical 1:交给 MediaSession 的这个 Player 必须报**条目内绝对位置**和**元数据总时长**。
         // 锁屏/通知栏/蓝牙的进度条与快进快退全部读它;底层 ExoPlayer 报的是转码流内的相对位置
@@ -154,6 +165,7 @@ class PlaybackService : MediaSessionService() {
             exoPlayer,
             router,
             playbackEngine.asAbsoluteTimeline { playQueue.current.value?.runTimeMs },
+            queueNavigator,
         )
         mediaSession = MediaSession.Builder(this, sessionPlayer).build()
 

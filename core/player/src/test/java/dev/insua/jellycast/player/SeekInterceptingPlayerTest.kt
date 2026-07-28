@@ -246,4 +246,93 @@ class SeekInterceptingPlayerTest {
         assertTrue(preparedUrls.last().contains("startTimeTicks=0"), preparedUrls.last())
         assertTrue(engine.state.value is PlaybackEngineState.Ready)
     }
+
+    // ---- 设计文档 §3.3:上一集/下一集,按 QueueNavigator 的真实状态加/删命令,委派执行 ----
+
+    private fun fakeNavigator(hasNext: Boolean = false, hasPrevious: Boolean = false) = object : QueueNavigator {
+        var nextCalled = false
+        var previousCalled = false
+        var hasNextQueried = false
+        var hasPreviousQueried = false
+        override fun hasNext(): Boolean { hasNextQueried = true; return hasNext }
+        override fun hasPrevious(): Boolean { hasPreviousQueried = true; return hasPrevious }
+        override fun next() { nextCalled = true }
+        override fun previous() { previousCalled = true }
+    }
+
+    /**
+     * ⚠️ 这里**不**通过构造 `Player.Commands`(`Builder().add(...).build()`)再 `.contains()` 回读来
+     * 断言 [SeekInterceptingPlayer.getAvailableCommands] 的结果——排查过:`Player.Commands.Builder`
+     * 内部用 `android.util.SparseBooleanArray`(真实 Android 框架类)存储,在本模块
+     * `testOptions.unitTests.isReturnDefaultValues = true` 的纯 JVM 环境下,它的 `add`/`get` 全是
+     * 静默空桩(不抛异常,但也不真的存东西),`.build()` 出来的 `Commands` 无论加没加过命令,
+     * `.contains()` 永远回 `false`——这一层测出来的只会是假阳性/假阴性,和 `Uri.parse` 是同一类
+     * 环境限制([PlaybackDisplayMetadata] 的类注释)。
+     *
+     * 能在这个环境里可靠验证的是**接线本身**:[SeekInterceptingPlayer.getAvailableCommands] 有没有
+     * 真的去问 [QueueNavigator] 的 `hasNext()`/`hasPrevious()`。真实的"加没加对命令"这件事留给
+     * `buildUpon()`/`add()`/`remove()` 这几个已经过 `javap` 核对过字节码的标准 Media3 API
+     * (真机/流体云验收项)。
+     */
+    @Test fun `getAvailableCommands 会查询 QueueNavigator 的 hasNext 和 hasPrevious`() {
+        val underlying = mockk<Player>(relaxed = true)
+        val navigator = fakeNavigator(hasNext = true, hasPrevious = false)
+        val sessionPlayer = SeekInterceptingPlayer(underlying, SeekRouter { }, queueNavigator = navigator)
+
+        sessionPlayer.availableCommands
+
+        assertTrue(navigator.hasNextQueried, "getAvailableCommands 应该查询 QueueNavigator.hasNext()")
+        assertTrue(navigator.hasPreviousQueried, "getAvailableCommands 应该查询 QueueNavigator.hasPrevious()")
+    }
+
+    @Test fun `没有接 QueueNavigator 时(默认 None)hasNext hasPrevious 恒为 false,不会抛异常`() {
+        val underlying = mockk<Player>(relaxed = true)
+        val sessionPlayer = SeekInterceptingPlayer(underlying, SeekRouter { })
+
+        sessionPlayer.availableCommands // 不应该抛异常
+
+        assertTrue(!QueueNavigator.None.hasNext())
+        assertTrue(!QueueNavigator.None.hasPrevious())
+    }
+
+    @Test fun `seekToNextMediaItem 委派给 QueueNavigator,不落到底层 player`() {
+        val underlying = mockk<Player>(relaxed = true)
+        val navigator = fakeNavigator(hasNext = true)
+        val sessionPlayer = SeekInterceptingPlayer(underlying, SeekRouter { }, queueNavigator = navigator)
+
+        sessionPlayer.seekToNextMediaItem()
+
+        assertTrue(navigator.nextCalled)
+        verify(exactly = 0) { underlying.seekToNextMediaItem() }
+    }
+
+    @Test fun `seekToPreviousMediaItem 委派给 QueueNavigator,不落到底层 player`() {
+        val underlying = mockk<Player>(relaxed = true)
+        val navigator = fakeNavigator(hasPrevious = true)
+        val sessionPlayer = SeekInterceptingPlayer(underlying, SeekRouter { }, queueNavigator = navigator)
+
+        sessionPlayer.seekToPreviousMediaItem()
+
+        assertTrue(navigator.previousCalled)
+        verify(exactly = 0) { underlying.seekToPreviousMediaItem() }
+    }
+
+    /**
+     * ⚠️ 接上 QueueNavigator 之后必须重新确认:`seekToPrevious()`(不带 MediaItem 后缀)的语义
+     * 完全不受影响——它和 `seekToPreviousMediaItem()` 是两个不同的方法、两套不同的语义
+     * (类顶部 KDoc:非直播场景下"回到本集开头",不是"切到上一条队列项")。即使队列里确实有上一条
+     * (`hasPrevious() == true`),`seekToPrevious()` 也绝不能被新加的队列导航接管。
+     */
+    @Test fun `新增队列导航后,seekToPrevious 语义不变 —— 仍是 seek 到 0,不会被 QueueNavigator 接管`() {
+        val underlying = mockk<Player>(relaxed = true)
+        val seen = mutableListOf<Long>()
+        val navigator = fakeNavigator(hasPrevious = true)
+        val sessionPlayer = SeekInterceptingPlayer(underlying, SeekRouter { seen += it }, queueNavigator = navigator)
+
+        sessionPlayer.seekToPrevious()
+
+        assertEquals(listOf(0L), seen)
+        assertTrue(!navigator.previousCalled, "seekToPrevious()(不带 MediaItem 后缀)不该被队列导航接管")
+        verify(exactly = 0) { underlying.seekToPrevious() }
+    }
 }

@@ -23,6 +23,9 @@ class PlayQueue {
 
     fun hasNext(): Boolean = index >= 0 && index < items.lastIndex
 
+    /** 见 [QueueNavigator]:上一集按钮的可用性判定,不移动游标。 */
+    fun hasPrevious(): Boolean = index > 0
+
     fun next(): MediaItem? {
         if (!hasNext()) return null
         index++

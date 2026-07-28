@@ -30,6 +30,13 @@ class PlayQueueTest {
         assertFalse(q.hasNext())
     }
 
+    @Test fun `hasPrevious 在第一项返回 false,推进后返回 true`() {
+        val q = PlayQueue().apply { setQueue(listOf(ep("1"), ep("2")), 0) }
+        assertFalse(q.hasPrevious())
+        q.next()
+        assertTrue(q.hasPrevious())
+    }
+
     @Test fun `空队列不崩溃`() {
         val q = PlayQueue().apply { setQueue(emptyList(), 0) }
         assertNull(q.current.value)
