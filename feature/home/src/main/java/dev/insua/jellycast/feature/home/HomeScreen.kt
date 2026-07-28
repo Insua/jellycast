@@ -17,10 +17,17 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AccountCircle
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -45,6 +52,9 @@ import dev.insua.jellycast.network.mapper.posterUrl
 /** 定位节点用的测试标签,不依赖文案(文案会改)。 */
 object HomeScreenTestTags {
     const val ERROR_RETRY = "home_error_retry"
+    const val TOP_BAR = "home_top_bar"
+    const val SEARCH_BUTTON = "home_top_bar_search"
+    const val ACCOUNT_BUTTON = "home_top_bar_account"
     const val TAB_ROW = "home_tab_row"
     const val FAVORITES_EMPTY = "home_favorites_empty"
 }
@@ -63,11 +73,18 @@ object HomeScreenTestTags {
  * [baseUrl] 是当前激活服务器的接入地址,用于拼封面 URL([dev.insua.jellycast.network.mapper.posterUrl]);
  * 默认空串——:feature:home 目前还没有接入"当前激活服务器"的会话解析(Task 22 导航装配的职责),
  * 空串时不拼 URL,PosterCard 走占位背景兜底,不会拼出一个必 404 的地址。
+ *
+ * [onSearchClick]/[onAccountClick] 是顶部栏(设计文档 §3.6)搜索/账户入口的回调,默认空实现——
+ * 本模块不认识具体路由,导航层(v1 期间是"跳进媒体库页"/"跳进设置页",两处都已经有对应功能:
+ * 媒体库页自带搜索框、设置页自带服务器管理入口)决定点了之后去哪。参照的是 Jellyfin Web mobile
+ * 的结构与信息层级,不是配色——App 仍是浅色主题。
  */
 @Composable
 fun HomeScreen(
     onItemClick: (MediaItem) -> Unit,
     onLibraryClick: (String) -> Unit = {},
+    onSearchClick: () -> Unit = {},
+    onAccountClick: () -> Unit = {},
     baseUrl: String = "",
     viewModel: HomeViewModel = hiltViewModel(),
 ) {
@@ -79,6 +96,8 @@ fun HomeScreen(
 
     Box {
     Column(modifier = Modifier.padding(vertical = 8.dp)) {
+        HomeTopBar(onSearchClick = onSearchClick, onAccountClick = onAccountClick)
+
         // 顶部标签(设计文档 §3.6):首页信息流 / 我的最爱。切标签不触发新请求——两份数据
         // 已经在 [HomeViewModel.load] 里并发取好,这里只是本地状态切换。
         TabRow(
@@ -133,6 +152,33 @@ fun HomeScreen(
 
     ActionMessageHost(message = uiState.actionError, onMessageShown = viewModel::consumeActionError)
     }
+}
+
+/**
+ * 顶部栏(设计文档 §3.6):App 身份(名称)+ 搜索入口 + 账户入口。参照的是 Jellyfin Web mobile
+ * 的结构——一行放"你在哪个 App"和两个跳转口子,不是它的深色配色,JellyCast 全程保持浅色。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun HomeTopBar(onSearchClick: () -> Unit, onAccountClick: () -> Unit) {
+    TopAppBar(
+        title = { Text("JellyCast") },
+        actions = {
+            IconButton(
+                onClick = onSearchClick,
+                modifier = Modifier.testTag(HomeScreenTestTags.SEARCH_BUTTON),
+            ) {
+                Icon(Icons.Filled.Search, contentDescription = "搜索")
+            }
+            IconButton(
+                onClick = onAccountClick,
+                modifier = Modifier.testTag(HomeScreenTestTags.ACCOUNT_BUTTON),
+            ) {
+                Icon(Icons.Filled.AccountCircle, contentDescription = "账户")
+            }
+        },
+        modifier = Modifier.testTag(HomeScreenTestTags.TOP_BAR),
+    )
 }
 
 @Composable

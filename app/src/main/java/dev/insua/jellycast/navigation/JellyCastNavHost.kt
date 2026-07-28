@@ -145,6 +145,17 @@ fun JellyCastNavHost(
                         sessionViewModel.play(item, listOf(item))
                         playerExpanded = true
                     },
+                    // 搜索入口跳进媒体库页——搜索框本来就长在那里(见 LibraryScreen 的
+                    // LibraryScreenTestTags.SEARCH_FIELD),顶部栏这里不重新实现一遍搜索。
+                    onSearchClick = {
+                        navController.navigate(Routes.LIBRARY) {
+                            popUpTo(Routes.HOME) { saveState = true }
+                            launchSingleTop = true
+                            restoreState = true
+                        }
+                    },
+                    // 账户入口跳进设置页——服务器管理(登录态/账号切换)本来就在那里。
+                    onAccountClick = { navController.navigate(Routes.SETTINGS) },
                     baseUrl = baseUrl,
                 )
             }
