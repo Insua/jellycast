@@ -14,6 +14,10 @@ object CacheBuckets {
     /** 「我的媒体」库入口列表(GET /UserViews)。 */
     const val HOME_LIBRARIES = "home.libraries"
 
+    /** 「我的最爱」标签页(GET /Items?isFavorite=true)——首页顶部与 [LIBRARY_SERIES] 等浏览列表
+     *  互不相干的独立分区,故独立成一个 bucket,不复用任何既有 key。 */
+    const val HOME_FAVORITES = "home.favorites"
+
     const val LIBRARY_SERIES = "library.series"
     const val LIBRARY_MOVIES = "library.movies"
     const val LIBRARY_COLLECTIONS = "library.collections"

@@ -51,6 +51,9 @@ class MediaRepositoryTest {
         override suspend fun hasRefreshedBucket(serverId: String, bucket: String): Boolean =
             (serverId to bucket) in refreshedBuckets
 
+        override suspend fun findByItemId(serverId: String, itemId: String): List<CachedItemEntity> =
+            rows.value.filterKeys { it.first == serverId }.values.flatten().filter { it.itemId == itemId }
+
         override suspend fun replaceBucket(
             serverId: String,
             bucket: String,
@@ -66,7 +69,17 @@ class MediaRepositoryTest {
             rows.value = rows.value - (serverId to bucket)
         }
 
-        override suspend fun insertAll(items: List<CachedItemEntity>) = Unit
+        // 真实 DAO 用 OnConflictStrategy.REPLACE:同一 (serverId, bucket, itemId) 的行原地替换,
+        // 不是简单追加——patchItem 就是靠这条语义把改好的 payload 写回原来的行。
+        override suspend fun insertAll(items: List<CachedItemEntity>) {
+            var next = rows.value
+            for (item in items) {
+                val key = item.serverId to item.bucket
+                val existing = next[key].orEmpty()
+                next = next + (key to (existing.filterNot { it.itemId == item.itemId } + item))
+            }
+            rows.value = next
+        }
 
         override suspend fun upsertBucketMeta(meta: CacheBucketMetaEntity) {
             refreshedBuckets += meta.serverId to meta.bucket
@@ -405,6 +418,47 @@ class MediaRepositoryTest {
 
         assertTrue(sawCancellation, "取消必须以 CancellationException 的形式穿过仓储,不能被吞成一次'刷新失败'")
         assertTrue(dao.replaceCalls.isEmpty())
+    }
+
+    // ---- patchItem:收藏/已看这类"条目自身属性"的乐观更新写透缓存 ----
+
+    @Test
+    fun `patchItem 改写条目在所有已缓存 bucket 里的那一行`() = runTest {
+        val dao = FakeCachedItemDao()
+        val target = episode("e1")
+        dao.seed(CacheBuckets.HOME_RESUME, listOf(target, episode("other")))
+        dao.seed(CacheBuckets.LIBRARY_SERIES, listOf(target))
+
+        repository(dao).patchItem("e1") { it.copy(isFavorite = true) }
+
+        val resume = dao.rows.value.getValue(serverId to CacheBuckets.HOME_RESUME)
+            .first { it.itemId == "e1" }
+        val series = dao.rows.value.getValue(serverId to CacheBuckets.LIBRARY_SERIES)
+            .first { it.itemId == "e1" }
+        assertTrue(CachedItemPayload.decode(resume.payloadJson)!!.isFavorite, "home.resume 里的这一行要被改到")
+        assertTrue(CachedItemPayload.decode(series.payloadJson)!!.isFavorite, "library.series 里的这一行也要被改到")
+
+        val untouched = dao.rows.value.getValue(serverId to CacheBuckets.HOME_RESUME).first { it.itemId == "other" }
+        assertFalse(CachedItemPayload.decode(untouched.payloadJson)!!.isFavorite, "同一 bucket 里的其它条目不该被连带改动")
+    }
+
+    @Test
+    fun `patchItem 对不在任何缓存里的条目安静跳过`() = runTest {
+        val dao = FakeCachedItemDao()
+
+        // 不抛异常就是这条用例的全部意义——不知道也不该崩。
+        repository(dao).patchItem("ghost") { it.copy(isFavorite = true) }
+    }
+
+    @Test
+    fun `patchItem 找不到激活服务器时安静跳过`() = runTest {
+        val dao = FakeCachedItemDao()
+        dao.seed(CacheBuckets.HOME_RESUME, listOf(episode("e1")))
+
+        repository(dao, session(id = null)).patchItem("e1") { it.copy(isFavorite = true) }
+
+        val row = dao.rows.value.getValue(serverId to CacheBuckets.HOME_RESUME).first { it.itemId == "e1" }
+        assertFalse(CachedItemPayload.decode(row.payloadJson)!!.isFavorite, "不知道该改哪台服务器,宁可不改")
     }
 
     // ---- 损坏的缓存行不得让整个列表崩掉 ----

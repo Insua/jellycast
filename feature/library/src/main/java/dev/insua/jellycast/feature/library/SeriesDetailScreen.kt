@@ -23,6 +23,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.compose.foundation.layout.Box
+import dev.insua.jellycast.designsystem.ActionMessageHost
 import dev.insua.jellycast.designsystem.OfflineBanner
 import dev.insua.jellycast.designsystem.PosterCard
 import dev.insua.jellycast.model.MediaItem
@@ -50,6 +52,7 @@ fun SeriesDetailScreen(
 
     var offlineNoticeDismissed by rememberSaveable(seriesId) { mutableStateOf(false) }
 
+    Box {
     Column {
         // 没缓存又连不上:可点重试,而不是一片空白(设计文档 §3.2 第三行)。
         detail.error?.let { message ->
@@ -105,8 +108,15 @@ fun SeriesDetailScreen(
                         onPlay(episode, viewModel.queueFor(episode))
                     },
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                    isFavorite = episode.isFavorite,
+                    onToggleFavorite = { viewModel.toggleFavorite(episode) },
+                    isPlayed = episode.isPlayed,
+                    onTogglePlayed = { viewModel.togglePlayed(episode) },
                 )
             }
         }
+    }
+
+    ActionMessageHost(message = uiState.actionError, onMessageShown = viewModel::consumeActionError)
     }
 }

@@ -53,6 +53,16 @@ interface CachedItemDao {
     @Query("SELECT * FROM cached_item WHERE serverId = :serverId AND bucket = :bucket ORDER BY position ASC")
     fun observeBucket(serverId: String, bucket: String): Flow<List<CachedItemEntity>>
 
+    /**
+     * 某个条目在**所有** bucket 里的缓存行——收藏/已看这类"条目自身属性"的乐观更新要写透缓存时,
+     * 不知道(也不该关心)这个条目当前出现在哪些 bucket 里(可能同时在 `library.series`、
+     * `home.favorites`、某个 `season.<id>.episodes` 里各有一行),所以按 itemId 一次查出全部,
+     * 逐行改写 payload 后原样 REPLACE 回去(见 [insertAll]),而不是按 bucket 挨个 replaceBucket——
+     * 那样既要知道全部 bucket 名,又会把整个 bucket 当"这次刷新"标记，语义不对。
+     */
+    @Query("SELECT * FROM cached_item WHERE serverId = :serverId AND itemId = :itemId")
+    suspend fun findByItemId(serverId: String, itemId: String): List<CachedItemEntity>
+
     /** true 表示 (serverId, bucket) 至少成功刷新过一次——哪怕刷新完是空的。 */
     @Query("SELECT EXISTS(SELECT 1 FROM cache_bucket_meta WHERE serverId = :serverId AND bucket = :bucket)")
     suspend fun hasRefreshedBucket(serverId: String, bucket: String): Boolean

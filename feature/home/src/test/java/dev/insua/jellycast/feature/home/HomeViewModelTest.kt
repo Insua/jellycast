@@ -468,4 +468,149 @@ class HomeViewModelTest {
             "这次的成功结果就是下次断网时用户能看到的内容",
         )
     }
+
+    // ================= 我的最爱标签(设计文档 §3.6/§3.7)=================
+
+    private fun favoriteDto(id: String) = BaseItemDto(
+        id = id, name = id, type = "Series",
+        userData = UserDataDto(isFavorite = true),
+    )
+
+    /** 只匹配"这一次请求确实带了 isFavorite=true"的调用——普通的 items() 桩(不传 isFavorite,
+     *  默认 null)不会命中,不用担心互相覆盖。 */
+    private fun stubFavorites(api: JellyfinApi, response: ItemsResponseDto) {
+        coEvery {
+            api.items(
+                userId = any(), types = any(), recursive = any(), sortBy = any(),
+                startIndex = any(), limit = any(), parentId = any(), searchTerm = any(),
+                sortOrder = any(), filters = any(), isFavorite = true, isPlayed = any(),
+            )
+        } returns response
+    }
+
+    @Test
+    fun `我的最爱标签展示收藏条目`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto()
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
+        stubNoLibraries(api)
+        stubFavorites(api, ItemsResponseDto(items = listOf(favoriteDto("fav-1"), favoriteDto("fav-2"))))
+
+        val viewModel = newViewModel(api)
+        advanceUntilIdle()
+
+        assertEquals(listOf("fav-1", "fav-2"), viewModel.uiState.value.favorites.map { it.id })
+        assertTrue(viewModel.uiState.value.favorites.all { it.isFavorite })
+    }
+
+    @Test
+    fun `我的最爱无缓存时刷新失败不影响其余分区也不出现在离线横幅里`() = runTest(testDispatcher) {
+        // 无缓存 + 失败:staleWhileRevalidate 一次都不发射(CachePolicy 的既有契约),
+        // 「我的最爱」这次干脆没有任何信号,不该被当成"有内容但是旧的"计入离线横幅——
+        // 与既有的"某个库的最近添加请求失败不影响其他库(无缓存时该库不出现)"是同一条规则。
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto(items = listOf(episodeDto("resume-1")))
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
+        stubNoLibraries(api)
+        coEvery {
+            api.items(
+                userId = any(), types = any(), recursive = any(), sortBy = any(),
+                startIndex = any(), limit = any(), parentId = any(), searchTerm = any(),
+                sortOrder = any(), filters = any(), isFavorite = true, isPlayed = any(),
+            )
+        } throws IOException("offline")
+
+        val viewModel = newViewModel(api)
+        advanceUntilIdle()
+
+        assertTrue(viewModel.uiState.value.favorites.isEmpty())
+        assertTrue(viewModel.uiState.value.sections.any { it.kind == HomeSectionKind.RESUME }, "我的最爱挂了不该拖累继续收听")
+        assertNull(viewModel.uiState.value.error, "还有内容可看就不该拿错误页盖住它")
+    }
+
+    @Test
+    fun `我的最爱有缓存时刷新失败显示缓存并计入整体离线`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto(items = listOf(episodeDto("resume-1")))
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
+        stubNoLibraries(api)
+        coEvery {
+            api.items(
+                userId = any(), types = any(), recursive = any(), sortBy = any(),
+                startIndex = any(), limit = any(), parentId = any(), searchTerm = any(),
+                sortOrder = any(), filters = any(), isFavorite = true, isPlayed = any(),
+            )
+        } throws IOException("offline")
+
+        val repository = FakeMediaRepository()
+        repository.seed(CacheBuckets.HOME_FAVORITES, listOf(episode("cached-fav-1").copy(isFavorite = true)))
+        val viewModel = newViewModel(api, repository)
+        advanceUntilIdle()
+
+        assertEquals(listOf("cached-fav-1"), viewModel.uiState.value.favorites.map { it.id }, "刷新失败绝不能清掉已经显示出来的缓存内容")
+        assertTrue(viewModel.uiState.value.isOffline, "我的最爱有缓存但没刷新成功,整体也算离线")
+        assertNull(viewModel.uiState.value.error)
+    }
+
+    @Test
+    fun `切换标签更新当前选中的tab`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto()
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
+        stubNoLibraries(api)
+        stubFavorites(api, ItemsResponseDto())
+
+        val viewModel = newViewModel(api)
+        advanceUntilIdle()
+
+        assertEquals(HomeTab.FEED, viewModel.uiState.value.tab)
+        viewModel.selectTab(HomeTab.FAVORITES)
+        assertEquals(HomeTab.FAVORITES, viewModel.uiState.value.tab)
+    }
+
+    @Test
+    fun `取消收藏时乐观更新使条目立刻从我的最爱消失_成功后写透缓存`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto()
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
+        stubNoLibraries(api)
+        stubFavorites(api, ItemsResponseDto(items = listOf(favoriteDto("fav-1"))))
+        coEvery { api.removeFavorite("fav-1", "user-1") } returns Unit
+
+        val repository = FakeMediaRepository()
+        val viewModel = newViewModel(api, repository)
+        advanceUntilIdle()
+        val target = viewModel.uiState.value.favorites.single { it.id == "fav-1" }
+
+        viewModel.toggleFavorite(target)
+        assertTrue(viewModel.uiState.value.favorites.none { it.id == "fav-1" }, "取消收藏后要立刻从我的最爱消失,不等网络")
+
+        advanceUntilIdle()
+        coVerify { api.removeFavorite("fav-1", "user-1") }
+        assertEquals(listOf("fav-1"), repository.patchedItemIds)
+        assertNull(viewModel.uiState.value.actionError)
+    }
+
+    @Test
+    fun `取消收藏失败时条目回到我的最爱并提示错误`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto()
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
+        stubNoLibraries(api)
+        stubFavorites(api, ItemsResponseDto(items = listOf(favoriteDto("fav-1"))))
+        coEvery { api.removeFavorite("fav-1", "user-1") } throws IOException("offline")
+
+        val viewModel = newViewModel(api)
+        advanceUntilIdle()
+        val target = viewModel.uiState.value.favorites.single { it.id == "fav-1" }
+
+        viewModel.toggleFavorite(target)
+        advanceUntilIdle()
+
+        assertTrue(
+            viewModel.uiState.value.favorites.any { it.id == "fav-1" },
+            "失败要回滚——条目重新出现在我的最爱,而不是停在'已消失'的乐观状态",
+        )
+        assertNotNull(viewModel.uiState.value.actionError)
+    }
 }
