@@ -67,8 +67,20 @@ class MediaItemMapperTest {
 
     @Test
     fun `未知 Type 返回 null 而不是抛异常`() {
-        val dto = BaseItemDto(id = "x1", name = "X", type = "BoxSet")
+        // Playlist 是 Jellyfin 真实存在但本项目浏览页不认识的类型,用来代表"陌生类型"这一档——
+        // 不能再用 BoxSet 举例,BoxSet 从本次改动起是已知类型(合集),见下面的专项测试。
+        val dto = BaseItemDto(id = "x1", name = "X", type = "Playlist")
         assertNull(dto.toMediaItem())
+    }
+
+    // ---- 合集(BoxSet):jq 核对 docs/jellyfin-openapi.json 的 BaseItemKind 枚举确认存在 ----
+
+    @Test
+    fun `BoxSet 映射为 MediaKind_COLLECTION`() {
+        val dto = BaseItemDto(id = "box1", name = "神作合集", type = "BoxSet")
+        val item = dto.toMediaItem()
+        assertEquals(MediaKind.COLLECTION, item?.kind)
+        assertEquals("神作合集", item?.name)
     }
 
     // ---- 封面 URL:GET Items 路径 id in path,maxWidth/tag query,大小写核对自 openapi.json ----
