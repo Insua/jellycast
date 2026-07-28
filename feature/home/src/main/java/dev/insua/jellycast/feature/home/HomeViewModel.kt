@@ -25,7 +25,18 @@ internal const val OFFLINE_MESSAGE = "无法连接服务器"
 /** 每个库的"最近添加"分组各自最多拉这么多条,呼应设计文档 §3.6(库有 8744 集不能拉全量)。 */
 private const val RECENTLY_ADDED_LIMIT = 20
 
+/** 「我的最爱」标签页最多拉这么多条——收藏列表通常远小于整个库,但仍要有一个上限,
+ *  不能对着 8744 集的库无限拉全量(同 [RECENTLY_ADDED_LIMIT] 的取舍)。 */
+private const val FAVORITES_LIMIT = 200
+
 enum class HomeSectionKind { RESUME, NEXT_UP, LIBRARIES }
+
+/**
+ * 首页顶部的两个标签(设计文档 §3.6:"顶部栏 + 首页/我的最爱标签",对齐 Jellyfin Web mobile)。
+ * [FEED] 是既有的"继续收听/下一集/我的媒体/最近添加"信息流,[FAVORITES] 是收藏列表——
+ * 两者的数据都在 [load] 里并发取好,切标签只是本地状态切换,不触发新请求。
+ */
+enum class HomeTab { FEED, FAVORITES }
 
 private val HomeSectionKind.bucket: String
     get() = when (this) {
@@ -65,6 +76,13 @@ data class HomeUiState(
     val isOffline: Boolean = false,
     /** 「我的媒体」以外的分区**一个都没拿到数据**(没缓存 + 全部请求失败)时的可重试错误态。 */
     val error: String? = null,
+    /** 当前选中的顶部标签(设计文档 §3.6)。 */
+    val tab: HomeTab = HomeTab.FEED,
+    /** 「我的最爱」标签页的内容——已经按 [MediaItem.isFavorite] 过滤过,取消收藏的乐观更新
+     *  会让条目立刻从这里消失,不需要等下一次刷新(见 [HomeViewModel.toggleFavorite])。 */
+    val favorites: List<MediaItem> = emptyList(),
+    /** 收藏乐观更新失败时的一次性提示,语义与 [dev.insua.jellycast.feature.library.LibraryUiState.actionError] 一致。 */
+    val actionError: String? = null,
 )
 
 /**
@@ -119,6 +137,10 @@ class HomeViewModel @Inject constructor(
     private val recentlyAddedItems = mutableMapOf<String, List<MediaItem>>()
     private val recentlyAddedRefreshFailed = mutableMapOf<String, Boolean>()
 
+    /** 「我的最爱」标签页的数据/失败标记,只有一个 bucket,不需要按 key 分组。 */
+    private var favoriteItems: List<MediaItem> = emptyList()
+    private var favoritesRefreshFailed: Boolean = false
+
     private var loadJob: Job? = null
 
     init {
@@ -131,18 +153,25 @@ class HomeViewModel @Inject constructor(
         sectionRefreshFailed.clear()
         recentlyAddedItems.clear()
         recentlyAddedRefreshFailed.clear()
+        favoriteItems = emptyList()
+        favoritesRefreshFailed = false
         loadJob = viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true, isOffline = false, error = null) }
 
-            // 第一阶段:三个 flat 分区同时发起,再一起 join——并发而非串行。
-            HomeSectionKind.entries
-                .map { kind ->
+            // 第一阶段:三个 flat 分区 + 「我的最爱」同时发起,再一起 join——并发而非串行。
+            // 「我的最爱」不参与下面 error 的判定(它是独立标签页,不是 feed 的一部分),但刷新
+            // 失败要计入整体 isOffline(见 recomputeState),失败/成功都不影响另外三个分区。
+            (
+                HomeSectionKind.entries.map { kind ->
                     launch {
                         repository.bucket(kind.bucket) { fetchSection(kind) }
                             .collect { cached -> applySection(kind, cached) }
                     }
+                } + launch {
+                    repository.bucket(CacheBuckets.HOME_FAVORITES) { fetchFavorites() }
+                        .collect { cached -> applyFavorites(cached) }
                 }
-                .joinAll()
+            ).joinAll()
 
             // 第二阶段:库列表已就绪(缓存或网络任一成功即可),按库并发拉"最近添加"——
             // 库与库之间互不阻塞、互不影响,与第一阶段内部的并发规则一致。
@@ -169,6 +198,52 @@ class HomeViewModel @Inject constructor(
     /** 重试:与首次加载完全同路,失败后的重试成功同样会把结果写回缓存。 */
     fun retry() = load()
 
+    fun selectTab(tab: HomeTab) {
+        _uiState.update { it.copy(tab = tab) }
+    }
+
+    /** [HomeUiState.actionError] 显示过一次后由 [HomeScreen] 调这个清空。 */
+    fun consumeActionError() {
+        _uiState.update { it.copy(actionError = null) }
+    }
+
+    /**
+     * 收藏 / 取消收藏(设计文档 §3.7)。与 `LibraryViewModel.toggleFavorite` 同一套模式:
+     * 乐观更新 → 成功写透缓存 / 失败原样回滚 + 提示。取消收藏时,乐观更新经由
+     * [HomeUiState.favorites] 对 [MediaItem.isFavorite] 的过滤,条目立刻从「我的最爱」标签页
+     * 消失,不需要额外的"从列表移除"逻辑。
+     */
+    fun toggleFavorite(item: MediaItem) {
+        val target = !item.isFavorite
+        mutateItem(item.id) { it.copy(isFavorite = target) }
+        viewModelScope.launch {
+            val result = runCatching {
+                val userId = session.userId()
+                if (target) api.addFavorite(item.id, userId) else api.removeFavorite(item.id, userId)
+            }
+            if (result.isSuccess) {
+                repository.patchItem(item.id) { it.copy(isFavorite = target) }
+            } else {
+                mutateItem(item.id) { item }
+                _uiState.update {
+                    it.copy(actionError = if (target) "收藏失败,请重试" else "取消收藏失败,请重试")
+                }
+            }
+        }
+    }
+
+    /** 把 [transform] 应用到 [itemId] 在首页各处出现的每一份缓存内存态,再重新拼一遍 UI 状态。 */
+    private fun mutateItem(itemId: String, transform: (MediaItem) -> MediaItem) {
+        sectionItems.keys.toList().forEach { k ->
+            sectionItems[k] = sectionItems.getValue(k).replaceIfMatches(itemId, transform)
+        }
+        recentlyAddedItems.keys.toList().forEach { k ->
+            recentlyAddedItems[k] = recentlyAddedItems.getValue(k).replaceIfMatches(itemId, transform)
+        }
+        favoriteItems = favoriteItems.replaceIfMatches(itemId, transform)
+        recomputeState()
+    }
+
     private suspend fun fetchSection(kind: HomeSectionKind): List<MediaItem> {
         val userId = session.userId()
         val response = when (kind) {
@@ -192,9 +267,33 @@ class HomeViewModel @Inject constructor(
         return response.items.mapNotNull { it.toMediaItem() }
     }
 
+    /**
+     * 「我的最爱」标签页取数(设计文档 §3.7):`isFavorite = true` 是 `/Items` 的专用布尔参数
+     * (核对自 docs/jellyfin-openapi.json,与 `filters=IsFavorite` 等价但更直接,`JellyfinApi`
+     * 已经单独暴露了这个参数)。混排 Series/Movie/Episode/BoxSet 四种类型——收藏可以是任意
+     * 一种,不像浏览 Tab 那样按类型分开。
+     */
+    private suspend fun fetchFavorites(): List<MediaItem> {
+        val userId = session.userId()
+        val response = api.items(
+            userId = userId,
+            types = "Series,Movie,Episode,BoxSet",
+            sortBy = "SortName",
+            limit = FAVORITES_LIMIT,
+            isFavorite = true,
+        )
+        return response.items.mapNotNull { it.toMediaItem() }
+    }
+
     private fun applySection(kind: HomeSectionKind, cached: Cached<List<MediaItem>>) {
         sectionItems[kind] = cached.data
         sectionRefreshFailed[kind] = cached.refreshFailed
+        recomputeState()
+    }
+
+    private fun applyFavorites(cached: Cached<List<MediaItem>>) {
+        favoriteItems = cached.data
+        favoritesRefreshFailed = cached.refreshFailed
         recomputeState()
     }
 
@@ -221,9 +320,18 @@ class HomeViewModel @Inject constructor(
                             ?.takeIf { it.isNotEmpty() }
                             ?.let { RecentlyAddedGroup(library.id, library.name, it) }
                     },
-                isOffline = sectionRefreshFailed.values.any { it } || recentlyAddedRefreshFailed.values.any { it },
+                // 只保留仍然收藏的条目——取消收藏的乐观更新(见 toggleFavorite)靠这个过滤
+                // 立刻从标签页消失,不需要单独维护一份"移除了哪些 id"的状态。
+                favorites = favoriteItems.filter { it.isFavorite },
+                isOffline = sectionRefreshFailed.values.any { it } ||
+                    recentlyAddedRefreshFailed.values.any { it } ||
+                    favoritesRefreshFailed,
                 error = null,
             )
         }
     }
 }
+
+/** [HomeViewModel.mutateItem] 用:命中 id 的那一条换成 [transform] 的结果,其余原样保留。 */
+private fun List<MediaItem>.replaceIfMatches(itemId: String, transform: (MediaItem) -> MediaItem): List<MediaItem> =
+    map { if (it.id == itemId) transform(it) else it }
