@@ -35,6 +35,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import dev.insua.jellycast.designsystem.MiniPlayerBar
 import dev.insua.jellycast.feature.home.HomeScreen
+import dev.insua.jellycast.feature.library.CollectionDetailScreen
 import dev.insua.jellycast.feature.library.LibraryScreen
 import dev.insua.jellycast.feature.library.SeriesDetailScreen
 import dev.insua.jellycast.feature.player.PlayerScreen
@@ -152,6 +153,9 @@ fun JellyCastNavHost(
                         sessionViewModel.play(item, listOf(item))
                         playerExpanded = true
                     },
+                    onCollectionClick = { collectionId ->
+                        navController.navigate(Routes.collectionDetail(collectionId))
+                    },
                     baseUrl = baseUrl,
                 )
             }
@@ -161,6 +165,18 @@ fun JellyCastNavHost(
                     seriesId = seriesId,
                     onPlay = { episode, queue ->
                         sessionViewModel.play(episode, queue)
+                        playerExpanded = true
+                    },
+                    baseUrl = baseUrl,
+                )
+            }
+            composable(Routes.COLLECTION_DETAIL_PATTERN) { entry ->
+                val collectionId = entry.arguments?.getString("collectionId") ?: return@composable
+                CollectionDetailScreen(
+                    collectionId = collectionId,
+                    onSeriesClick = { seriesId -> navController.navigate(Routes.seriesDetail(seriesId)) },
+                    onPlay = { item ->
+                        sessionViewModel.play(item, listOf(item))
                         playerExpanded = true
                     },
                     baseUrl = baseUrl,
