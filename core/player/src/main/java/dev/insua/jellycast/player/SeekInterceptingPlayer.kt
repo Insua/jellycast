@@ -3,6 +3,8 @@ package dev.insua.jellycast.player
 import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.Player
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
@@ -24,9 +26,47 @@ fun interface SeekRouter {
 class EngineSeekRouter(
     private val engine: AudioPlaybackEngine,
     private val scope: CoroutineScope,
+    private val debounceMs: Long = DEFAULT_DEBOUNCE_MS,
 ) : SeekRouter {
+
+    /**
+     * ## seek 防抖 / 连点合并
+     *
+     * 复现见 `SeekCoalescingTest`:连点快进大约 1/7 会弹出「该条目无法播放」,而耳机里其实还在
+     * 正常出声。根因不是"迟到的结果覆盖了更新的状态"——那条路已经被
+     * [AudioPlaybackEngineImpl] 既有的 `requestSeq`/`isStale` 令牌机制挡住了(见
+     * [AudioPlaybackEngineTest] 的"连点 seek 时先发出的慢 resolve 不得覆盖后发出的快
+     * resolve"/"过期 seek 失败时不得把已经成功的新一次 seek 打成 Error")。真正的根因是
+     * **每一次按键都无条件起一个新的 resolve 请求**,而群晖 J4125 只能扛有限的并发转码探测
+     * (`PlaybackSourceResolver`「稳定性根因 #3」的 KDoc)。连点两下快进,**第二下**(真正最新、
+     * 按令牌判定完全不 stale 的那一次)可能因为第一下还占着并发名额而竞争失败——它本身就是
+     * "最新",令牌机制救不了它,`state` 被打成 Error,而播放器上还在放第一下发起前的那条旧流,
+     * 声音完全没有断。
+     *
+     * 这里在真正调用 [AudioPlaybackEngine.seekTo] 之前,先取消上一次还没落地的请求:如果它还在
+     * [debounceMs] 的等待窗口里,直接被取消,连 resolve 都不会发起;如果它已经在 resolve 中,
+     * 取消会让协程在下一个挂起点抛 [kotlinx.coroutines.CancellationException],
+     * [AudioPlaybackEngineImpl.resolveAndPrepare] 把它原样向上抛出、绝不会落到
+     * `catch (e: Exception)` 分支——所以被取消的那次请求**不可能**把 state 打成 Error。
+     *
+     * 这是在 [AudioPlaybackEngine] 既有的令牌机制之上叠加,不是另起一套并行方案:令牌机制继续
+     * 兜底"取消信号还没来得及生效、resolve 已经跑完"那极小的窗口;这一层从根上减少冗余请求
+     * 本身,不让陈旧请求有机会去抢并发名额。
+     */
+    @Volatile
+    private var pendingSeek: Job? = null
+
     override fun seekTo(positionMs: Long) {
-        scope.launch { engine.seekTo(positionMs) }
+        pendingSeek?.cancel()
+        pendingSeek = scope.launch {
+            if (debounceMs > 0L) delay(debounceMs)
+            engine.seekTo(positionMs)
+        }
+    }
+
+    private companion object {
+        /** 连点快进/拖动进度条的合并窗口。 */
+        const val DEFAULT_DEBOUNCE_MS = 250L
     }
 }
 
