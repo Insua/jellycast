@@ -1,0 +1,23 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!--
+          分享诊断日志需要一个 FileProvider——应用私有目录下的文件不能直接塞进 ACTION_SEND 的
+          content Uri。authorities 用 "${applicationId}" 占位符(AGP 清单合并时对所有被合并进
+          :app 的清单统一解析,androidx.startup / WorkManager 等库用的是同一手法),这样这个库
+          模块自己声明 provider,不用改 :app 的 AndroidManifest.xml。
+
+          exported="false" + grantUriPermissions="true":只把 Uri 临时授权给发起分享的那个
+          Activity(系统分享面板选中的目标 App),不对外广播这个 provider——分享诊断日志不需要
+          让任意第三方 App 都能访问它。
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.diagnostics.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/diagnostics_file_paths" />
+        </provider>
+    </application>
+</manifest>
