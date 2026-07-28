@@ -12,6 +12,7 @@ import dev.insua.jellycast.model.MediaItem
 import dev.insua.jellycast.model.SubtitleTimeline
 import dev.insua.jellycast.model.SubtitleTrackRef
 import dev.insua.jellycast.subtitle.SubtitleRepository
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -131,8 +132,9 @@ data class PlayerUiState(
  * 计算,在 [LyricsView] 里直接调用——这里不重复实现一遍查找逻辑,只负责把字幕轨拉下来解析成
  * [SubtitleTimeline] 交给它。
  *
- * 字幕铁律:[SubtitleRepository.load] 任何失败都已经降级成空 timeline,这里不做二次 try/catch,
- * 也不允许把字幕异常变成播放中断。
+ * 字幕铁律:[SubtitleRepository.load] 任何失败都已经降级成空 timeline;[loadSubtitleTrack]
+ * 里仍然包了一层兜底 `catch (e: Throwable)`,作为三层防御(见设计文档 §2)的最后一道 ——
+ * 不允许把任何字幕相关异常变成播放中断或进程崩溃。
  */
 @HiltViewModel
 class PlayerViewModel @Inject constructor(
@@ -186,13 +188,27 @@ class PlayerViewModel @Inject constructor(
     /**
      * 字幕铁律落地处:[track] 为 null(无可用文本字幕轨)时直接给空 timeline,不发请求;
      * 有轨道时调 [SubtitleRepository.load] —— 它内部已经把网络异常/非 2xx/解析异常统统降级成
-     * 空 timeline,这里不需要、也不允许再包一层 try/catch 把它变成向上抛错。
+     * 空 timeline。
+     *
+     * 这里仍然包一层 `catch (e: Throwable)` 兜底(第三层防线,见
+     * docs/superpowers/specs/2026-07-28-crash-and-usability-design.md §2 的"防御纵深"表格)。
+     * 不是因为不信任 [SubtitleRepository.load] 的契约,而是因为 `observeNowPlaying()` 的
+     * `viewModelScope.launch` 本身没有 `CoroutineExceptionHandler`——任何在这条调用链上
+     * 逃逸的 `Throwable`(哪怕来自未来的重构、来自这个方法之外目前想不到的路径)都会直接杀掉
+     * 进程,而不只是让字幕消失。字幕是纯装饰功能,失败必须收敛成"无字幕"的 UI 状态,不能变成
+     * 崩溃。`CancellationException` 仍然无条件重抛,不属于这里要兜底的范畴。
      */
     private suspend fun loadSubtitleTrack(itemId: String, mediaSourceId: String, track: SubtitleTrackRef?) {
         val timeline = if (track == null) {
             SubtitleTimeline(emptyList())
         } else {
-            subtitleRepository.load(itemId, mediaSourceId, track.index)
+            try {
+                subtitleRepository.load(itemId, mediaSourceId, track.index)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                SubtitleTimeline(emptyList())
+            }
         }
         _uiState.update {
             it.copy(subtitleTimeline = timeline, isSubtitleLoading = false, selectedSubtitleTrackIndex = track?.index)
