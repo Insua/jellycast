@@ -33,4 +33,10 @@ object CacheBuckets {
 
     /** 某个合集(BoxSet)里的条目列表。 */
     fun collectionItemsOf(collectionId: String): String = "collection.$collectionId.items"
+
+    /**
+     * 首页「我的媒体」库卡片点进来的单个库浏览页(修正 §3.1)。**必须**按 [libraryId] 区分——
+     * 不同库共用同一个 key 会互相覆盖缓存,用户点进 A 库看到的却是上次刷新过的 B 库内容。
+     */
+    fun libraryViewOf(libraryId: String): String = "library.view.$libraryId"
 }

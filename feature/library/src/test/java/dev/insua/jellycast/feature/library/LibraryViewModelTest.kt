@@ -982,6 +982,132 @@ class LibraryViewModelTest {
         assertFalse(viewModel.uiState.value.series.items.single { it.id == "series-1" }.isPlayed)
     }
 
+    // ================= 单个库浏览(首页「我的媒体」卡片,修正 §3.1)=================
+    // jq -r '.paths["/Items"].get.parameters[]?.name' docs/jellyfin-openapi.json | grep -ix parentId
+    // 命中且大小写完全一致(parentId)——见任务报告的 jq 证据。
+
+    @Test fun `打开某个库时用 parentId 限定该库并只拉第一页`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery {
+            api.items(any(), "Series,Movie", any(), any(), 0, 50, "lib-1", any(), any(), any(), any(), any())
+        } returns page("剧A", "电影B")
+        val vm = newViewModel(api)
+
+        vm.openLibrary("lib-1")
+        advanceUntilIdle()
+
+        assertEquals("lib-1", vm.uiState.value.libraryView?.libraryId)
+        assertEquals(listOf("剧A", "电影B"), vm.uiState.value.libraryView?.page?.items?.map { it.name })
+        assertEquals(120, vm.uiState.value.libraryView?.page?.totalCount)
+        coVerify { api.items(any(), "Series,Movie", any(), any(), 0, 50, "lib-1", any(), any(), any(), any(), any()) }
+    }
+
+    @Test fun `不同库各自独立缓存_不会互相覆盖`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } throws
+            java.io.IOException("offline")
+        val repository = FakeMediaRepository()
+        repository.seed(CacheBuckets.libraryViewOf("lib-1"), listOf(series("库1缓存")))
+        repository.seed(CacheBuckets.libraryViewOf("lib-2"), listOf(series("库2缓存")))
+
+        val vm = newViewModel(api, repository = repository)
+
+        vm.openLibrary("lib-1")
+        advanceUntilIdle()
+        assertEquals(listOf("库1缓存"), vm.uiState.value.libraryView?.page?.items?.map { it.name })
+
+        vm.openLibrary("lib-2")
+        advanceUntilIdle()
+        assertEquals(
+            listOf("库2缓存"),
+            vm.uiState.value.libraryView?.page?.items?.map { it.name },
+            "换一个库不该看到上一个库缓存下来的内容——bucket key 必须按 libraryId 区分",
+        )
+    }
+
+    @Test fun `库浏览页 loadLibraryViewNextPage 追加下一页且不重复触发`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery {
+            api.items(any(), "Series,Movie", any(), any(), 0, 50, "lib-1", any(), any(), any(), any(), any())
+        } returns page("A", "B")
+        coEvery {
+            api.items(any(), "Series,Movie", any(), any(), 2, 50, "lib-1", any(), any(), any(), any(), any())
+        } returns page("C", "D")
+        val vm = newViewModel(api)
+
+        vm.openLibrary("lib-1"); advanceUntilIdle()
+        vm.loadLibraryViewNextPage(); vm.loadLibraryViewNextPage() // 连点两次
+        advanceUntilIdle()
+
+        assertEquals(listOf("A", "B", "C", "D"), vm.uiState.value.libraryView?.page?.items?.map { it.name })
+        coVerify(exactly = 1) {
+            api.items(any(), "Series,Movie", any(), any(), 2, 50, "lib-1", any(), any(), any(), any(), any())
+        }
+    }
+
+    @Test fun `库浏览页到底之后不再请求`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery {
+            api.items(any(), "Series,Movie", any(), any(), 0, 50, "lib-1", any(), any(), any(), any(), any())
+        } returns ItemsResponseDto(listOf(seriesDto("A")), total = 1)
+        val vm = newViewModel(api)
+
+        vm.openLibrary("lib-1"); advanceUntilIdle()
+        vm.loadLibraryViewNextPage(); advanceUntilIdle()
+
+        coVerify(exactly = 0) {
+            api.items(any(), any(), any(), any(), 1, any(), any(), any(), any(), any(), any(), any())
+        }
+    }
+
+    @Test fun `库浏览页分页失败保留已加载内容并可重试`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery {
+            api.items(any(), "Series,Movie", any(), any(), 0, 50, "lib-1", any(), any(), any(), any(), any())
+        } returns page("A", "B")
+        coEvery {
+            api.items(any(), "Series,Movie", any(), any(), 2, 50, "lib-1", any(), any(), any(), any(), any())
+        } throws java.io.IOException("offline") andThen page("C", "D")
+        val vm = newViewModel(api)
+
+        vm.openLibrary("lib-1"); advanceUntilIdle()
+        vm.loadLibraryViewNextPage(); advanceUntilIdle()
+        assertEquals(listOf("A", "B"), vm.uiState.value.libraryView?.page?.items?.map { it.name })
+        assertNotNull(vm.uiState.value.libraryView?.page?.error)
+
+        vm.retryLibraryView(); advanceUntilIdle()
+        assertEquals(listOf("A", "B", "C", "D"), vm.uiState.value.libraryView?.page?.items?.map { it.name })
+        assertNull(vm.uiState.value.libraryView?.page?.error)
+    }
+
+    @Test fun `库浏览页无缓存且断网时进入可重试错误态而不崩溃`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } throws
+            java.io.IOException("offline")
+        val vm = newViewModel(api)
+
+        vm.openLibrary("lib-1"); advanceUntilIdle()
+
+        assertTrue(vm.uiState.value.libraryView?.page?.items.isNullOrEmpty())
+        assertNotNull(vm.uiState.value.libraryView?.page?.error, "无缓存 + 连不上 = 可重试的错误态")
+        assertFalse(vm.uiState.value.libraryView?.page?.isLoading ?: true, "必须收尾,不能一直转圈")
+    }
+
+    @Test fun `库浏览页断网但有缓存时显示缓存并标记该屏离线`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } throws
+            java.io.IOException("offline")
+        val repository = FakeMediaRepository()
+        repository.seed(CacheBuckets.libraryViewOf("lib-1"), listOf(series("缓存A")))
+
+        val vm = newViewModel(api, repository = repository)
+        vm.openLibrary("lib-1"); advanceUntilIdle()
+
+        assertEquals(listOf("缓存A"), vm.uiState.value.libraryView?.page?.items?.map { it.name })
+        assertTrue(vm.uiState.value.libraryView?.isOffline == true)
+        assertNull(vm.uiState.value.libraryView?.page?.error, "还有内容可看就不该显示错误")
+    }
+
     @Test
     fun `收藏切换同步更新剧集详情里的同一集`() = runTest(testDispatcher) {
         val api = defaultApi()

@@ -153,6 +153,21 @@ data class CollectionDetailUiState(
     val error: String? = null,
 )
 
+/**
+ * 首页「我的媒体」库卡片点进来的单个库浏览页(修正 §3.1)。分页规则与 [LibraryUiState.series]/
+ * [movies] 完全一致(第一页缓存优先整体替换,第二页起纯网络追加、不缓存)——只是范围被
+ * [libraryId] 圈定在这一个库内。剧集与电影混排、不预设库的类型,与 [CollectionDetailUiState]/
+ * 搜索同样的处理方式(见 [LibraryViewModel.fetchLibraryViewPage])。
+ *
+ * [isOffline] 只反映**这一个库浏览页**当前这次刷新是不是失败、显示的是缓存——与
+ * [LibraryUiState.isOffline](顶层三个浏览 Tab 用的)互不相干,是完全独立的一块屏幕状态。
+ */
+data class LibraryViewUiState(
+    val libraryId: String,
+    val page: PageState<MediaItem> = PageState(),
+    val isOffline: Boolean = false,
+)
+
 data class LibraryUiState(
     val tab: LibraryTab = LibraryTab.SERIES,
     val series: PageState<MediaItem> = PageState(),
@@ -167,6 +182,8 @@ data class LibraryUiState(
     val searchResults: PageState<MediaItem> = PageState(),
     val detail: SeriesDetailUiState? = null,
     val collectionDetail: CollectionDetailUiState? = null,
+    /** 首页库卡片点进来的单个库浏览页(修正 §3.1)。null = 当前没有打开任何库。 */
+    val libraryView: LibraryViewUiState? = null,
     /** 当前可见的浏览列表显示的是缓存、且这次刷新没成功。 */
     val isOffline: Boolean = false,
     /**
@@ -244,6 +261,7 @@ class LibraryViewModel @Inject constructor(
     private var seasonsJob: Job? = null
     private var episodesJob: Job? = null
     private var collectionDetailJob: Job? = null
+    private var libraryViewFirstPageJob: Job? = null
 
     /**
      * 浏览列表(剧集/电影)**各自**最近一次的刷新是否失败,用来 OR 出 [LibraryUiState.isOffline]。
@@ -489,6 +507,107 @@ class LibraryViewModel @Inject constructor(
         _uiState.value.collectionDetail?.collectionId?.let { openCollection(it) }
     }
 
+    /**
+     * 进入某个库(首页「我的媒体」卡片,修正 §3.1):缓存优先加载该库的直接子条目,分页规则与
+     * [loadFirstPage]/[requestPage] 完全一致——第一页整体替换(缓存优先),第二页起追加、不缓存。
+     * bucket key 按 [libraryId] 区分([CacheBuckets.libraryViewOf]),两个库不会互相覆盖缓存。
+     */
+    fun openLibrary(libraryId: String) {
+        _uiState.update { it.copy(libraryView = LibraryViewUiState(libraryId = libraryId)) }
+        loadLibraryViewFirstPage(libraryId)
+    }
+
+    private fun loadLibraryViewFirstPage(libraryId: String) {
+        libraryViewFirstPageJob?.cancel()
+        updateLibraryViewPage(libraryId) { PageState<MediaItem>().startLoading() }
+        libraryViewFirstPageJob = viewModelScope.launch {
+            var delivered = false
+            repository.pagedBucket(CacheBuckets.libraryViewOf(libraryId)) {
+                val response = fetchLibraryViewPage(libraryId, startIndex = 0)
+                ItemPage(response.items.mapNotNull { it.toMediaItem() }, response.total)
+            }.collect { cached ->
+                delivered = true
+                updateLibraryViewPage(libraryId) { state ->
+                    state.copy(
+                        items = cached.data.items,
+                        totalCount = cached.data.total ?: state.totalCount,
+                        isLoading = cached.isStale && !cached.refreshFailed,
+                        error = null,
+                    )
+                }
+                _uiState.update { state ->
+                    val current = state.libraryView ?: return@update state
+                    if (current.libraryId != libraryId) return@update state
+                    state.copy(libraryView = current.copy(isOffline = cached.refreshFailed))
+                }
+            }
+            if (!delivered) {
+                // 既没缓存又连不上:进可重试的错误态,绝不抛异常、绝不崩溃。
+                updateLibraryViewPage(libraryId) { it.onError(OFFLINE_MESSAGE) }
+            }
+        }
+    }
+
+    /** 库浏览页的下一页——与 [loadNextPage] 同样的幂等保证:同步先标 `isLoading = true` 再
+     *  launch 协程,连点两次只发一次请求。 */
+    fun loadLibraryViewNextPage() {
+        val libraryView = _uiState.value.libraryView ?: return
+        val current = libraryView.page
+        if (current.isLoading || current.endReached) return
+        val startIndex = current.loadedCount
+        if (startIndex == 0) {
+            // 一条都没加载成功时,"下一页"其实就是第一页——走缓存优先那条路(重试路径)。
+            loadLibraryViewFirstPage(libraryView.libraryId)
+            return
+        }
+        updateLibraryViewPage(libraryView.libraryId) { it.startLoading() }
+        requestLibraryViewPage(libraryView.libraryId, startIndex)
+    }
+
+    /** 重试库浏览页——失败没有推进 loadedCount,"重试"本质就是"再要一次下一页"(同 [retry])。 */
+    fun retryLibraryView() = loadLibraryViewNextPage()
+
+    private fun requestLibraryViewPage(libraryId: String, startIndex: Int) {
+        viewModelScope.launch {
+            val result = runCatching { fetchLibraryViewPage(libraryId, startIndex) }
+            result.fold(
+                onSuccess = { response ->
+                    updateLibraryViewPage(libraryId) {
+                        it.onPageLoaded(response.items.mapNotNull { dto -> dto.toMediaItem() }, startIndex, response.total)
+                    }
+                },
+                onFailure = { error ->
+                    updateLibraryViewPage(libraryId) { it.onError(error.message ?: "加载失败") }
+                },
+            )
+        }
+    }
+
+    /**
+     * 某个库的直接子条目:剧集/电影混排([types] 与合集/搜索一致,不预设这个库的类型),
+     * `parentId` 圈定这一个库——精确拼写 `parentId` 已用 jq 核对 docs/jellyfin-openapi.json 的
+     * /Items 参数表(详见任务报告)。
+     */
+    private suspend fun fetchLibraryViewPage(libraryId: String, startIndex: Int): ItemsResponseDto =
+        api.items(
+            userId = session.userId(),
+            types = "Series,Movie",
+            sortBy = "SortName",
+            startIndex = startIndex,
+            limit = PAGE_SIZE,
+            parentId = libraryId,
+        )
+
+    /** 忽略掉与当前打开的库不一致的迟到更新——同 [applySearchResult] 的"身份校验"取舍:
+     *  用户已经切换到另一个库时,上一个库迟到的响应不该覆盖当前正在看的这个库。 */
+    private fun updateLibraryViewPage(libraryId: String, transform: (PageState<MediaItem>) -> PageState<MediaItem>) {
+        _uiState.update { state ->
+            val current = state.libraryView ?: return@update state
+            if (current.libraryId != libraryId) return@update state
+            state.copy(libraryView = current.copy(page = transform(current.page)))
+        }
+    }
+
     /** [LibraryUiState.actionError] 显示过一次后由 [LibraryScreen] 调这个清空。 */
     fun consumeActionError() {
         _uiState.update { it.copy(actionError = null) }
@@ -571,6 +690,7 @@ class LibraryViewModel @Inject constructor(
                 collectionDetail = state.collectionDetail?.copy(
                     items = state.collectionDetail.items.replaceIfMatches(itemId, transform),
                 ),
+                libraryView = state.libraryView?.copy(page = state.libraryView.page.mapItems(itemId, transform)),
             )
         }
     }
