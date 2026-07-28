@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  自适应图标前景层(Task:应用图标)。图形是"耳机 + 播放按钮"——听剧当播客听的产品隐喻,
+  刻意不用视频画面/胶片元素(项目铁律 1:全程不渲染视频)。
+
+  108dp 画布,内容集中在中心 66dp 安全区(以 (54,54) 为圆心、半径 33 的圆)内,不会被圆形/圆角
+  遮罩裁掉——耳机罩最外侧约在半径 29 处,播放徽标最外侧约在半径 21 处,都留了余量。
+
+  中间的圆形播放徽标用 evenOdd 填充规则"挖空"一个播放三角形,让背景层的暖色透出来,
+  不需要在前景里硬编码背景色,两层图形天然呼应。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 耳机头梁:从左耳罩顶部拱到右耳罩顶部。 -->
+    <path
+        android:pathData="M32,54 A22,20 0 0 1 76,54"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="6"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000" />
+
+    <!-- 左耳罩 -->
+    <path
+        android:pathData="M26,60 a6,6 0 1,0 12,0 a6,6 0 1,0 -12,0 Z"
+        android:fillColor="#FFFFFFFF" />
+
+    <!-- 右耳罩 -->
+    <path
+        android:pathData="M70,60 a6,6 0 1,0 12,0 a6,6 0 1,0 -12,0 Z"
+        android:fillColor="#FFFFFFFF" />
+
+    <!-- 中央播放徽标:白色圆形挖空一个三角形("播客/播放"的视觉锚点)。 -->
+    <path
+        android:pathData="M41,62 a13,13 0 1,0 26,0 a13,13 0 1,0 -26,0 Z M48,54 L48,70 L63,62 Z"
+        android:fillType="evenOdd"
+        android:fillColor="#FFFFFFFF" />
+</vector>
