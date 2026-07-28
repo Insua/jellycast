@@ -88,6 +88,7 @@ object LibraryScreenTestTags {
 fun LibraryScreen(
     onSeriesClick: (String) -> Unit,
     onPlay: (MediaItem) -> Unit,
+    onCollectionClick: (String) -> Unit = {},
     baseUrl: String = "",
     viewModel: LibraryViewModel = hiltViewModel(),
 ) {
@@ -101,6 +102,7 @@ fun LibraryScreen(
         onRetry = viewModel::retry,
         onSeriesClick = onSeriesClick,
         onPlay = onPlay,
+        onCollectionClick = onCollectionClick,
         onSortByChange = viewModel::setSortBy,
         onSortOrderChange = viewModel::setSortOrder,
         onFiltersChange = viewModel::setFilters,
@@ -128,6 +130,7 @@ fun LibraryScreenContent(
     onRetry: () -> Unit,
     onSeriesClick: (String) -> Unit,
     onPlay: (MediaItem) -> Unit,
+    onCollectionClick: (String) -> Unit = {},
     onSortByChange: (LibrarySortBy) -> Unit = {},
     onSortOrderChange: (LibrarySortOrder) -> Unit = {},
     onFiltersChange: (LibraryFilters) -> Unit = {},
@@ -175,6 +178,11 @@ fun LibraryScreenContent(
                     selected = uiState.tab == LibraryTab.MOVIES,
                     onClick = { onSelectTab(LibraryTab.MOVIES) },
                     text = { Text("电影") },
+                )
+                Tab(
+                    selected = uiState.tab == LibraryTab.COLLECTIONS,
+                    onClick = { onSelectTab(LibraryTab.COLLECTIONS) },
+                    text = { Text("合集") },
                 )
             }
 
@@ -234,7 +242,11 @@ fun LibraryScreenContent(
                     subtitle = if (uiState.isSearching) mediaItem.kind.searchSubtitle() else null,
                     imageUrl = if (baseUrl.isBlank()) null else mediaItem.posterUrl(baseUrl),
                     onClick = {
-                        if (mediaItem.kind == MediaKind.SERIES) onSeriesClick(mediaItem.id) else onPlay(mediaItem)
+                        when (mediaItem.kind) {
+                            MediaKind.SERIES -> onSeriesClick(mediaItem.id)
+                            MediaKind.COLLECTION -> onCollectionClick(mediaItem.id)
+                            else -> onPlay(mediaItem)
+                        }
                     },
                     modifier = Modifier.testTag(LibraryScreenTestTags.item(mediaItem.id)),
                 )

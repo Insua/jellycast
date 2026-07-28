@@ -14,10 +14,14 @@ object CacheBuckets {
 
     const val LIBRARY_SERIES = "library.series"
     const val LIBRARY_MOVIES = "library.movies"
+    const val LIBRARY_COLLECTIONS = "library.collections"
 
     /** 某部剧的季列表。 */
     fun seasonsOf(seriesId: String): String = "series.$seriesId.seasons"
 
     /** 某一季的完整集列表 —— 也就是自动连播的播放队列。 */
     fun episodesOf(seasonId: String): String = "season.$seasonId.episodes"
+
+    /** 某个合集(BoxSet)里的条目列表。 */
+    fun collectionItemsOf(collectionId: String): String = "collection.$collectionId.items"
 }

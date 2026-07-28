@@ -730,4 +730,114 @@ class LibraryViewModelTest {
         )
         assertEquals(2, vm.uiState.value.detail?.episodes?.size)
     }
+
+    // ================= 合集(BoxSet,设计文档 §3.7)=================
+
+    private fun boxSetDto(id: String, name: String = id) = BaseItemDto(id = id, name = name, type = "BoxSet")
+
+    @Test fun `合集 Tab 使用 includeItemTypes=BoxSet 加载列表`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } returns
+            ItemsResponseDto()
+        coEvery { api.items(any(), "BoxSet", any(), any(), 0, 50, any(), null, any(), any(), any(), any()) } returns
+            ItemsResponseDto(listOf(boxSetDto("box1", "神作合集")), total = 1)
+
+        val vm = newViewModel(api)
+        advanceUntilIdle()
+
+        assertEquals(listOf("神作合集"), vm.uiState.value.collections.items.map { it.name })
+    }
+
+    @Test fun `进入合集加载其中的条目_不使用 queueFor 概念`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } returns
+            ItemsResponseDto()
+        coEvery { api.items(any(), "Movie,Series", false, any(), any(), any(), "box1", any(), any(), any(), any(), any()) } returns
+            ItemsResponseDto(listOf(movieDto("m1"), seriesDto("s1")), total = 2)
+
+        val vm = newViewModel(api)
+        advanceUntilIdle()
+        vm.openCollection("box1")
+        advanceUntilIdle()
+
+        assertEquals(listOf("m1", "s1"), vm.uiState.value.collectionDetail?.items?.map { it.id })
+        assertFalse(vm.uiState.value.collectionDetail!!.isLoading)
+        assertNull(vm.uiState.value.collectionDetail!!.error)
+    }
+
+    @Test fun `合集详情有缓存时先显示缓存_断网标记离线`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } throws
+            java.io.IOException("offline")
+
+        val repository = FakeMediaRepository()
+        repository.seed(CacheBuckets.collectionItemsOf("box1"), listOf(series("缓存的合集条目")))
+
+        val vm = newViewModel(api, repository = repository)
+        vm.openCollection("box1"); advanceUntilIdle()
+
+        val detail = vm.uiState.value.collectionDetail
+        assertEquals(listOf("缓存的合集条目"), detail?.items?.map { it.name })
+        assertTrue(detail!!.isOffline)
+        assertFalse(detail.isLoading)
+    }
+
+    @Test fun `合集详情无缓存且断网时进错误态而不崩溃`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } throws
+            java.io.IOException("offline")
+
+        val vm = newViewModel(api)
+        vm.openCollection("box1"); advanceUntilIdle()
+
+        val detail = vm.uiState.value.collectionDetail
+        assertNotNull(detail)
+        assertTrue(detail!!.items.isEmpty())
+        assertNotNull(detail.error, "无缓存 + 连不上 = 可重试的错误态")
+        assertFalse(detail.isLoading, "必须收尾,不能一直转圈")
+    }
+
+    @Test fun `合集条目刷新成功后写回 bucket`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } returns
+            ItemsResponseDto()
+        coEvery { api.items(any(), any(), false, any(), any(), any(), "box1", any(), any(), any(), any(), any()) } returns
+            ItemsResponseDto(listOf(movieDto("m1")))
+        val repository = FakeMediaRepository()
+
+        val vm = newViewModel(api, repository = repository)
+        vm.openCollection("box1"); advanceUntilIdle()
+
+        assertEquals(
+            listOf("m1"),
+            repository.writes.single { it.first == CacheBuckets.collectionItemsOf("box1") }.second.map { it.id },
+        )
+    }
+
+    // ---- 合集 Tab 的刷新失败同样计入 isOffline(OR 逻辑覆盖第三个 target,不只是 series/movies) ----
+    // 合集 Tab 必须**有缓存**才能走到"缓存已显示、这次刷新失败"这条分支——这与既有的
+    // "无缓存 + 断网 = 错误态"是两码事(错误态不经过 collect,不会记入 listRefreshFailed,
+    // 也就不会影响 isOffline,这一点在"无缓存且断网时进入可重试的错误态而不是崩溃"里已经
+    // 覆盖过 series/movies 两个 target 的同等行为)。
+
+    @Test fun `合集 Tab 有缓存但刷新失败时也会让 isOffline 变为 true`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), "Series", any(), any(), 0, 50, any(), null, any(), any(), any(), any()) } returns
+            page("剧集A")
+        coEvery { api.items(any(), "Movie", any(), any(), 0, 50, any(), null, any(), any(), any(), any()) } returns
+            ItemsResponseDto(listOf(movieDto("m1")), total = 1)
+        coEvery { api.items(any(), "BoxSet", any(), any(), 0, 50, any(), null, any(), any(), any(), any()) } throws
+            java.io.IOException("offline")
+
+        val repository = FakeMediaRepository()
+        val collectionsBucket =
+            libraryBucketKey(CacheBuckets.LIBRARY_COLLECTIONS, LibrarySortBy.NAME, LibrarySortOrder.ASCENDING, LibraryFilters())
+        repository.seed(collectionsBucket, listOf(series("缓存合集")))
+
+        val vm = newViewModel(api, repository = repository)
+        advanceUntilIdle()
+
+        assertTrue(vm.uiState.value.isOffline, "合集 Tab 有缓存但刷新失败,也应该体现在整体离线横幅上")
+        assertEquals(listOf("剧集A"), vm.uiState.value.series.items.map { it.name }, "剧集 Tab 本身仍正常显示")
+    }
 }

@@ -36,10 +36,10 @@ private const val SEARCH_DEBOUNCE_MS = 300L
 /** 无缓存又连不上服务器时给用户看的话。不带技术细节——用户能做的只有"重试"。 */
 private const val OFFLINE_MESSAGE = "无法连接服务器"
 
-enum class LibraryTab { SERIES, MOVIES }
+enum class LibraryTab { SERIES, MOVIES, COLLECTIONS }
 
 /** 当前可见的分页列表是哪一个——浏览态下按 Tab 分流,搜索态下统一走 searchResults。 */
-private enum class ListTarget { SERIES, MOVIES, SEARCH }
+private enum class ListTarget { SERIES, MOVIES, COLLECTIONS, SEARCH }
 
 /**
  * 浏览排序字段。[apiValue] 对应 `/Items` 的 `sortBy`,取值来自 Jellyfin `ItemSortBy` 枚举,
@@ -140,17 +140,33 @@ data class SeriesDetailUiState(
     val error: String? = null,
 )
 
+/**
+ * 合集(BoxSet)详情:直接是一份条目列表(电影/剧集混排),不像剧集详情那样有"季"这层
+ * 结构。合集不是自动连播的队列语境——里面的条目彼此独立,点开电影直接播放,点开剧集导航
+ * 到 [SeriesDetailUiState] 那条既有路径,所以这里不需要 `queueFor` 那样的概念。
+ */
+data class CollectionDetailUiState(
+    val collectionId: String,
+    val items: List<MediaItem> = emptyList(),
+    val isLoading: Boolean = true,
+    val isOffline: Boolean = false,
+    val error: String? = null,
+)
+
 data class LibraryUiState(
     val tab: LibraryTab = LibraryTab.SERIES,
     val series: PageState<MediaItem> = PageState(),
     val movies: PageState<MediaItem> = PageState(),
-    /** 当前排序/筛选选择——两个 Tab 共用同一套选择(顶部只有一处排序筛选入口)。 */
+    /** 合集(BoxSet)列表——第三个浏览 Tab(设计文档 §3.7)。 */
+    val collections: PageState<MediaItem> = PageState(),
+    /** 当前排序/筛选选择——三个 Tab 共用同一套选择(顶部只有一处排序筛选入口)。 */
     val sortBy: LibrarySortBy = LibrarySortBy.NAME,
     val sortOrder: LibrarySortOrder = LibrarySortOrder.ASCENDING,
     val filters: LibraryFilters = LibraryFilters(),
     val query: String = "",
     val searchResults: PageState<MediaItem> = PageState(),
     val detail: SeriesDetailUiState? = null,
+    val collectionDetail: CollectionDetailUiState? = null,
     /** 当前可见的浏览列表显示的是缓存、且这次刷新没成功。 */
     val isOffline: Boolean = false,
 ) {
@@ -158,7 +174,15 @@ data class LibraryUiState(
 
     /** 当前该显示哪一页数据:搜索态下永远是 searchResults,否则跟随当前 Tab。 */
     val visible: PageState<MediaItem>
-        get() = if (isSearching) searchResults else if (tab == LibraryTab.SERIES) series else movies
+        get() = if (isSearching) {
+            searchResults
+        } else {
+            when (tab) {
+                LibraryTab.SERIES -> series
+                LibraryTab.MOVIES -> movies
+                LibraryTab.COLLECTIONS -> collections
+            }
+        }
 }
 
 /**
@@ -213,6 +237,7 @@ class LibraryViewModel @Inject constructor(
 
     private var seasonsJob: Job? = null
     private var episodesJob: Job? = null
+    private var collectionDetailJob: Job? = null
 
     /**
      * 浏览列表(剧集/电影)**各自**最近一次的刷新是否失败,用来 OR 出 [LibraryUiState.isOffline]。
@@ -266,9 +291,9 @@ class LibraryViewModel @Inject constructor(
         }
     }
 
-    /** 首屏加载:剧集 / 电影各自独立并发拉第一页(缓存优先)。 */
+    /** 首屏加载:剧集 / 电影 / 合集各自独立并发拉第一页(缓存优先)。 */
     fun loadLibrary() {
-        listOf(ListTarget.SERIES, ListTarget.MOVIES).forEach { loadFirstPage(it) }
+        listOf(ListTarget.SERIES, ListTarget.MOVIES, ListTarget.COLLECTIONS).forEach { loadFirstPage(it) }
     }
 
     fun selectTab(tab: LibraryTab) {
@@ -301,7 +326,7 @@ class LibraryViewModel @Inject constructor(
     }
 
     private fun reloadBrowseLists() {
-        listOf(ListTarget.SERIES, ListTarget.MOVIES).forEach { loadFirstPage(it) }
+        listOf(ListTarget.SERIES, ListTarget.MOVIES, ListTarget.COLLECTIONS).forEach { loadFirstPage(it) }
     }
 
     fun onQueryChange(query: String) {
@@ -424,6 +449,52 @@ class LibraryViewModel @Inject constructor(
     fun queueFor(episode: MediaItem): List<MediaItem> =
         _uiState.value.detail?.episodes?.takeIf { it.isNotEmpty() } ?: listOf(episode)
 
+    /** 进入某个合集:缓存优先加载它的直接子条目(电影/剧集混排,不递归)。 */
+    fun openCollection(collectionId: String) {
+        collectionDetailJob?.cancel()
+        _uiState.update { it.copy(collectionDetail = CollectionDetailUiState(collectionId = collectionId, isLoading = true)) }
+        collectionDetailJob = viewModelScope.launch {
+            var delivered = false
+            repository.bucket(CacheBuckets.collectionItemsOf(collectionId)) {
+                fetchCollectionItems(collectionId)
+            }.collect { cached ->
+                delivered = true
+                _uiState.update { state ->
+                    state.copy(
+                        collectionDetail = state.collectionDetail?.copy(
+                            items = cached.data,
+                            isLoading = cached.isStale && !cached.refreshFailed,
+                            isOffline = cached.refreshFailed,
+                            error = null,
+                        ),
+                    )
+                }
+            }
+            if (!delivered) {
+                _uiState.update { state ->
+                    state.copy(collectionDetail = state.collectionDetail?.copy(isLoading = false, error = OFFLINE_MESSAGE))
+                }
+            }
+        }
+    }
+
+    /** 重试当前合集详情的加载——本质就是重新 openCollection 同一个 id。 */
+    fun retryCollection() {
+        _uiState.value.collectionDetail?.collectionId?.let { openCollection(it) }
+    }
+
+    /**
+     * 合集内的直接子条目:`parentId` 定位到这个合集,`recursive=false` 只要直接子项
+     * (合集本身可能混装电影和整部剧集,不需要也不应该展开到季/集那一层)。
+     */
+    private suspend fun fetchCollectionItems(collectionId: String): List<MediaItem> =
+        api.items(
+            userId = session.userId(),
+            types = "Movie,Series",
+            recursive = false,
+            parentId = collectionId,
+        ).items.mapNotNull { it.toMediaItem() }
+
     /**
      * 浏览列表的**第一页**:缓存优先。一条流会先后发"缓存"和"新数据"两次,所以这里是
      * **整体替换**而不是 [PageState.onPageLoaded] 的追加语义(追加会把两批拼成重复列表)。
@@ -538,14 +609,19 @@ class LibraryViewModel @Inject constructor(
         val state = _uiState.value
         return when {
             state.isSearching -> ListTarget.SEARCH
-            state.tab == LibraryTab.SERIES -> ListTarget.SERIES
-            else -> ListTarget.MOVIES
+            else -> when (state.tab) {
+                LibraryTab.SERIES -> ListTarget.SERIES
+                LibraryTab.MOVIES -> ListTarget.MOVIES
+                LibraryTab.COLLECTIONS -> ListTarget.COLLECTIONS
+            }
         }
     }
 
     private fun typesFor(target: ListTarget): String = when (target) {
         ListTarget.SERIES -> "Series"
         ListTarget.MOVIES -> "Movie"
+        // BaseItemKind 精确拼写 "BoxSet" 已用 jq 核对(见 MediaItemMapper 里的同一处核对)。
+        ListTarget.COLLECTIONS -> "BoxSet"
         ListTarget.SEARCH -> "Series,Movie"
     }
 
@@ -559,6 +635,7 @@ class LibraryViewModel @Inject constructor(
         val base = when (target) {
             ListTarget.SERIES -> CacheBuckets.LIBRARY_SERIES
             ListTarget.MOVIES -> CacheBuckets.LIBRARY_MOVIES
+            ListTarget.COLLECTIONS -> CacheBuckets.LIBRARY_COLLECTIONS
             ListTarget.SEARCH -> return null
         }
         val state = _uiState.value
@@ -576,6 +653,7 @@ class LibraryViewModel @Inject constructor(
     private fun getPageState(target: ListTarget): PageState<MediaItem> = when (target) {
         ListTarget.SERIES -> _uiState.value.series
         ListTarget.MOVIES -> _uiState.value.movies
+        ListTarget.COLLECTIONS -> _uiState.value.collections
         ListTarget.SEARCH -> _uiState.value.searchResults
     }
 
@@ -584,6 +662,7 @@ class LibraryViewModel @Inject constructor(
             when (target) {
                 ListTarget.SERIES -> state.copy(series = transform(state.series))
                 ListTarget.MOVIES -> state.copy(movies = transform(state.movies))
+                ListTarget.COLLECTIONS -> state.copy(collections = transform(state.collections))
                 ListTarget.SEARCH -> state.copy(searchResults = transform(state.searchResults))
             }
         }

@@ -2,7 +2,7 @@ package dev.insua.jellycast.model
 
 import java.util.Locale
 
-enum class MediaKind { SERIES, SEASON, EPISODE, MOVIE }
+enum class MediaKind { SERIES, SEASON, EPISODE, MOVIE, COLLECTION }
 
 data class MediaItem(
     val id: String,
