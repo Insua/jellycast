@@ -111,8 +111,9 @@ class LyricsAutoFollowController(
 
 /**
  * 歌词式字幕视图:对标 Apple Music / 小宇宙的歌词滚动。当前行由
- * [dev.insua.jellycast.model.SubtitleTimeline.indexAt] 算出(已在 core:model 单测覆盖的二分查找,
- * 这里绝不重写第二份查找逻辑),点击任意行只做一件事——把该行 [SubtitleLine.startMs] 交给
+ * [dev.insua.jellycast.model.SubtitleTimeline.indexAt] 算出(已在 core:model 单测覆盖的线性扫描——
+ * 缺陷 2/设计文档 §3.4 之后不再是二分查找,这里绝不重写第二份查找逻辑),点击任意行只做一件事——
+ * 把该行 [SubtitleLine.startMs] 交给
  * [onSeek],至于"seek 在转码音频流上到底怎么实现"完全不是这一层的事(见 [PlayerViewModel.onSeek])。
  *
  * 间隙期处理(设计决策,详见任务报告):[SubtitleTimeline.indexAt] 在两行之间返回 -1 ——
@@ -128,11 +129,19 @@ fun LyricsView(
     positionMs: Long,
     onSeek: (Long) -> Unit,
     modifier: Modifier = Modifier,
+    // 全支线复审 Important:候选字幕轨存在但全被弹幕信号(标题关键字或解析后密度异常)排除时,
+    // [PlayerUiState.subtitleSkippedAsDanmaku] 为 true——占位文案要能区分"这一集真的没有字幕"
+    // 和"有字幕但被判定为弹幕丢弃了",后者不该悄无声息。
+    subtitleSkippedAsDanmaku: Boolean = false,
 ) {
     if (lyricsDisplayState(isLoading = false, timeline = timeline) == LyricsDisplayState.PLACEHOLDER) {
         Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Text(
-                text = "此内容无文本字幕",
+                text = if (subtitleSkippedAsDanmaku) {
+                    "识别到疑似弹幕的字幕轨,已跳过——本集暂不显示字幕"
+                } else {
+                    "此内容无文本字幕"
+                },
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,

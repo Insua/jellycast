@@ -139,6 +139,7 @@ fun PlayerScreen(
                 positionMs = uiState.positionMs,
                 onSeek = viewModel::onSeek,
                 modifier = Modifier.weight(1f),
+                subtitleSkippedAsDanmaku = uiState.subtitleSkippedAsDanmaku,
             )
         }
 

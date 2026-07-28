@@ -58,4 +58,32 @@ class SubtitleTimeline(val lines: List<SubtitleLine>) {
         }
         return next
     }
+
+    /**
+     * 弹幕轨识别信号 2(设计文档 §3.3):条目密度异常。[SubtitleTrackRef.isLikelyDanmaku] 的标题
+     * 关键字只是信号之一,覆盖不了命名花样百出的场景——日文コメント、通用 Track 1、纯数字标签的
+     * 弹幕轨都不含 danmu/danmaku/弹幕这三个词,但它们的行密度远高于对白轨:实测样本 25 分钟集数,
+     * 真字幕 774 条(≈31/分钟)、外挂弹幕 3676 条(≈147/分钟),相差近 5 倍。
+     *
+     * 用密度(条目数 / 分钟)而不是原始条目数——原始数字对短集数偏保守、对长片(90 分钟电影的
+     * 对白行数本来就该比 20 分钟番剧多)偏激进,密度把片长这个变量除掉了。
+     *
+     * 这个信号只有在字幕文件解析完之后才算得出来(选轨发生在拉取字幕之前,行数此时未知)——
+     * 调用方(`PlayerViewModel`)负责在解析后二次判定,判定为弹幕就降级并换下一个候选,而不是
+     * 在这里直接丢弃数据(和 `indexAt`/`nextBoundaryAfter` 一样,这里只判定、不决策)。
+     */
+    fun isSuspiciouslyDense(runTimeMs: Long): Boolean {
+        if (runTimeMs <= 0L || lines.isEmpty()) return false
+        val minutes = runTimeMs / 60_000.0
+        return (lines.size / minutes) > DANMAKU_DENSITY_PER_MINUTE_THRESHOLD
+    }
+
+    private companion object {
+        /**
+         * 60/分钟取在实测两个样本密度(≈31 与 ≈147)中间偏保守的一侧——约为真字幕密度的 2 倍、
+         * 弹幕密度的四成,留了足够余量:语速快、行数多的正常对白轨(尤其是短集数)不会被误判,
+         * 同时仍能稳定命中实测弹幕轨。
+         */
+        const val DANMAKU_DENSITY_PER_MINUTE_THRESHOLD = 60.0
+    }
 }

@@ -1,6 +1,8 @@
 package dev.insua.jellycast.model
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class SubtitleTimelineTest {
@@ -97,5 +99,39 @@ class SubtitleTimelineTest {
 
     @Test fun `nextBoundaryAfter 空时间轴返回 null`() {
         assertEquals(null, SubtitleTimeline(emptyList()).nextBoundaryAfter(0))
+    }
+
+    // 全支线复审 Important:标题关键字(danmu/danmaku/弹幕)只是弹幕识别的信号之一,覆盖不了
+    // 命名花样百出的场景(日文コメント、通用 Track 1、纯数字标签)。设计文档 §3.3 明确写了第二个
+    // 独立信号:条目数异常多。这里用"密度"(条目数 / 分钟)而不是原始条目数——原始数字对短集数
+    // 偏保守、对长片(90 分钟电影本来对白就该比 20 分钟番剧多)偏激进,密度把片长这个变量除掉了。
+    // 实测样本:25 分钟集数,真字幕 774 条(≈31/分钟),外挂弹幕 3676 条(≈147/分钟)。
+    private fun denseTimeline(count: Int): SubtitleTimeline =
+        SubtitleTimeline((0 until count).map { SubtitleLine(it * 100L, it * 100L + 50L, "line$it") })
+
+    @Test fun `密度异常判定为疑似弹幕`() {
+        val danmakuLike = denseTimeline(3676)
+        assertTrue(danmakuLike.isSuspiciouslyDense(runTimeMs = 25 * 60_000L))
+    }
+
+    @Test fun `正常对白密度不判定为疑似弹幕`() {
+        val dialogue = denseTimeline(774)
+        assertFalse(dialogue.isSuspiciouslyDense(runTimeMs = 25 * 60_000L))
+    }
+
+    @Test fun `更长片长的正常对白行数更多也不应被误判`() {
+        // 密度而非原始条目数是关键:2000 条比 774 条多,但摊在 90 分钟电影里密度反而更低。
+        val movieDialogue = denseTimeline(2000)
+        assertFalse(movieDialogue.isSuspiciouslyDense(runTimeMs = 90 * 60_000L))
+    }
+
+    @Test fun `时长未知或非正数时不判定密度`() {
+        val danmakuLike = denseTimeline(3676)
+        assertFalse(danmakuLike.isSuspiciouslyDense(runTimeMs = 0L))
+        assertFalse(danmakuLike.isSuspiciouslyDense(runTimeMs = -1L))
+    }
+
+    @Test fun `空时间轴不判定密度`() {
+        assertFalse(SubtitleTimeline(emptyList()).isSuspiciouslyDense(runTimeMs = 25 * 60_000L))
     }
 }
