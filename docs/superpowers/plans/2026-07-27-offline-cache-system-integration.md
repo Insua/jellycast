@@ -403,20 +403,12 @@ jq -r '.paths["/UserFavoriteItems/{itemId}"] | to_entries[] | "\(.key) \(.value.
 - [ ] `BoxSet` 已确认是合法 `BaseItemKind`。媒体库增加合集浏览,进入后列出其内容。
 - [ ] Commit:`feat(library): browse collections`
 
-### Task 20:清理仓库中的服务器地址
+### Task 20:清理仓库中的服务器地址 —— ❌ 已取消(2026-07-28)
 
-**⚠️ 含历史重写,属破坏性操作。执行前必须再次向用户确认。**
+用户决定不做。理由:该地址是 Tailscale 虚拟网段(CGNAT `100.64.0.0/10`),
+只在其 tailnet 内可达,外部无法访问,不构成实际暴露面。
 
-- [ ] **Step 1: 先清理工作区**
-
-替换 6 个已提交文件中的真实地址为占位符:2 个测试夹具、3 份 v1 文档
-(`docs/jellyfin-openapi.json` 是服务器自己生成的,**单独询问用户是否也要处理**)。
-
-- [ ] **Step 2: 历史重写(仅在用户明确同意后)**
-
-用 `git filter-repo`。**执行前必须先备份仓库**。完成后全历史 grep 复查。
-
-- [ ] **Step 3: Commit**
+**因此本计划的交付范围为 Task 1–19。**
 
 ---
 
