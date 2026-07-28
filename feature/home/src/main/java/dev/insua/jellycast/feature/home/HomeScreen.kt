@@ -7,13 +7,19 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -28,6 +34,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import dev.insua.jellycast.designsystem.ActionMessageHost
 import dev.insua.jellycast.designsystem.OfflineBanner
 import dev.insua.jellycast.designsystem.PosterCard
 import dev.insua.jellycast.model.MediaItem
@@ -37,6 +44,8 @@ import dev.insua.jellycast.network.mapper.posterUrl
 /** 定位节点用的测试标签,不依赖文案(文案会改)。 */
 object HomeScreenTestTags {
     const val ERROR_RETRY = "home_error_retry"
+    const val TAB_ROW = "home_tab_row"
+    const val FAVORITES_EMPTY = "home_favorites_empty"
 }
 
 /**
@@ -67,81 +76,176 @@ fun HomeScreen(
     // (或点重试重新加载)时提示该重新出现,而不是被永久关掉。
     var offlineNoticeDismissed by rememberSaveable { mutableStateOf(false) }
 
+    Box {
     Column(modifier = Modifier.padding(vertical = 8.dp)) {
-        // 显示的是上次的内容:提示一句,但绝不挡住内容本身,也允许用户关掉。
+        // 顶部标签(设计文档 §3.6):首页信息流 / 我的最爱。切标签不触发新请求——两份数据
+        // 已经在 [HomeViewModel.load] 里并发取好,这里只是本地状态切换。
+        TabRow(
+            selectedTabIndex = uiState.tab.ordinal,
+            modifier = Modifier.testTag(HomeScreenTestTags.TAB_ROW),
+        ) {
+            Tab(
+                selected = uiState.tab == HomeTab.FEED,
+                onClick = { viewModel.selectTab(HomeTab.FEED) },
+                text = { Text("首页") },
+            )
+            Tab(
+                selected = uiState.tab == HomeTab.FAVORITES,
+                onClick = { viewModel.selectTab(HomeTab.FAVORITES) },
+                text = { Text("我的最爱") },
+            )
+        }
+
+        // 显示的是上次的内容:提示一句,但绝不挡住内容本身,也允许用户关掉。这条横幅覆盖两个
+        // 标签共同的离线状态(HomeUiState.isOffline 已经 OR 了「我的最爱」的刷新结果),
+        // 放在 TabRow 之下、两个标签内容之上,不随切标签而改变含义。
         //
         // ⚠️ **必须放在 LazyColumn 外面。** 放进去(`item(key = "home_offline")`)会踩到懒列表的
         // 锚定行为:分区是先到的,提示条是后到的(网络失败晚于读缓存),于是这一项是被**插入到
         // 已有项之前**的。LazyListState 带 key 时会保持原来那一项的位置不动,新插入的项因此
         // 落在视口**上方** —— 它确实被组合出来了,用户却要往上滑才看得见。真机验证时正是这个
         // 现象:日志里 isOffline=true、屏幕上什么都没有。
-        if (uiState.isOffline && uiState.sections.isNotEmpty() && !offlineNoticeDismissed) {
+        val hasVisibleContent = if (uiState.tab == HomeTab.FEED) uiState.sections.isNotEmpty() else uiState.favorites.isNotEmpty()
+        if (uiState.isOffline && hasVisibleContent && !offlineNoticeDismissed) {
             OfflineBanner(onDismiss = { offlineNoticeDismissed = true })
         }
 
-        LazyColumn(
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-            contentPadding = PaddingValues(bottom = 96.dp), // 给底部常驻的 MiniPlayerBar 让位
+        when (uiState.tab) {
+            HomeTab.FEED -> HomeFeed(
+                uiState = uiState,
+                baseUrl = baseUrl,
+                onItemClick = onItemClick,
+                onLibraryClick = onLibraryClick,
+                onRetry = {
+                    offlineNoticeDismissed = false
+                    viewModel.retry()
+                },
+            )
+            HomeTab.FAVORITES -> FavoritesGrid(
+                favorites = uiState.favorites,
+                baseUrl = baseUrl,
+                onItemClick = onItemClick,
+                onToggleFavorite = viewModel::toggleFavorite,
+            )
+        }
+    }
+
+    ActionMessageHost(message = uiState.actionError, onMessageShown = viewModel::consumeActionError)
+    }
+}
+
+@Composable
+private fun HomeFeed(
+    uiState: HomeUiState,
+    baseUrl: String,
+    onItemClick: (MediaItem) -> Unit,
+    onLibraryClick: (String) -> Unit,
+    onRetry: () -> Unit,
+) {
+    LazyColumn(
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+        contentPadding = PaddingValues(bottom = 96.dp), // 给底部常驻的 MiniPlayerBar 让位
+    ) {
+        // 没缓存又连不上服务器:给一个可点的重试行,而不是一片什么都没有的白屏。
+        // 只要有任何一个分区有内容(哪怕是缓存),error 就是 null,这一行不会盖住它们。
+        uiState.error?.let { message ->
+            item(key = "home_error") {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(onClick = onRetry)
+                        .padding(horizontal = 16.dp, vertical = 24.dp)
+                        .testTag(HomeScreenTestTags.ERROR_RETRY),
+                ) {
+                    Text(
+                        text = message,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    Text(
+                        text = "点击重试",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
+        }
+        for (section in uiState.sections) {
+            item(key = section.kind) {
+                HomeSectionRow(
+                    section = section,
+                    baseUrl = baseUrl,
+                    // 「我的媒体」的卡片点的是库,不是可播放条目——回调换成 onLibraryClick,
+                    // 其余分区(继续收听/下一集)行为不变。
+                    onItemClick = { mediaItem ->
+                        if (section.kind == HomeSectionKind.LIBRARIES) {
+                            onLibraryClick(mediaItem.id)
+                        } else {
+                            onItemClick(mediaItem)
+                        }
+                    },
+                )
+            }
+        }
+        // 「最近添加」按库分组(设计文档 §3.6),紧跟在三个 flat 分区之后。空分组已经被
+        // ViewModel 过滤掉,这里不会画出一个没有内容的标题。
+        for (group in uiState.recentlyAddedGroups) {
+            item(key = "recent_${group.libraryId}") {
+                RecentlyAddedGroupRow(
+                    group = group,
+                    baseUrl = baseUrl,
+                    onItemClick = onItemClick,
+                    onLibraryClick = onLibraryClick,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 「我的最爱」标签页(设计文档 §3.6/§3.7):混排的收藏条目网格,点击行为按类型分流——
+ * 剧集是"库"这一层概念在这里不会出现,所以只需要区分"是不是可以直接播放"。已收藏的剧集条目
+ * 直接点播(与浏览页/剧集详情不同,这里没有"进详情选季"这层导航,保持最短路径)。
+ * 每张卡片右上角是收藏按钮,点了立刻从这个网格消失(乐观更新,见 [HomeViewModel.toggleFavorite])。
+ */
+@Composable
+private fun FavoritesGrid(
+    favorites: List<MediaItem>,
+    baseUrl: String,
+    onItemClick: (MediaItem) -> Unit,
+    onToggleFavorite: (MediaItem) -> Unit,
+) {
+    if (favorites.isEmpty()) {
+        Box(
+            modifier = Modifier.fillMaxSize().padding(32.dp),
+            contentAlignment = Alignment.Center,
         ) {
-            // 没缓存又连不上服务器:给一个可点的重试行,而不是一片什么都没有的白屏。
-            // 只要有任何一个分区有内容(哪怕是缓存),error 就是 null,这一行不会盖住它们。
-            uiState.error?.let { message ->
-                item(key = "home_error") {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable {
-                                // 重试是一次全新的加载,离线提示的"已看过"状态跟着复位。
-                                offlineNoticeDismissed = false
-                                viewModel.retry()
-                            }
-                            .padding(horizontal = 16.dp, vertical = 24.dp)
-                            .testTag(HomeScreenTestTags.ERROR_RETRY),
-                    ) {
-                        Text(
-                            text = message,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.error,
-                        )
-                        Text(
-                            text = "点击重试",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.primary,
-                        )
-                    }
-                }
-            }
-            for (section in uiState.sections) {
-                item(key = section.kind) {
-                    HomeSectionRow(
-                        section = section,
-                        baseUrl = baseUrl,
-                        // 「我的媒体」的卡片点的是库,不是可播放条目——回调换成 onLibraryClick,
-                        // 其余分区(继续收听/下一集)行为不变。
-                        onItemClick = { mediaItem ->
-                            if (section.kind == HomeSectionKind.LIBRARIES) {
-                                onLibraryClick(mediaItem.id)
-                            } else {
-                                onItemClick(mediaItem)
-                            }
-                        },
-                    )
-                }
-            }
-            // 「最近添加」按库分组(设计文档 §3.6),紧跟在三个 flat 分区之后。空分组已经被
-            // ViewModel 过滤掉,这里不会画出一个没有内容的标题。
-            for (group in uiState.recentlyAddedGroups) {
-                item(key = "recent_${group.libraryId}") {
-                    RecentlyAddedGroupRow(
-                        group = group,
-                        baseUrl = baseUrl,
-                        onItemClick = onItemClick,
-                        onLibraryClick = onLibraryClick,
-                    )
-                }
-            }
+            Text(
+                "还没有收藏的内容",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.testTag(HomeScreenTestTags.FAVORITES_EMPTY),
+            )
+        }
+        return
+    }
+
+    LazyVerticalGrid(
+        columns = GridCells.Adaptive(minSize = 140.dp),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 96.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        items(favorites, key = { it.id }) { mediaItem ->
+            PosterCard(
+                title = mediaItem.name,
+                subtitle = mediaItem.displaySubtitle.ifBlank { null },
+                imageUrl = if (baseUrl.isBlank()) null else mediaItem.posterUrl(baseUrl),
+                onClick = { onItemClick(mediaItem) },
+                isFavorite = mediaItem.isFavorite,
+                onToggleFavorite = { onToggleFavorite(mediaItem) },
+            )
         }
     }
 }
