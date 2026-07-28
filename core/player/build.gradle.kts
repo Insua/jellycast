@@ -2,6 +2,9 @@ plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.hilt)
     alias(libs.plugins.ksp)
+    // v3 复审 Finding 2:给 Robolectric 挂 JUnit Platform Launcher Interceptor,只对本模块的
+    // 单测生效——SeekInterceptingPlayerTest 里真实断言 Player.Commands 的内容需要它。
+    alias(libs.plugins.robolectric.junit5)
 }
 // 注意:AGP 9 内置 Kotlin 支持,不 apply kotlin-android 插件。
 
@@ -48,6 +51,7 @@ dependencies {
     testImplementation(libs.mockk)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.okhttp.mockwebserver)
+    testImplementation(libs.robolectric.junit5.extension)
 }
 
 // AGP library 模块下 tasks.test 访问器不可用(它是 DefaultTask 聚合器),

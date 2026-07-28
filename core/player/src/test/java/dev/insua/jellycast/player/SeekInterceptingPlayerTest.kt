@@ -261,18 +261,20 @@ class SeekInterceptingPlayerTest {
     }
 
     /**
-     * ⚠️ 这里**不**通过构造 `Player.Commands`(`Builder().add(...).build()`)再 `.contains()` 回读来
-     * 断言 [SeekInterceptingPlayer.getAvailableCommands] 的结果——排查过:`Player.Commands.Builder`
-     * 内部用 `android.util.SparseBooleanArray`(真实 Android 框架类)存储,在本模块
-     * `testOptions.unitTests.isReturnDefaultValues = true` 的纯 JVM 环境下,它的 `add`/`get` 全是
-     * 静默空桩(不抛异常,但也不真的存东西),`.build()` 出来的 `Commands` 无论加没加过命令,
-     * `.contains()` 永远回 `false`——这一层测出来的只会是假阳性/假阴性,和 `Uri.parse` 是同一类
-     * 环境限制([PlaybackDisplayMetadata] 的类注释)。
+     * ⚠️ v3 复审 Finding 2(已闭合):这里**不**通过构造 `Player.Commands`
+     * (`Builder().add(...).build()`)再 `.contains()` 回读来断言 [SeekInterceptingPlayer.getAvailableCommands]
+     * 的结果——排查过:`Player.Commands.Builder` 内部用 `android.util.SparseBooleanArray`(真实
+     * Android 框架类)存储,在本模块 `testOptions.unitTests.isReturnDefaultValues = true` 的纯 JVM
+     * 环境下,它的 `add`/`get` 全是静默空桩(不抛异常,但也不真的存东西),`.build()` 出来的
+     * `Commands` 无论加没加过命令,`.contains()` 永远回 `false`——这一层测出来的只会是假阳性/假阴性,
+     * 和 `Uri.parse` 是同一类环境限制([PlaybackDisplayMetadata] 的类注释)。
      *
-     * 能在这个环境里可靠验证的是**接线本身**:[SeekInterceptingPlayer.getAvailableCommands] 有没有
-     * 真的去问 [QueueNavigator] 的 `hasNext()`/`hasPrevious()`。真实的"加没加对命令"这件事留给
-     * `buildUpon()`/`add()`/`remove()` 这几个已经过 `javap` 核对过字节码的标准 Media3 API
-     * (真机/流体云验收项)。
+     * 这个测试本身**只**可靠验证**接线**:[SeekInterceptingPlayer.getAvailableCommands] 有没有真的去问
+     * [QueueNavigator] 的 `hasNext()`/`hasPrevious()`——单靠它不够,即使 `add`/`remove` 被写反(该加
+     * 的时候删、该删的时候加)它也照样通过。真正"加没加对命令"这件事现在由
+     * [SeekInterceptingPlayerCommandsTest] 覆盖:借 `tech.apter.junit5.jupiter:robolectric-extension`
+     * 把 Robolectric 接进 JUnit5,拿到真实的 `SparseBooleanArray` shadow,直接断言
+     * `Player.Commands.contains(...)` 的真实结果,不再需要留到真机/流体云验收。
      */
     @Test fun `getAvailableCommands 会查询 QueueNavigator 的 hasNext 和 hasPrevious`() {
         val underlying = mockk<Player>(relaxed = true)
