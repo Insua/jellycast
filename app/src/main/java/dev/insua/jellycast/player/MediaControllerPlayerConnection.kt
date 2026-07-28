@@ -164,11 +164,23 @@ class MediaControllerPlayerConnection @Inject constructor(
         if (armed) autoPlayNextController.armStopAfterCurrentEpisode() else autoPlayNextController.disarmStopAfterCurrentEpisode()
     }
 
+    /**
+     * v3 复审 Finding 3(Minor,已闭合):[skipToNext] 曾经在这里手写一遍"取 userId → 推进队列 →
+     * engine.play()",顺序还写反了(先 `playQueue.next()` 再查 userId)——拿不到登录用户时队列已经
+     * 推进过了,引擎却没跟着播,和 [EngineQueueNavigator] 类注释里点名要避免的那个缺陷一模一样。
+     * 两份独立实现的"下一集"逻辑迟早会分道扬镳,这里改成直接复用 [EngineQueueNavigator]:
+     * "先查 userId、拿不到就安全地什么都不做"这条顺序只在一个地方写。[EngineQueueNavigator] 本身不
+     * 持有跨调用的可变状态,只是把 [playQueue]/[audioPlaybackEngine] 这两个单例包一层,这里和
+     * `PlaybackService.onCreate()` 里各自持有一个实例并不冲突。
+     */
+    private val queueNavigator: QueueNavigator = EngineQueueNavigator(
+        playQueue = playQueue,
+        engine = audioPlaybackEngine,
+        userIdProvider = { runCatching { jellyfinSession.userId() }.getOrNull() },
+        scope = scope,
+    )
+
     override fun skipToNext() {
-        scope.launch {
-            val next = playQueue.next() ?: return@launch
-            val userId = runCatching { jellyfinSession.userId() }.getOrNull() ?: return@launch
-            audioPlaybackEngine.play(next.id, userId, next.resumePositionMs)
-        }
+        queueNavigator.next()
     }
 }
