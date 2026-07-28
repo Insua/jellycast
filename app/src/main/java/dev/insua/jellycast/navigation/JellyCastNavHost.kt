@@ -36,6 +36,7 @@ import androidx.navigation.compose.rememberNavController
 import dev.insua.jellycast.designsystem.MiniPlayerBar
 import dev.insua.jellycast.feature.home.HomeScreen
 import dev.insua.jellycast.feature.library.CollectionDetailScreen
+import dev.insua.jellycast.feature.library.LibraryContentsScreen
 import dev.insua.jellycast.feature.library.LibraryScreen
 import dev.insua.jellycast.feature.library.SeriesDetailScreen
 import dev.insua.jellycast.feature.player.PlayerScreen
@@ -145,6 +146,9 @@ fun JellyCastNavHost(
                         sessionViewModel.play(item, listOf(item))
                         playerExpanded = true
                     },
+                    // 「我的媒体」库卡片(修正 §3.1):之前这里没接,走了 HomeScreen 参数的默认空
+                    // 实现,点了没反应。跳到新增的按库浏览路由,库内容用 /Items?parentId= 拉取。
+                    onLibraryClick = { libraryId -> navController.navigate(Routes.libraryView(libraryId)) },
                     // 搜索入口跳进媒体库页——搜索框本来就长在那里(见 LibraryScreen 的
                     // LibraryScreenTestTags.SEARCH_FIELD),顶部栏这里不重新实现一遍搜索。
                     onSearchClick = {
@@ -187,6 +191,18 @@ fun JellyCastNavHost(
                 val collectionId = entry.arguments?.getString("collectionId") ?: return@composable
                 CollectionDetailScreen(
                     collectionId = collectionId,
+                    onSeriesClick = { seriesId -> navController.navigate(Routes.seriesDetail(seriesId)) },
+                    onPlay = { item ->
+                        sessionViewModel.play(item, listOf(item))
+                        playerExpanded = true
+                    },
+                    baseUrl = baseUrl,
+                )
+            }
+            composable(Routes.LIBRARY_VIEW_PATTERN) { entry ->
+                val libraryId = entry.arguments?.getString("libraryId") ?: return@composable
+                LibraryContentsScreen(
+                    libraryId = libraryId,
                     onSeriesClick = { seriesId -> navController.navigate(Routes.seriesDetail(seriesId)) },
                     onPlay = { item ->
                         sessionViewModel.play(item, listOf(item))
