@@ -139,6 +139,42 @@ class PlaybackSourceResolverTest {
         assertEquals(1, src.audioTracks.first().index)
     }
 
+    /**
+     * 缺陷 1(设计文档 §3.3):`PlayerViewModel` 要在默认选轨时降级弹幕,前提是它能拿到
+     * `IsExternal` 信号 —— 这条断言确保 [MediaStreamDto.isExternal] 被原样传进
+     * [dev.insua.jellycast.model.SubtitleTrackRef.isExternal],而不是在这一层丢失。
+     */
+    @Test fun `字幕轨的 isExternal 从 MediaStreamDto 原样传递`() = runTest {
+        val mediaSource = MediaSourceDto(
+            id = TEST_MEDIA_SOURCE_ID,
+            mediaStreams = listOf(
+                MediaStreamDto(
+                    type = "Subtitle", index = 0, codec = "ass", language = "chi",
+                    displayTitle = "弹幕[BiliBili]", isTextSubtitle = true, isExternal = true,
+                ),
+                MediaStreamDto(
+                    type = "Subtitle", index = 4, codec = "ass", language = "chi",
+                    displayTitle = "简体中文", isTextSubtitle = true, isExternal = true,
+                ),
+                MediaStreamDto(
+                    type = "Subtitle", index = 5, codec = "ass", language = "chi",
+                    displayTitle = "内嵌字幕", isTextSubtitle = true, isExternal = false,
+                ),
+            ),
+        )
+        val src = newResolver(probe(emptySet()), api = fakeApi(listOf(mediaSource))).resolve(TEST_ITEM_ID, TEST_USER_ID)
+
+        val danmaku = src.textSubtitles.first { it.index == 0 }
+        val realExternalSubtitle = src.textSubtitles.first { it.index == 4 }
+        val embedded = src.textSubtitles.first { it.index == 5 }
+
+        assertTrue(danmaku.isExternal)
+        assertTrue(danmaku.isLikelyDanmaku)
+        assertTrue(realExternalSubtitle.isExternal)
+        assertFalse(realExternalSubtitle.isLikelyDanmaku)
+        assertFalse(embedded.isExternal)
+    }
+
     @Test fun `startPositionMs 非零时换算为 ticks 拼进 URL`() = runTest {
         val resolver = newResolver(probe(setOf("/Audio/$TEST_ITEM_ID/universal")))
         val src = resolver.resolve(TEST_ITEM_ID, TEST_USER_ID, startPositionMs = 5_000L)

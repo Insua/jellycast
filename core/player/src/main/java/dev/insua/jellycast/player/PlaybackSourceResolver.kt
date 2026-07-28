@@ -89,6 +89,7 @@ class PlaybackSourceResolver(
                     language = it.language,
                     displayName = it.displayTitle ?: it.language ?: "字幕 ${it.index}",
                     isTextBased = true,
+                    isExternal = it.isExternal,
                 )
             }
 

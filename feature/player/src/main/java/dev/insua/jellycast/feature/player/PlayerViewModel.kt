@@ -103,6 +103,47 @@ internal fun nextPlaybackSpeed(current: Float): Float =
 
 private const val PLAYBACK_SPEED_EPSILON = 0.001f
 
+/**
+ * 默认字幕轨选择(设计文档 §3.3)。[tracks] 调用方必须已经排除弹幕轨
+ * ([dev.insua.jellycast.model.SubtitleTrackRef.isLikelyDanmaku])——这里不重复过滤,只负责
+ * 在"干净"的候选里挑:优先匹配偏好语言,找不到就退到第一条(哪怕语言不匹配也比没有字幕好)。
+ * [tracks] 为空(只有弹幕可选,或片源根本没有文本字幕)时返回 null,调用方据此显示空歌词区。
+ */
+internal fun selectDefaultSubtitleTrack(
+    tracks: List<SubtitleTrackRef>,
+    preferredLanguage: String?,
+): SubtitleTrackRef? = tracks.firstOrNull { it.language == preferredLanguage } ?: tracks.firstOrNull()
+
+/** 没有迫近字幕边界时的轮询基线,和缺陷 3 修复前完全一样——不额外费电。 */
+internal const val LYRICS_POLL_INTERVAL_MS = 500L
+
+/** 迫近边界时允许的最短轮询间隔,防止病态输入(边界间距趋近于 0)导致忙轮询耗电。 */
+internal const val LYRICS_MIN_POLL_INTERVAL_MS = 80L
+
+/**
+ * 缺陷 3(设计文档 §3.5):固定 500ms 轮询漏掉约 85% 的字幕行——很多行比半个轮询周期还短,
+ * 采样点两次都落在行外,那一行从未被命中过。
+ *
+ * 方案(选择"按下一个边界调度",没有选择"无脑提高频率"):不改变没有迫近事件时的轮询节奏
+ * ([LYRICS_POLL_INTERVAL_MS],和原来一样),只在
+ * [dev.insua.jellycast.model.SubtitleTimeline.nextBoundaryAfter] 报告有一条字幕行的起止边界
+ * 即将到来时,把这一次的睡眠精确设成"到那个边界还有多久"(按当前倍速折算),这样每条字幕行的
+ * 开始/结束都恰好被采样命中一次,而不是碰运气。
+ *
+ * 功耗权衡(必须权衡,不能无脑把间隔调到 50ms):naive 50ms 轮询会让 CPU 在整集播放期间
+ * 每秒唤醒 20 次。这里的方案是"稀疏、精确的唤醒"——远离边界时维持原来 2Hz 的基线频率,只在
+ * 每条字幕行的开始和结束附近各多醒来一次(平均每行 +2 次唤醒),暂停播放或关闭歌词开关时
+ * 直接退回基线、不做任何调度计算。[LYRICS_MIN_POLL_INTERVAL_MS] 是地板,防止边界几乎重叠的
+ * 病态输入把这个"精确调度"退化成忙轮询。
+ */
+internal fun nextLyricsPollDelayMs(isPlaying: Boolean, state: PlayerUiState): Long {
+    if (!isPlaying || !state.lyricsEnabled) return LYRICS_POLL_INTERVAL_MS
+    val boundary = state.subtitleTimeline.nextBoundaryAfter(state.positionMs) ?: return LYRICS_POLL_INTERVAL_MS
+    val speed = state.playbackSpeed.takeIf { it > 0f } ?: 1f
+    val untilBoundaryMs = ((boundary - state.positionMs) / speed).toLong()
+    return untilBoundaryMs.coerceIn(LYRICS_MIN_POLL_INTERVAL_MS, LYRICS_POLL_INTERVAL_MS)
+}
+
 /** 睡眠定时器的可选模式:固定分钟数(墙钟倒计时)或「播完本集」(见设计文档 §3.5)。 */
 sealed interface SleepTimerOption {
     data class Minutes(val value: Int) : SleepTimerOption
@@ -157,13 +198,17 @@ class PlayerViewModel @Inject constructor(
     private fun observeNowPlaying() {
         viewModelScope.launch {
             connection.nowPlaying.collectLatest { info ->
+                // 缺陷 1(设计文档 §3.3):弹幕类外挂轨永远不当"字幕"处理——不进入可选列表,
+                // 默认选轨、手动循环切换([onCycleSubtitleTrack])都看不到它。这样"选不出真字幕
+                // 就不显示字幕"这条规则只用写一处,不会有第二条路径又把弹幕漏进来。
+                val realTracks = info?.subtitleTracks.orEmpty().filterNot { it.isLikelyDanmaku }
                 _uiState.update {
                     it.copy(
                         mediaItem = info?.mediaItem,
                         // 元数据总时长是权威(见 resolveDurationMs);换集时立刻生效,不等下一次轮询。
                         durationMs = info?.mediaItem?.runTimeMs?.coerceAtLeast(0L) ?: 0L,
                         audioTracks = info?.audioTracks.orEmpty(),
-                        subtitleTracks = info?.subtitleTracks.orEmpty(),
+                        subtitleTracks = realTracks,
                         isSubtitleLoading = info != null,
                     )
                 }
@@ -177,8 +222,7 @@ class PlayerViewModel @Inject constructor(
                     }
                 } else {
                     val preferredLanguage = preferencesStore.preferredSubtitleLanguage.first()
-                    val track = info.subtitleTracks.firstOrNull { it.language == preferredLanguage }
-                        ?: info.subtitleTracks.firstOrNull()
+                    val track = selectDefaultSubtitleTrack(realTracks, preferredLanguage)
                     loadSubtitleTrack(info.mediaItem.id, info.mediaSourceId, track)
                 }
             }
@@ -242,7 +286,9 @@ class PlayerViewModel @Inject constructor(
                             playbackSpeed = player.playbackParameters.speed,
                         )
                     }
-                    delay(POSITION_POLL_INTERVAL_MS)
+                    // 缺陷 3(设计文档 §3.5):不再固定 500ms 碰运气,按下一个字幕边界自适应调度——
+                    // 见 [nextLyricsPollDelayMs] KDoc 里的功耗权衡说明。
+                    delay(nextLyricsPollDelayMs(player.isPlaying, _uiState.value))
                 }
             }
         }
@@ -393,9 +439,5 @@ class PlayerViewModel @Inject constructor(
     override fun onCleared() {
         sleepTimerJob?.cancel()
         super.onCleared()
-    }
-
-    private companion object {
-        const val POSITION_POLL_INTERVAL_MS = 500L
     }
 }
