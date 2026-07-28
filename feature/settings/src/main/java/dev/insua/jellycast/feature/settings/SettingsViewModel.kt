@@ -1,9 +1,11 @@
 package dev.insua.jellycast.feature.settings
 
+import android.content.Intent
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dev.insua.jellycast.datastore.PreferencesStore
+import dev.insua.jellycast.diagnostics.DiagnosticsExporter
 import dev.insua.jellycast.model.AudioDeliveryLevel
 import dev.insua.jellycast.network.session.JellyfinSession
 import dev.insua.jellycast.player.AudioPlaybackEngine
@@ -27,11 +29,16 @@ data class SettingsUiState(
     val currentEndpoint: String? = null,
     val currentDeliveryLevel: AudioDeliveryLevel? = null,
     val sessionBytesTransferred: Long = 0L,
+    val diagnosticsEnabled: Boolean = true,
 )
 
 /**
- * 设置页。前六项([playbackSpeed]…[preferredSubtitleLanguage])直接把 [PreferencesStore] 的
+ * 设置页。前七项([playbackSpeed]…[diagnosticsEnabled])直接把 [PreferencesStore] 的
  * Flow 摆到 UI 上,双向绑定——没有额外的领域逻辑。
+ *
+ * [buildDiagnosticsExportIntent](Task 5,design doc §5)是个例外:导出诊断日志不是一条偏好,
+ * 是个一次性动作,委托给 [DiagnosticsExporter]——真正的落盘/脱敏/轮转逻辑都在 `:core:diagnostics`,
+ * 这里只做转发,方便测试(mock [DiagnosticsExporter] 而不用真的碰文件系统)。
  *
  * "开发者信息(折叠)"三项(修正 §3)是本类唯一有一点点逻辑的地方:
  * - [SettingsUiState.currentEndpoint] 来自 [JellyfinSession]——只读一次当前缓存值,不主动触发
@@ -46,6 +53,7 @@ class SettingsViewModel @Inject constructor(
     private val session: JellyfinSession,
     private val playbackEngine: AudioPlaybackEngine,
     private val byteCounter: SessionByteCounter,
+    private val diagnosticsExporter: DiagnosticsExporter,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(SettingsUiState())
@@ -76,6 +84,9 @@ class SettingsViewModel @Inject constructor(
             preferencesStore.audioBitRateKbps.collect { v -> _uiState.update { it.copy(audioBitRateKbps = v) } }
         }
         viewModelScope.launch {
+            preferencesStore.diagnosticsEnabled.collect { v -> _uiState.update { it.copy(diagnosticsEnabled = v) } }
+        }
+        viewModelScope.launch {
             playbackEngine.state.collect { state ->
                 val level = (state as? PlaybackEngineState.Ready)?.source?.level
                 _uiState.update { it.copy(currentDeliveryLevel = level) }
@@ -104,4 +115,13 @@ class SettingsViewModel @Inject constructor(
         viewModelScope.launch { preferencesStore.setPreferredSubtitleLanguage(value) }
 
     fun onAudioBitRateKbpsChange(value: Int) = viewModelScope.launch { preferencesStore.setAudioBitRateKbps(value) }
+
+    fun onDiagnosticsEnabledChange(value: Boolean) =
+        viewModelScope.launch { preferencesStore.setDiagnosticsEnabled(value) }
+
+    /**
+     * "导出诊断日志"背后的动作(design doc §5)。返回 `null` 时(从未记录过任何内容,或用户此前
+     * 已关闭诊断日志)UI 层应该给一条"暂无可导出的诊断日志"之类的提示,而不是弹出一个空的分享面板。
+     */
+    fun buildDiagnosticsExportIntent(): Intent? = diagnosticsExporter.buildShareIntent()
 }

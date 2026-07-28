@@ -30,6 +30,7 @@ dependencies {
     implementation(project(":core:network"))
     implementation(project(":core:datastore"))
     implementation(project(":core:player"))
+    implementation(project(":core:diagnostics"))
 
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)

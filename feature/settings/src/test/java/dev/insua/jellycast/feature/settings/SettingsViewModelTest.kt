@@ -1,6 +1,8 @@
 package dev.insua.jellycast.feature.settings
 
+import android.content.Intent
 import dev.insua.jellycast.datastore.PreferencesStore
+import dev.insua.jellycast.diagnostics.DiagnosticsExporter
 import dev.insua.jellycast.model.AudioDeliveryLevel
 import dev.insua.jellycast.model.PlaybackSource
 import dev.insua.jellycast.network.session.JellyfinSession
@@ -11,6 +13,7 @@ import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
+import io.mockk.verify
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -50,8 +53,11 @@ class SettingsViewModelTest {
         every { store.lyricsEnabled } returns flowOf(false)
         every { store.preferredSubtitleLanguage } returns flowOf("chi")
         every { store.audioBitRateKbps } returns flowOf(64)
+        every { store.diagnosticsEnabled } returns flowOf(true)
         return store
     }
+
+    private fun exporter(): DiagnosticsExporter = mockk(relaxed = true)
 
     private fun session(baseUrl: String? = "http://192.168.1.10:8096"): JellyfinSession {
         val s = mockk<JellyfinSession>()
@@ -76,7 +82,7 @@ class SettingsViewModelTest {
     }
 
     @Test fun `启动后从 PreferencesStore 读取全部偏好项`() = runTest(testDispatcher) {
-        val viewModel = SettingsViewModel(preferencesStore(), session(), engine(), byteCounter())
+        val viewModel = SettingsViewModel(preferencesStore(), session(), engine(), byteCounter(), exporter())
         advanceUntilIdle()
 
         val state = viewModel.uiState.value
@@ -87,11 +93,12 @@ class SettingsViewModelTest {
         assertEquals(false, state.lyricsEnabled)
         assertEquals("chi", state.preferredSubtitleLanguage)
         assertEquals(64, state.audioBitRateKbps)
+        assertEquals(true, state.diagnosticsEnabled)
     }
 
     @Test fun `开发者信息读取当前 endpoint 与本次会话已传输字节数`() = runTest(testDispatcher) {
         val viewModel = SettingsViewModel(
-            preferencesStore(), session("http://100.1.1.1:8096"), engine(), byteCounter(12_345L),
+            preferencesStore(), session("http://100.1.1.1:8096"), engine(), byteCounter(12_345L), exporter(),
         )
         advanceUntilIdle()
 
@@ -101,7 +108,7 @@ class SettingsViewModelTest {
     }
 
     @Test fun `没有已激活服务器时 currentEndpoint 保持 null 而不是崩溃`() = runTest(testDispatcher) {
-        val viewModel = SettingsViewModel(preferencesStore(), session(null), engine(), byteCounter())
+        val viewModel = SettingsViewModel(preferencesStore(), session(null), engine(), byteCounter(), exporter())
         advanceUntilIdle()
 
         assertNull(viewModel.uiState.value.currentEndpoint)
@@ -114,7 +121,7 @@ class SettingsViewModelTest {
             audioTracks = emptyList(), textSubtitles = emptyList(),
         )
         val viewModel = SettingsViewModel(
-            preferencesStore(), session(), engine(PlaybackEngineState.Ready(source)), byteCounter(),
+            preferencesStore(), session(), engine(PlaybackEngineState.Ready(source)), byteCounter(), exporter(),
         )
         advanceUntilIdle()
 
@@ -123,7 +130,7 @@ class SettingsViewModelTest {
 
     @Test fun `修改快退秒数会写回 PreferencesStore`() = runTest(testDispatcher) {
         val store = preferencesStore()
-        val viewModel = SettingsViewModel(store, session(), engine(), byteCounter())
+        val viewModel = SettingsViewModel(store, session(), engine(), byteCounter(), exporter())
         advanceUntilIdle()
 
         viewModel.onRewindSecondsChange(30)
@@ -134,12 +141,45 @@ class SettingsViewModelTest {
 
     @Test fun `修改音频码率会写回 PreferencesStore`() = runTest(testDispatcher) {
         val store = preferencesStore()
-        val viewModel = SettingsViewModel(store, session(), engine(), byteCounter())
+        val viewModel = SettingsViewModel(store, session(), engine(), byteCounter(), exporter())
         advanceUntilIdle()
 
         viewModel.onAudioBitRateKbpsChange(256)
         advanceUntilIdle()
 
         coVerify { store.setAudioBitRateKbps(256) }
+    }
+
+    @Test fun `关闭诊断日志开关会写回 PreferencesStore`() = runTest(testDispatcher) {
+        val store = preferencesStore()
+        val viewModel = SettingsViewModel(store, session(), engine(), byteCounter(), exporter())
+        advanceUntilIdle()
+
+        viewModel.onDiagnosticsEnabledChange(false)
+        advanceUntilIdle()
+
+        coVerify { store.setDiagnosticsEnabled(false) }
+    }
+
+    @Test fun `导出诊断日志委托给 DiagnosticsExporter 并返回其分享 Intent`() = runTest(testDispatcher) {
+        val fakeIntent = mockk<Intent>()
+        val diagnosticsExporter = mockk<DiagnosticsExporter>()
+        every { diagnosticsExporter.buildShareIntent() } returns fakeIntent
+        val viewModel = SettingsViewModel(preferencesStore(), session(), engine(), byteCounter(), diagnosticsExporter)
+        advanceUntilIdle()
+
+        val result = viewModel.buildDiagnosticsExportIntent()
+
+        assertEquals(fakeIntent, result)
+        verify { diagnosticsExporter.buildShareIntent() }
+    }
+
+    @Test fun `没有任何诊断日志内容时导出返回 null 而不是崩溃`() = runTest(testDispatcher) {
+        val diagnosticsExporter = mockk<DiagnosticsExporter>()
+        every { diagnosticsExporter.buildShareIntent() } returns null
+        val viewModel = SettingsViewModel(preferencesStore(), session(), engine(), byteCounter(), diagnosticsExporter)
+        advanceUntilIdle()
+
+        assertNull(viewModel.buildDiagnosticsExportIntent())
     }
 }
