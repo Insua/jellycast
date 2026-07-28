@@ -522,6 +522,193 @@ class LibraryViewModelTest {
         assertFalse(detail.isLoading, "必须收尾,不能一直转圈")
     }
 
+    // ================= 排序与筛选(设计文档 §3.7)=================
+    // Jellyfin 对错误大小写的查询参数静默忽略,以下断言的字面量(SortName/DateCreated/
+    // DatePlayed/Descending/IsUnplayed/IsFavorite)均已用 jq 核对 docs/jellyfin-openapi.json
+    // 的 ItemSortBy / SortOrder / ItemFilter 三个枚举精确拼写——详见任务报告。
+
+    @Test fun `默认不改排序时请求不显式携带 sortOrder`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), "Series", any(), "SortName", 0, 50, any(), null) } returns page("默认")
+        val vm = newViewModel(api)
+        vm.loadLibrary(); advanceUntilIdle()
+        assertEquals(listOf("默认"), vm.uiState.value.series.items.map { it.name })
+        // 显式验证:sortOrder 位置(第 9 参)确实是 null——默认选择不该在查询串里额外声明升序。
+        coVerify { api.items(any(), "Series", any(), "SortName", 0, 50, any(), null, null, null, null, null) }
+    }
+
+    @Test fun `选择按添加日期降序排序时请求携带对应参数`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), "Series", any(), "DateCreated", 0, 50, any(), null, "Descending", any(), any(), any()) } returns
+            page("按添加时间降序")
+        val vm = newViewModel(api)
+        advanceUntilIdle()
+
+        vm.setSortBy(LibrarySortBy.DATE_ADDED)
+        vm.setSortOrder(LibrarySortOrder.DESCENDING)
+        advanceUntilIdle()
+
+        assertEquals(listOf("按添加时间降序"), vm.uiState.value.series.items.map { it.name })
+    }
+
+    @Test fun `选择按观看日期排序时 sortBy 为 DatePlayed`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), "Series", any(), "DatePlayed", 0, 50, any(), null, any(), any(), any(), any()) } returns
+            page("按观看时间")
+        val vm = newViewModel(api)
+        advanceUntilIdle()
+
+        vm.setSortBy(LibrarySortBy.DATE_PLAYED)
+        advanceUntilIdle()
+
+        assertEquals(listOf("按观看时间"), vm.uiState.value.series.items.map { it.name })
+    }
+
+    @Test fun `选择仅未看筛选时请求携带 filters=IsUnplayed`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), "Series", any(), any(), 0, 50, any(), null, any(), "IsUnplayed", any(), any()) } returns
+            page("未看")
+        val vm = newViewModel(api)
+        advanceUntilIdle()
+
+        vm.setFilters(LibraryFilters(unplayedOnly = true))
+        advanceUntilIdle()
+
+        assertEquals(listOf("未看"), vm.uiState.value.series.items.map { it.name })
+    }
+
+    @Test fun `同时选择未看与收藏筛选时filters逗号分隔且顺序固定`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery {
+            api.items(any(), "Series", any(), any(), 0, 50, any(), null, any(), "IsUnplayed,IsFavorite", any(), any())
+        } returns page("未看且收藏")
+        val vm = newViewModel(api)
+        advanceUntilIdle()
+
+        vm.setFilters(LibraryFilters(unplayedOnly = true, favoritesOnly = true))
+        advanceUntilIdle()
+
+        assertEquals(listOf("未看且收藏"), vm.uiState.value.series.items.map { it.name })
+    }
+
+    @Test fun `选择相同排序不重复触发请求`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), "Series", any(), "SortName", 0, 50, any(), null) } returns page("默认")
+        val vm = newViewModel(api)
+        advanceUntilIdle()
+        coVerify(exactly = 1) { api.items(any(), "Series", any(), "SortName", 0, 50, any(), null, null, null, null, null) }
+
+        vm.setSortBy(LibrarySortBy.NAME) // 和当前选择相同,不该重新发请求
+        advanceUntilIdle()
+
+        coVerify(exactly = 1) { api.items(any(), "Series", any(), "SortName", 0, 50, any(), null, null, null, null, null) }
+    }
+
+    @Test fun `搜索不受浏览排序筛选选择影响`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), "Series", any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } returns
+            ItemsResponseDto()
+        coEvery { api.items(any(), "Series,Movie", any(), "SortName", 0, 50, any(), "银魂", null, null, any(), any()) } returns
+            page("银魂")
+        val vm = newViewModel(api)
+        advanceUntilIdle()
+
+        vm.setFilters(LibraryFilters(unplayedOnly = true))
+        vm.setSortBy(LibrarySortBy.DATE_ADDED)
+        advanceUntilIdle()
+
+        vm.onQueryChange("银魂"); advanceUntilIdle()
+
+        assertEquals(listOf("银魂"), vm.uiState.value.searchResults.items.map { it.name })
+    }
+
+    // ---- 铁律:排序/筛选选择必须参与缓存 bucket key,否则不同选择会互相覆盖缓存 ----
+
+    @Test fun `切换排序后再切回_读到的是各自排序对应的缓存_不会串桶`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } throws
+            java.io.IOException("offline")
+
+        val repository = FakeMediaRepository()
+        val ascendingBucket =
+            libraryBucketKey(CacheBuckets.LIBRARY_SERIES, LibrarySortBy.NAME, LibrarySortOrder.ASCENDING, LibraryFilters())
+        val descendingBucket =
+            libraryBucketKey(CacheBuckets.LIBRARY_SERIES, LibrarySortBy.NAME, LibrarySortOrder.DESCENDING, LibraryFilters())
+        assertTrue(ascendingBucket != descendingBucket, "两种排序选择必须对应不同的 bucket key")
+        repository.seed(ascendingBucket, listOf(series("升序缓存")))
+        repository.seed(descendingBucket, listOf(series("降序缓存")))
+
+        val vm = newViewModel(api, repository = repository)
+        advanceUntilIdle()
+        assertEquals(listOf("升序缓存"), vm.uiState.value.series.items.map { it.name }, "默认(升序)应该读到升序自己的缓存")
+
+        vm.setSortOrder(LibrarySortOrder.DESCENDING)
+        advanceUntilIdle()
+        assertEquals(
+            listOf("降序缓存"),
+            vm.uiState.value.series.items.map { it.name },
+            "切到降序应该读降序自己的缓存,不能继承升序的缓存内容",
+        )
+
+        vm.setSortOrder(LibrarySortOrder.ASCENDING)
+        advanceUntilIdle()
+        assertEquals(
+            listOf("升序缓存"),
+            vm.uiState.value.series.items.map { it.name },
+            "切回升序应该读回升序自己的缓存——证明两个 bucket 全程互不覆盖,而不只是巧合地没冲突",
+        )
+    }
+
+    @Test fun `筛选选择也参与缓存 bucket_未播放与全部互不覆盖`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } throws
+            java.io.IOException("offline")
+
+        val repository = FakeMediaRepository()
+        val allBucket =
+            libraryBucketKey(CacheBuckets.LIBRARY_SERIES, LibrarySortBy.NAME, LibrarySortOrder.ASCENDING, LibraryFilters())
+        val unplayedBucket = libraryBucketKey(
+            CacheBuckets.LIBRARY_SERIES, LibrarySortBy.NAME, LibrarySortOrder.ASCENDING,
+            LibraryFilters(unplayedOnly = true),
+        )
+        repository.seed(allBucket, listOf(series("全部缓存")))
+        repository.seed(unplayedBucket, listOf(series("未播放缓存")))
+
+        val vm = newViewModel(api, repository = repository)
+        advanceUntilIdle()
+        assertEquals(listOf("全部缓存"), vm.uiState.value.series.items.map { it.name })
+
+        vm.setFilters(LibraryFilters(unplayedOnly = true))
+        advanceUntilIdle()
+        assertEquals(
+            listOf("未播放缓存"),
+            vm.uiState.value.series.items.map { it.name },
+            "筛选选择必须参与 bucket key,否则会读到未筛选那份缓存,用户会看到明明选了'仅未看'却混进已看内容",
+        )
+    }
+
+    @Test fun `切换排序会写入新 bucket 而不覆盖旧 bucket 的既有缓存`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), "Series", any(), "SortName", 0, 50, any(), null) } returns page("升序网络结果")
+        coEvery {
+            api.items(any(), "Series", any(), "SortName", 0, 50, any(), null, "Descending", any(), any(), any())
+        } returns page("降序网络结果")
+
+        val repository = FakeMediaRepository()
+        val vm = newViewModel(api, repository = repository)
+        advanceUntilIdle()
+
+        vm.setSortOrder(LibrarySortOrder.DESCENDING)
+        advanceUntilIdle()
+
+        val ascendingWrite = repository.writes.first { it.second.any { i -> i.name == "升序网络结果" } }
+        val descendingWrite = repository.writes.first { it.second.any { i -> i.name == "降序网络结果" } }
+        assertTrue(
+            ascendingWrite.first != descendingWrite.first,
+            "升序和降序的写回必须落在不同的 bucket,实际都写进了 ${ascendingWrite.first}",
+        )
+    }
+
     @Test fun `季与集刷新成功后写回各自的 bucket`() = runTest {
         val api = mockk<JellyfinApi>(relaxed = true)
         coEvery { api.items(any(), any(), any(), any(), any(), any(), any(), any()) } returns ItemsResponseDto()

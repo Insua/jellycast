@@ -41,6 +41,92 @@ enum class LibraryTab { SERIES, MOVIES }
 /** 当前可见的分页列表是哪一个——浏览态下按 Tab 分流,搜索态下统一走 searchResults。 */
 private enum class ListTarget { SERIES, MOVIES, SEARCH }
 
+/**
+ * 浏览排序字段。[apiValue] 对应 `/Items` 的 `sortBy`,取值来自 Jellyfin `ItemSortBy` 枚举,
+ * 2026-07-28 用 `jq '.components.schemas.ItemSortBy.enum' docs/jellyfin-openapi.json` 核对过
+ * 三个取值的精确大小写(SortName / DateCreated / DatePlayed)——写错大小写会被服务端静默忽略。
+ */
+enum class LibrarySortBy(internal val apiValue: String) {
+    /** 名称(拼音/字母序),对应"按名称"。 */
+    NAME("SortName"),
+    /** 入库时间,对应"按添加日期"。 */
+    DATE_ADDED("DateCreated"),
+    /** 最近观看时间,对应"按观看日期"。 */
+    DATE_PLAYED("DatePlayed"),
+}
+
+/**
+ * 排序方向。[wireValue] 对应 `/Items` 的 `sortOrder`,取值来自 Jellyfin `SortOrder` 枚举
+ * (jq 核对:Ascending / Descending)。
+ *
+ * [ASCENDING] 故意映射到 `null`(不发送这个查询参数)而不是字面量 `"Ascending"`——
+ * Jellyfin 在未指定 `sortOrder` 时的默认行为就是升序,这里不发送只是省一个查询参数,
+ * **不影响服务端实际返回的顺序**。这与既有代码"不发送即代表默认值"的写法一致(见
+ * [LibraryFilters.toApiFilters] 对空筛选的处理)。缓存 bucket key 的区分逻辑
+ * ([libraryBucketKey])不依赖这个 wire 层面的省略,而是直接比较枚举本身,所以这个优化
+ * 不会影响"不同排序选择互不覆盖缓存"这条铁律。
+ */
+enum class LibrarySortOrder {
+    ASCENDING,
+    DESCENDING,
+    ;
+
+    internal val wireValue: String?
+        get() = when (this) {
+            ASCENDING -> null
+            DESCENDING -> "Descending"
+        }
+}
+
+/**
+ * 浏览筛选:仅未看 / 仅收藏,两者可同时生效。对应 `/Items` 的 `filters` 参数,取值来自
+ * Jellyfin `ItemFilter` 枚举,2026-07-28 用
+ * `jq '.components.schemas.ItemFilter.enum' docs/jellyfin-openapi.json` 核对过精确拼写:
+ * `IsUnplayed` / `IsFavorite`(枚举里还有 IsPlayed/IsResumable 等本次不用)。
+ */
+data class LibraryFilters(
+    val unplayedOnly: Boolean = false,
+    val favoritesOnly: Boolean = false,
+) {
+    /** 都未选中时返回 null——不发送这个参数,而不是空字符串(空字符串的服务端行为未经核实)。 */
+    fun toApiFilters(): String? {
+        val values = buildList {
+            if (unplayedOnly) add("IsUnplayed")
+            if (favoritesOnly) add("IsFavorite")
+        }
+        return values.takeIf { it.isNotEmpty() }?.joinToString(",")
+    }
+}
+
+/**
+ * 缓存 bucket key 的唯一组装处(feature:library 内部)——排序/筛选选择必须参与这个 key,
+ * 否则"剧集按名称升序"和"剧集按添加时间降序"会共用同一个缓存位置,后加载的那个会覆盖前一个,
+ * 用户切换排序再切回来时会看到刚才那次选择残留的内容,而不是真正属于当前选择的数据。
+ *
+ * 默认选择(名称 / 升序 / 无筛选)刻意映射回 [base] 原样,不追加任何后缀——这样"从未特意选过
+ * 排序筛选"的既有用户拿到的缓存 key 和改动前完全一致,不会因为这次改动让老缓存全部失效。
+ * 只有真正偏离默认值的那些维度才会被编码进 key,且顺序固定(排序字段、排序方向、筛选项),
+ * 不因为用户操作顺序不同而产生不同的 key(否则"先选未看再选收藏"和"先选收藏再选未看"会被
+ * 误判成两个不同的桶)。
+ *
+ * 之所以放在 `internal`(而不是 private)——[LibraryViewModelTest] 需要用同一份公式算出
+ * "某个排序筛选组合对应的 bucket key"去 seed [FakeMediaRepository],以此证明"切换排序/筛选
+ * 读到的是各自独立的缓存,不会互相串桶"。两处如果各写一份拼接逻辑,拼法一旦不一致,
+ * 测试就会失去意义(测的是"我以为的公式"而不是"真正在用的公式")。
+ */
+internal fun libraryBucketKey(
+    base: String,
+    sortBy: LibrarySortBy,
+    sortOrder: LibrarySortOrder,
+    filters: LibraryFilters,
+): String = buildString {
+    append(base)
+    if (sortBy != LibrarySortBy.NAME) append(".sort=").append(sortBy.name.lowercase())
+    if (sortOrder != LibrarySortOrder.ASCENDING) append(".order=").append(sortOrder.name.lowercase())
+    if (filters.unplayedOnly) append(".unplayed")
+    if (filters.favoritesOnly) append(".favorite")
+}
+
 /** 剧集详情:季列表(按季号排序)+ 当前选中季的完整集列表。[episodes] 就是自动连播的播放队列。 */
 data class SeriesDetailUiState(
     val seriesId: String,
@@ -58,6 +144,10 @@ data class LibraryUiState(
     val tab: LibraryTab = LibraryTab.SERIES,
     val series: PageState<MediaItem> = PageState(),
     val movies: PageState<MediaItem> = PageState(),
+    /** 当前排序/筛选选择——两个 Tab 共用同一套选择(顶部只有一处排序筛选入口)。 */
+    val sortBy: LibrarySortBy = LibrarySortBy.NAME,
+    val sortOrder: LibrarySortOrder = LibrarySortOrder.ASCENDING,
+    val filters: LibraryFilters = LibraryFilters(),
     val query: String = "",
     val searchResults: PageState<MediaItem> = PageState(),
     val detail: SeriesDetailUiState? = null,
@@ -168,7 +258,7 @@ class LibraryViewModel @Inject constructor(
                             // 结果换人的同一时刻改身份:此后迟到的旧词分页都对不上号,会被丢弃。
                             displayedSearchTerm = query
                             updatePageState(ListTarget.SEARCH) { it.reset().startLoading() }
-                            emit(runCatching { fetchPage(types = "Series,Movie", startIndex = 0, searchTerm = query) })
+                            emit(runCatching { fetchSearchPage(startIndex = 0, searchTerm = query) })
                         }
                     }
                 }
@@ -183,6 +273,35 @@ class LibraryViewModel @Inject constructor(
 
     fun selectTab(tab: LibraryTab) {
         _uiState.update { it.copy(tab = tab) }
+    }
+
+    /**
+     * 排序/筛选选择变更:更新状态并重新拉取两个浏览 Tab 的第一页(缓存优先,同
+     * [loadLibrary])。选择不变时不重复触发([reloadBrowseLists] 会取消并重开两条第一页流,
+     * 没有实际变化就重开一次没有意义,还会打断正在展示的转圈状态)。
+     *
+     * 搜索不受影响——[fetchSearchPage] 固定使用默认排序,不读这里的状态(见其 KDoc)。
+     */
+    fun setSortBy(sortBy: LibrarySortBy) {
+        if (_uiState.value.sortBy == sortBy) return
+        _uiState.update { it.copy(sortBy = sortBy) }
+        reloadBrowseLists()
+    }
+
+    fun setSortOrder(sortOrder: LibrarySortOrder) {
+        if (_uiState.value.sortOrder == sortOrder) return
+        _uiState.update { it.copy(sortOrder = sortOrder) }
+        reloadBrowseLists()
+    }
+
+    fun setFilters(filters: LibraryFilters) {
+        if (_uiState.value.filters == filters) return
+        _uiState.update { it.copy(filters = filters) }
+        reloadBrowseLists()
+    }
+
+    private fun reloadBrowseLists() {
+        listOf(ListTarget.SERIES, ListTarget.MOVIES).forEach { loadFirstPage(it) }
     }
 
     fun onQueryChange(query: String) {
@@ -319,7 +438,7 @@ class LibraryViewModel @Inject constructor(
         firstPageJobs[target] = viewModelScope.launch {
             var delivered = false
             repository.pagedBucket(bucket) {
-                val response = fetchPage(types = typesFor(target), startIndex = 0, searchTerm = null)
+                val response = fetchBrowsePage(target, startIndex = 0)
                 ItemPage(response.items.mapNotNull { it.toMediaItem() }, response.total)
             }.collect { cached ->
                 delivered = true
@@ -344,7 +463,13 @@ class LibraryViewModel @Inject constructor(
     /** 浏览列表(剧集/电影)**第二页起**的分页请求:成功走 onPageLoaded(自带幂等丢弃),失败走 onError,绝不抛错。 */
     private fun requestPage(target: ListTarget, startIndex: Int, searchTerm: String?) {
         viewModelScope.launch {
-            val result = runCatching { fetchPage(types = typesFor(target), startIndex = startIndex, searchTerm = searchTerm) }
+            val result = runCatching {
+                if (target == ListTarget.SEARCH) {
+                    fetchSearchPage(startIndex, requireNotNull(searchTerm))
+                } else {
+                    fetchBrowsePage(target, startIndex)
+                }
+            }
             // 身份校验:响应回来时,屏幕上显示的结果如果已经换成别的查询词(或已退出搜索),
             // 这一页就是"上一场比赛的成绩",直接丢弃 —— 既不追加条目也不覆盖 totalCount。
             // 此时 searchResults 的 isLoading 由新查询那条管线自己负责收尾,不会卡住。
@@ -376,10 +501,33 @@ class LibraryViewModel @Inject constructor(
         )
     }
 
-    private suspend fun fetchPage(types: String, startIndex: Int, searchTerm: String? = null): ItemsResponseDto =
+    /**
+     * 浏览列表(剧集/电影)取数——带上用户当前选择的排序字段/方向/筛选(设计文档 §3.7)。
+     * `sortOrder`/`filters` 的取值构造见 [LibrarySortOrder.wireValue] / [LibraryFilters.toApiFilters]
+     * 的 KDoc:默认选择时不发送这两个参数,行为与改动前完全一致。
+     */
+    private suspend fun fetchBrowsePage(target: ListTarget, startIndex: Int): ItemsResponseDto {
+        val state = _uiState.value
+        return api.items(
+            userId = session.userId(),
+            types = typesFor(target),
+            sortBy = state.sortBy.apiValue,
+            startIndex = startIndex,
+            limit = PAGE_SIZE,
+            sortOrder = state.sortOrder.wireValue,
+            filters = state.filters.toApiFilters(),
+        )
+    }
+
+    /**
+     * 搜索固定用名称排序、不带任何筛选——搜索关心的是"这个词命中了什么",用户在浏览页选的
+     * 排序/筛选是浏览语境下的偏好,套到搜索结果上没有意义,也会让"清空搜索词回到浏览态"和
+     * "搜索结果与浏览列表互不影响"这两条既有保证变得含糊。
+     */
+    private suspend fun fetchSearchPage(startIndex: Int, searchTerm: String): ItemsResponseDto =
         api.items(
             userId = session.userId(),
-            types = types,
+            types = "Series,Movie",
             sortBy = "SortName",
             startIndex = startIndex,
             limit = PAGE_SIZE,
@@ -401,11 +549,20 @@ class LibraryViewModel @Inject constructor(
         ListTarget.SEARCH -> "Series,Movie"
     }
 
-    /** 搜索结果不缓存(见类 KDoc),所以 SEARCH 没有 bucket。 */
-    private fun bucketFor(target: ListTarget): String? = when (target) {
-        ListTarget.SERIES -> CacheBuckets.LIBRARY_SERIES
-        ListTarget.MOVIES -> CacheBuckets.LIBRARY_MOVIES
-        ListTarget.SEARCH -> null
+    /**
+     * 搜索结果不缓存(见类 KDoc),所以 SEARCH 没有 bucket。
+     *
+     * 剧集/电影的 bucket key 由 [libraryBucketKey] 拼出当前排序/筛选选择——这是本次改动的
+     * 关键点:不同选择必须落到不同的缓存位置,否则会互相覆盖(见 [libraryBucketKey] 的 KDoc)。
+     */
+    private fun bucketFor(target: ListTarget): String? {
+        val base = when (target) {
+            ListTarget.SERIES -> CacheBuckets.LIBRARY_SERIES
+            ListTarget.MOVIES -> CacheBuckets.LIBRARY_MOVIES
+            ListTarget.SEARCH -> return null
+        }
+        val state = _uiState.value
+        return libraryBucketKey(base, state.sortBy, state.sortOrder, state.filters)
     }
 
     /**
