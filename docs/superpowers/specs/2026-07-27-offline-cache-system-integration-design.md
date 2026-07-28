@@ -96,8 +96,26 @@ ViewModel → Repository → ① 立刻发射缓存(可能是旧的)
 L3 URL 带 `static=true`,服务端因此**静默忽略 `startTimeTicks`**,结果是进度条跳了、
 音频从头放 —— 比报错更糟,因为用户看不出来。
 
-**方向:** L3 走非 static 的转码 URL 以支持 `startTimeTicks`;若实测服务端仍不支持,
-则在该路径下**明确禁用 seek 并告知用户**,而不是假装成功。**实现前必须对真实服务器实测确认。**
+**实测结论(2026-07-28,对真实服务器 curl + ffprobe 核验,取"非 static"这条路):**
+非 static 的转码 URL **确实支持** `startTimeTicks`,所以 L3 改用它,seek 真的生效,
+不需要"禁用 seek 并告知用户"那个退路。但要真的生效,三件事缺一不可:
+
+1. **去掉 `static=true`** —— 带上它服务端直出原始文件,`startTimeTicks` 被忽略(实测整集 1496.038 s)。
+2. **显式指定 `.mkv` 容器** —— 不指定时 MP4/MOV 源会 remux 成 `moov` 在末尾的 MP4,
+   而响应是 `chunked` + `Accept-Ranges: none`,ExoPlayer 直接 `Source error`(下了 441 MB 仍
+   `moov atom not found`)。Matroska 头部自带时长,天生可流式。
+3. **每次请求带本次 `PlaybackInfo` 返回的 `playSessionId`** —— Jellyfin 的转码输出文件路径
+   **不随 `startTimeTicks` 变化**,同一会话第二次请求会拿到上一次任务已落盘的产物;
+   `DELETE /Videos/ActiveEncodings` 删任务不删产物,也救不了。`PlaybackInfo` 每次调用都回一个
+   新的 32 位 PlaySessionId,这个值本来就在手上。
+
+三条齐备后:距结尾 30 s 的请求 `ffprobe` 时长 33.280 s(MP4 源)/ 31.990 s(MKV 源);
+距结尾 300 s 的请求 301.494 s。完整证据表见 `PlaybackSourceResolver.buildVideoStreamUrl` 的 KDoc。
+
+已知代价(接受):remux 到 mkv 后原容器的多条音轨只剩服务端选中的那一条,L3 上的客户端选音轨
+因此失效。用它换 seek 的正确性是划算的 —— L3 是罕见兜底,seek 是每次收听都要用的基本功能。
+
+实测 **L1 `/Audio/{id}/universal` 不受影响**(带不带 `playSessionId` 都正确响应偏移),不动它。
 
 ### 3.6 浏览层对齐(保持浅色)
 

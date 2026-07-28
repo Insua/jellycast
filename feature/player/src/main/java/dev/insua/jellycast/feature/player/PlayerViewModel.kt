@@ -300,10 +300,16 @@ class PlayerViewModel @Inject constructor(
      * Media3 现代 API [Player.trackSelectionParameters] 的 [TrackSelectionOverride] 覆盖选择,
      * 不触碰底层 ExoPlayer 内部状态。
      *
-     * 诚实说明:L1(`/Audio/{id}/universal`)是服务端已经转码/remux 成的单一音频输出,通常只报告
-     * 一条音轨,此时这里是 no-op(`audioGroups.size <= 1` 直接返回)——这是符合预期的行为,不是
-     * bug。多音轨切换真正生效的场景是降级到 L3(`/Videos/{id}/stream?static=true`,直通原始容器)
-     * 时,原始文件里保留的多条音轨才会出现在 [Player.getCurrentTracks] 里。
+     * 诚实说明:**当前两条投递路径都只吐一条音轨,所以这里在生产上基本恒为 no-op**
+     * (`audioGroups.size <= 1` 直接返回)——这是符合预期的行为,不是 bug。
+     * - L1(`/Audio/{id}/universal`):服务端转码/remux 成的单一音频输出。
+     * - L3(`/Videos/{id}/stream`):曾经带 `static=true` 直通原始容器,多条音轨确实都在流里;
+     *   但那条路会让服务端**静默忽略 `startTimeTicks`**,L3 上的 seek 变成空操作(实测证据见
+     *   `PlaybackSourceResolver.buildVideoStreamUrl` 的 KDoc)。为了让 seek 真的生效,L3 已改走
+     *   非 static 的转码路径,代价就是原容器的多音轨只剩服务端选中的那一条。
+     *
+     * 要在 L3 上重新支持选音轨,得走服务端选轨(`/Videos/{id}/stream` 的 `audioStreamIndex` 参数)
+     * 而不是客户端 TrackSelector,那是独立的一件事,不在本方法的范围内。
      */
     fun onCycleAudioTrack() {
         val player = connection.player.value ?: return

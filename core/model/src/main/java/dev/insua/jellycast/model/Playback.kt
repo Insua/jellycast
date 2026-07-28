@@ -10,7 +10,7 @@ package dev.insua.jellycast.model
  */
 enum class AudioDeliveryLevel {
     /** L1 服务端直出纯音频:GET /Audio/{itemId}/universal */ SERVER_AUDIO_ONLY,
-    /** L3 拉完整流,客户端禁用视频轨:GET /Videos/{itemId}/stream?static=true */ CLIENT_VIDEO_DISABLED,
+    /** L3 拉完整流,客户端禁用视频轨:GET /Videos/{itemId}/stream(不带 static —— 带上服务端会忽略 startTimeTicks) */ CLIENT_VIDEO_DISABLED,
 }
 
 data class PlaybackSource(

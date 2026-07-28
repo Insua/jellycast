@@ -16,6 +16,7 @@ import dagger.hilt.android.testing.HiltAndroidTest
 import dev.insua.jellycast.MainActivity
 import dev.insua.jellycast.datastore.ServerStore
 import dev.insua.jellycast.feature.server.JellyfinApiFactory
+import dev.insua.jellycast.model.AudioDeliveryLevel
 import dev.insua.jellycast.model.Endpoint
 import dev.insua.jellycast.model.MediaItem
 import dev.insua.jellycast.model.Server
@@ -25,6 +26,12 @@ import dev.insua.jellycast.network.dto.BaseItemDto
 import dev.insua.jellycast.network.mapper.toMediaItem
 import dev.insua.jellycast.network.session.JellyfinSession
 import dev.insua.jellycast.player.AudioPlaybackEngine
+import dev.insua.jellycast.player.AudioPlaybackEngineImpl
+import dev.insua.jellycast.player.ExoPlayerControl
+import dev.insua.jellycast.player.PlaybackEngineState
+import dev.insua.jellycast.player.PlaybackSourceResolver
+import dev.insua.jellycast.player.StreamProbe
+import dev.insua.jellycast.player.asProvider
 import dev.insua.jellycast.player.PlayQueue
 import dev.insua.jellycast.player.PlaybackService
 import dev.insua.jellycast.player.MediaControllerPlayerConnection
@@ -227,9 +234,9 @@ class PlaybackE2eTest {
      * 在**一个音频样本都还没出声**的时候就已经满足了;紧接着的"还在前进"也照样满足,因为那条流
      * 确实在放,只不过是**从第 0 秒开始放的**。
      *
-     * 这不是假想的漏洞,是一个**已知的真实缺陷**的形状:L3 兜底的 URL 带 `static=true`,服务端
+     * 这不是假想的漏洞,是一个**已修复的真实缺陷**的形状:L3 兜底的 URL 曾经带 `static=true`,服务端
      * 于是**静默忽略 `startTimeTicks`**,seek 从头重播而进度条照走(见 v2-task-2 报告 §8)。
-     * 这两段断言在那种情况下**全绿**。
+     * 这两段断言在那种情况下**全绿**。守住它的是场景 3d(强制走 L3)。
      *
      * 所以最后加一段真正有判别力的:见 [assertSeekOffsetHonoredAtTail]。
      */
@@ -331,6 +338,68 @@ class PlaybackE2eTest {
             removeEndedLatch(latch)
             seekScope.cancel()
         }
+    }
+
+    // ---------------------------------------------------------------- 场景 3d
+
+    /**
+     * 场景 3d:**强制走 L3 兜底路径时,seek 也必须真的生效。**
+     *
+     * L3 现在很罕见(一次服务端 500 不再把整个会话钉死在它上面),但它是**保底可播**的那条路,
+     * 所以它必须诚实 —— 而在修复前它恰恰是最不诚实的一条:URL 带 `static=true`,服务端因此
+     * **静默忽略 `startTimeTicks`**,进度条跳到目标继续走,耳机里却在从头重播。
+     *
+     * ## 怎么"强制走 L3"而不动生产 DI
+     *
+     * L1/L3 的分岔点只有一个:[StreamProbe] 的判定。这里就地组装一个**探测恒为 false** 的
+     * [PlaybackSourceResolver],再用它驱动一个 [AudioPlaybackEngineImpl] —— 播放器仍然是
+     * 注入进来的那个**单例 ExoPlayer**,API / 会话 / 网络栈也全是生产实现。
+     * 换掉的只有"要不要降级"这一个判定,正是本用例要钉住的那条路。
+     *
+     * 断言分两段:先证明**真的**落在 L3(否则这个用例什么也没测到),再用
+     * [awaitEnded] 的数量级判别证明偏移真的生效。
+     */
+    @Test
+    fun `强制走L3兜底时seek同样真的从目标位置开始`() {
+        val l3Engine = forcedL3Engine()
+        playQueue.setQueue(listOf(playableItem), 0)
+        runBlocking(Dispatchers.Main) { l3Engine.play(playableItem.id, userId, 0L) }
+
+        val started = awaitCondition(STARTUP_TIMEOUT_MS) { onMain { l3Engine.absolutePositionMs } > 0L }
+        assertTrue("强制 L3 时播放从未开始。${diagnostics()}", started)
+
+        val level = onMain { (l3Engine.state.value as? PlaybackEngineState.Ready)?.source?.level }
+        assertTrue(
+            "本用例的前提是真的落在 L3,实际 level=$level —— 前提不成立时后面的断言证明不了任何事。",
+            level == AudioDeliveryLevel.CLIENT_VIDEO_DISABLED,
+        )
+
+        val tail = tailSeekTargetMs(playableItem)
+        val latch = addEndedLatch()
+        try {
+            runBlocking(Dispatchers.Main) { l3Engine.seekTo(tail) }
+            assertNoPlaybackError("强制 L3:尾部 seek 之后")
+            awaitEnded(latch, "强制 L3:seek 到 ${tail}ms(距结尾 ${TAIL_SEEK_MARGIN_MS}ms)")
+        } finally {
+            removeEndedLatch(latch)
+        }
+    }
+
+    /**
+     * 探测恒为 false 的引擎 —— 除了这一个判定,其余全是生产实现(见 [强制走L3兜底时seek同样真的从目标位置开始])。
+     * 播放器刻意复用注入的单例 [exoPlayer],这样 [addEndedLatch] 挂的监听器和它是同一个播放器。
+     */
+    private fun forcedL3Engine(): AudioPlaybackEngine {
+        val neverAudioOnly = object : StreamProbe {
+            override suspend fun isAudioOnly(url: String): Boolean = false
+        }
+        val resolver = PlaybackSourceResolver(
+            api = api,
+            streamProbe = neverAudioOnly,
+            baseUrlProvider = { session.cachedBaseUrlOrNull().orEmpty() },
+            tokenProvider = { session.cachedTokenOrNull().orEmpty() },
+        )
+        return AudioPlaybackEngineImpl(resolver.asProvider(), ExoPlayerControl(exoPlayer))
     }
 
     // ---------------------------------------------------------------- 场景 3c
@@ -513,7 +582,7 @@ class PlaybackE2eTest {
      * 尾部落点:距结尾 [TAIL_SEEK_MARGIN_MS]。
      *
      * 之所以必须**贴着结尾**取:这是唯一一个"服务端认不认 `startTimeTicks`"会产生**数量级差异**的
-     * 可观测点 —— 认了,这条流只剩 30 秒,很快 `STATE_ENDED`;忽略了(L3 的 `static=true` 就是这样),
+     * 可观测点 —— 认了,这条流只剩 30 秒,很快 `STATE_ENDED`;忽略了(L3 曾经的 `static=true` 就是这样),
      * 这条流是整整一集,几十分钟内绝不可能 ENDED。
      */
     private fun tailSeekTargetMs(item: MediaItem): Long {
@@ -535,7 +604,7 @@ class PlaybackE2eTest {
      * [position] = `currentStartPositionMs + 流内位置`,而 `AudioPlaybackEngineImpl` 在 `resolve()`
      * 一返回就把 `currentStartPositionMs` 设成请求的目标 —— 所以"落到目标区间 + 还在前进"这两段
      * 断言在**服务端把 `startTimeTicks` 整个忽略掉、从第 0 秒重播**的时候**照样全绿**。
-     * 这正是 v2-task-2 报告 §8 记录的真实缺陷:L3 兜底 URL 带 `static=true`,服务端直接吐原始文件。
+     * 这正是 v2-task-2 报告 §8 记录的真实缺陷:L3 兜底 URL 曾经带 `static=true`,服务端直接吐原始文件。
      *
      * 判别办法:从距结尾 [TAIL_SEEK_MARGIN_MS] 处开始播,要求 [TAIL_END_TIMEOUT_MS] 内收到
      * `STATE_ENDED`。认了偏移 → 30 秒后就到;忽略了偏移 → 要放完整整一集(挑选条目时已保证
@@ -566,7 +635,7 @@ class PlaybackE2eTest {
             "$label:${TAIL_END_TIMEOUT_MS / 1000}s 内没有收到 STATE_ENDED。" +
                 "这条流本该只剩 ${TAIL_SEEK_MARGIN_MS / 1000}s —— 收不到 ENDED 说明服务端**忽略了 " +
                 "startTimeTicks**,实际在从头重播,而 absolutePositionMs 还在按'起始位置 + 流内位置'" +
-                "报数(界面显示末尾,耳朵听到开头)。已知触发路径:落到 L3 时 URL 带 static=true。" +
+                "报数(界面显示末尾,耳朵听到开头)。历史触发路径:落到 L3 时 URL 带 static=true。" +
                 "${diagnostics()}",
             ended,
         )

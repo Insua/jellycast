@@ -88,8 +88,8 @@ class PlaybackSourceResolverTest {
         val src = resolver.resolve(TEST_ITEM_ID, TEST_USER_ID)
         assertEquals(AudioDeliveryLevel.CLIENT_VIDEO_DISABLED, src.level)
         assertTrue(src.streamUrl.isNotBlank())   // L3 必须永远给出可播 URL
-        assertTrue(src.streamUrl.startsWith("$TEST_BASE_URL/Videos/$TEST_ITEM_ID/stream"))
-        assertTrue(src.streamUrl.contains("static=true"))
+        assertTrue(src.streamUrl.startsWith("$TEST_BASE_URL/Videos/$TEST_ITEM_ID/stream."))
+        assertTrue(src.streamUrl.contains("mediaSourceId=$TEST_MEDIA_SOURCE_ID"), src.streamUrl)
     }
 
     @Test fun `StreamProbe 抛异常时静默降级到 L3 不向上抛错`() = runTest {
@@ -155,6 +155,102 @@ class PlaybackSourceResolverTest {
         val resolver = newResolver(probe(emptySet()))
         val src = resolver.resolve(TEST_ITEM_ID, TEST_USER_ID, startPositionMs = 600_000L)
         assertTrue(src.streamUrl.contains("startTimeTicks=6000000000"), src.streamUrl)
+    }
+
+    /**
+     * 🔴 **L3 上 seek 是空操作** —— 本项目最不诚实的一个缺陷,因为它比报错更糟:进度条跳到目标、
+     * 继续往前走,而耳机里在从头重播,用户完全看不出来。
+     *
+     * 根因不在客户端:`static=true` 让服务端走"直出原始文件"那条路,`startTimeTicks` 被**静默忽略**。
+     *
+     * ## 对真实服务器的实测(2026-07-28,群晖 DS920+ / J4125)
+     *
+     * 同一个条目(时长 1 496 037 ms),`startTimeTicks` 一律取"距结尾 30s"= 14 660 370 000,
+     * 每次请求都带**唯一的 `deviceId`**(否则 Jellyfin 会把上一次转码任务的输出原样递回来,
+     * 测出来的是缓存不是行为):
+     *
+     * | 请求 | 响应头 | `ffprobe` 出来的时长 | 结论 |
+     * |---|---|---|---|
+     * | `…/stream?…&static=true&startTimeTicks=…` | 200,`Content-Length: 1002873182`,`Accept-Ranges: bytes` | **1496.038 s(整集)** | 偏移被忽略 |
+     * | `…/stream?…&startTimeTicks=…`(无 static) | 200,`Accept-Ranges: none`,`Transfer-Encoding: chunked` | **32.017 s** | 偏移生效 |
+     * | `…/stream?…&startTimeTicks=`(距结尾 300s) | 同上 | **301.494 s** | 偏移生效,且按请求值线性对应 |
+     *
+     * 所以走**非 static** 的那条路:seek 是真的生效,而不是"看起来生效"。
+     *
+     * 代价已知并接受:非 static 由服务端 remux/转码,原容器里的**多条音轨只剩服务端选中的那一条**
+     * (实测一个 3 条 DTS 音轨的条目,非 static 输出只有 1 条 AAC)。用 seek 的正确性换 L3 上的
+     * 多音轨切换是划算的 —— L3 本来就是罕见兜底,而 seek 是每次收听都要用的基本功能。
+     */
+    @Test fun `L3 不带 static=true —— 带上服务端就会静默忽略 startTimeTicks`() = runTest {
+        val resolver = newResolver(probe(emptySet()))
+        val src = resolver.resolve(TEST_ITEM_ID, TEST_USER_ID, startPositionMs = 600_000L)
+        assertEquals(AudioDeliveryLevel.CLIENT_VIDEO_DISABLED, src.level)
+        assertFalse(
+            src.streamUrl.contains("static=true"),
+            "L3 URL 仍然带着 static=true —— 服务端会因此忽略 startTimeTicks,seek 变成空操作:${src.streamUrl}",
+        )
+        assertTrue(src.streamUrl.contains("startTimeTicks=6000000000"), src.streamUrl)
+    }
+
+    /** 起始位置为 0 时同样不带 static:一条流只有一种形态,免得 seek 前后在两种语义之间来回切。 */
+    /** 起始位置为 0 时形态完全一样 —— 一条 L3 流只有一种形态,免得 seek 前后语义来回切。 */
+    @Test fun `L3 从头播放时也不带 static=true`() = runTest {
+        val resolver = newResolver(probe(emptySet()))
+        val src = resolver.resolve(TEST_ITEM_ID, TEST_USER_ID, startPositionMs = 0L)
+        assertFalse(src.streamUrl.contains("static"), src.streamUrl)
+    }
+
+    /**
+     * 🔴 去掉 `static=true` 还是不够 —— 端到端里 seek 依旧从头重播,而 URL 明明带着正确的
+     * `startTimeTicks`。根因在服务端的转码产物复用上:
+     *
+     * **Jellyfin 的转码输出文件路径不随 `startTimeTicks` 变化。** 同一个设备/会话第二次请求同一条流时,
+     * 服务端直接把**上一次那个任务已经落盘的输出**原样递回来,于是偏移形同虚设。
+     *
+     * ## 实测(2026-07-28,同一条目,先请求 offset 0 再请求"距结尾 30s")
+     *
+     * | 场景 | 第二次请求的 `ffprobe` 时长 | 结论 |
+     * |---|---|---|
+     * | 不带 `deviceId`/`playSessionId`(修复前的 App) | **1826.581 s(整集)** | 偏移无效 |
+     * | 固定 `deviceId` + 固定 `playSessionId` | **1826.581 s** | 偏移无效 |
+     * | 先 `DELETE /Videos/ActiveEncodings` 再请求 | **1826.581 s** | 删任务不删产物,仍然无效 |
+     * | **每次请求带各自的 `playSessionId`** | **33.280 s** | ✅ 偏移生效 |
+     *
+     * 而 `POST /Items/{id}/PlaybackInfo` **每次调用都回一个新的 32 位 `PlaySessionId`**(实测三次全不同),
+     * 而 `resolve()` 每次都会调它 —— 也就是说这个"每次唯一"的值本来就在手上,只是没拼进 URL。
+     *
+     * 这同时也是正确的语义:服务端能把转码任务和播放会话对应起来。
+     *
+     * (实测 L1 `/Audio/{id}/universal` **不受此影响** —— 带不带 `playSessionId`,"距结尾 30s"
+     * 都稳定给出 29.27 s。所以只改 L3,不动那条已经验证过的路径。)
+     */
+    @Test fun `L3 URL 带上本次 resolve 的 playSessionId —— 否则服务端复用上一次的转码产物`() = runTest {
+        val resolver = newResolver(probe(emptySet()))
+        val src = resolver.resolve(TEST_ITEM_ID, TEST_USER_ID, startPositionMs = 600_000L)
+        assertEquals("session-1", src.playSessionId)
+        assertTrue(
+            src.streamUrl.contains("playSessionId=session-1"),
+            "L3 URL 少了 playSessionId —— 服务端会把上一次转码任务的产物原样递回来,startTimeTicks 形同虚设:" +
+                src.streamUrl,
+        )
+    }
+
+    /**
+     * 🔴 去掉 `static=true` 只解决了一半。服务端随后按**源容器**决定输出容器,MP4/MOV 源 remux 出来的
+     * MP4 把 `moov` atom 写在文件末尾,而响应是 `chunked` + `Accept-Ranges: none` —— 流式播放器在整条流
+     * 下完之前拿不到 `moov`。端到端里 ExoPlayer 直接 `Source error`,一秒都没播出来
+     * (实测:下了 441 MB 后 `ffprobe` 仍然 `moov atom not found`)。
+     *
+     * 所以必须显式要 Matroska(头部自带时长,天生可流式)。走**路径后缀**而不是 `container=` 查询参数:
+     * 后者输出的 mkv 头里没有时长。详见 [PlaybackSourceResolver] 里 `buildVideoStreamUrl` 的 KDoc。
+     */
+    @Test fun `L3 强制 mkv 容器 —— MP4 源 remux 的 moov 在末尾,chunked 流根本没法播`() = runTest {
+        val resolver = newResolver(probe(emptySet()))
+        val src = resolver.resolve(TEST_ITEM_ID, TEST_USER_ID, startPositionMs = 600_000L)
+        assertTrue(
+            src.streamUrl.startsWith("$TEST_BASE_URL/Videos/$TEST_ITEM_ID/stream.mkv?"),
+            "L3 必须显式要 mkv 容器:${src.streamUrl}",
+        )
     }
 
     @Test fun `PlaybackInfo 返回空 mediaSources 时抛出异常而不是产出空 URL`() = runTest {
