@@ -54,8 +54,27 @@ class SessionJellyfinApi(private val session: JellyfinSession) : JellyfinApi {
         limit: Int?,
         parentId: String?,
         searchTerm: String?,
+        sortOrder: String?,
+        filters: String?,
+        isFavorite: Boolean?,
+        isPlayed: Boolean?,
     ): ItemsResponseDto =
-        delegate { items(userId, types, recursive, sortBy, startIndex, limit, parentId, searchTerm) }
+        delegate {
+            items(
+                userId, types, recursive, sortBy, startIndex, limit, parentId, searchTerm,
+                sortOrder, filters, isFavorite, isPlayed,
+            )
+        }
+
+    override suspend fun userViews(userId: String): ItemsResponseDto = delegate { userViews(userId) }
+
+    override suspend fun addFavorite(itemId: String, userId: String) = delegate { addFavorite(itemId, userId) }
+
+    override suspend fun removeFavorite(itemId: String, userId: String) = delegate { removeFavorite(itemId, userId) }
+
+    override suspend fun markPlayed(itemId: String, userId: String) = delegate { markPlayed(itemId, userId) }
+
+    override suspend fun markUnplayed(itemId: String, userId: String) = delegate { markUnplayed(itemId, userId) }
 
     override suspend fun resume(userId: String): ItemsResponseDto = delegate { resume(userId) }
 

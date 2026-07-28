@@ -177,7 +177,16 @@ private object NoopJellyfinApi : JellyfinApi {
         limit: Int?,
         parentId: String?,
         searchTerm: String?,
+        sortOrder: String?,
+        filters: String?,
+        isFavorite: Boolean?,
+        isPlayed: Boolean?,
     ): ItemsResponseDto = error("not used in test")
+    override suspend fun userViews(userId: String): ItemsResponseDto = error("not used in test")
+    override suspend fun addFavorite(itemId: String, userId: String) = error("not used in test")
+    override suspend fun removeFavorite(itemId: String, userId: String) = error("not used in test")
+    override suspend fun markPlayed(itemId: String, userId: String) = error("not used in test")
+    override suspend fun markUnplayed(itemId: String, userId: String) = error("not used in test")
     override suspend fun resume(userId: String): ItemsResponseDto = error("not used in test")
     override suspend fun nextUp(userId: String, limit: Int): ItemsResponseDto = error("not used in test")
     override suspend fun seasons(seriesId: String, userId: String): ItemsResponseDto = error("not used in test")
