@@ -38,6 +38,27 @@ class ProgressReporter(
     private val flushMutex = Mutex()
 
     /**
+     * 设计文档 §2.3 规则 3:**所有**上报(实时 + 重放)串行经过这一把锁,每次只持有
+     * **一个 HTTP 调用**的时长。
+     *
+     * 为什么必须有它:10 秒心跳的 `progress` 是挂起的网络请求,它在飞的时候如果播放正好结束,
+     * `stop` 会另起一条连接 —— 两条请求到达服务端的先后**没有任何保证**。心跳后到,服务端就把
+     * 位置写成了心跳那个值,而已播放的勾不会撤销(设计文档 §1.2 根因 B)。
+     *
+     * 和终结标记叠加之后,两种交错都被覆盖:
+     * - `progress` 先拿到锁 → 它先落地,`stop` 随后落地 → 终态正确
+     * - `stop` 先拿到锁 → `progress` 随后在锁内被终结判定丢弃 → 终态正确
+     *
+     * ⚠️ 终结判定必须**在锁内**做。放在锁外的话,一条已经通过判定、正在等锁的心跳会排到
+     * `stop` 后面发出去 —— 那正是这把锁要防的东西。
+     *
+     * **已知取舍:** 一次实时 `stop` 最多等待一个在飞请求的时长(受 OkHttp 超时上界约束)。
+     * 因此补报重放必须**逐条**获取这把锁,而不是整批持有 —— 队列上限 100 条,整批持有会把
+     * 实时 `stop` 堵在一次满队列重放的后面。
+     */
+    private val reportMutex = Mutex()
+
+    /**
      * 每一行补报记录连续失败了几次(复审 Minor)。
      *
      * 缺陷现场:[flushPending] 只删除**成功**的行,于是一条永远失败的记录(最典型的是条目已在服务端
@@ -77,7 +98,12 @@ class ProgressReporter(
      * - `stop` 打上终结标记,并清空该条目在补报队列里的所有旧记录
      * - `progress` 遇到已终结的条目直接丢弃 —— 不发、不入队
      */
-    private suspend fun dispatch(kind: String, itemId: String, sessionId: String?, positionMs: Long) {
+    private suspend fun dispatch(
+        kind: String,
+        itemId: String,
+        sessionId: String?,
+        positionMs: Long,
+    ) = reportMutex.withLock {
         when (kind) {
             KIND_START -> finishedItems.clearFinished(itemId)
             KIND_STOP -> {
@@ -94,7 +120,7 @@ class ProgressReporter(
                     // 静默:见上方注释。
                 }
             }
-            KIND_PROGRESS -> if (finishedItems.isFinished(itemId)) return
+            KIND_PROGRESS -> if (finishedItems.isFinished(itemId)) return@withLock
         }
         reportOrEnqueue(kind, itemId, sessionId, positionMs)
     }
@@ -124,7 +150,7 @@ class ProgressReporter(
         /** 成功补报的 + 主动跳过的 + 重试次数用尽被放弃的 —— 三者都要从队列里删掉。 */
         val settledIds = mutableListOf<Long>()
         for (entry in pending) {
-            if (runCatching { replay(entry) }.isSuccess) {
+            if (runCatching { reportMutex.withLock { replay(entry) } }.isSuccess) {
                 replayFailures.remove(entry.id)
                 settledIds += entry.id
                 continue

@@ -4,9 +4,11 @@ import dev.insua.jellycast.database.ProgressReportDao
 import dev.insua.jellycast.database.ProgressReportEntity
 import dev.insua.jellycast.network.JellyfinApi
 import io.mockk.*
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
@@ -311,5 +313,111 @@ class ProgressReporterTest {
 
         coVerify(exactly = 1) { api.reportStop(match { it.itemId == "ep1" }) }
         assertEquals(emptyList<String>(), dao.store.map { it.itemId })
+    }
+
+    // ---- 设计文档 §2.3 规则 3:所有上报串行,保证到达服务端的先后就是发出的先后 ----
+
+    /**
+     * 🔴 设计文档 §1.2 根因 B。10 秒心跳的 `progress` 是一个挂起的网络请求;它在飞的这两三秒里
+     * 如果播放正好结束,`stop` 会另起一条连接发出去 —— 两条请求谁先到服务端**没有任何保证**。
+     * 心跳后到,服务端就把位置写成了心跳那个值,而已播放的勾还留着。
+     *
+     * 判别办法:让 `reportProgress` 卡住不返回,在这期间发一条 `stop`,断言 `stop` **没有**
+     * 在心跳完成之前被发出去。串行化之前 stop 会立刻穿过去,这条断言就红。
+     */
+    @Test fun `stop 必须等在飞的 progress 完成之后才发出`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        val dao = mockk<ProgressReportDao>(relaxed = true)
+        val order = mutableListOf<String>()
+        val progressGate = CompletableDeferred<Unit>()
+
+        coEvery { api.reportProgress(any()) } coAnswers {
+            progressGate.await()
+            order += "progress"
+        }
+        coEvery { api.reportStop(any()) } coAnswers { order += "stop" }
+
+        val reporter = ProgressReporter(api, dao, "s1")
+        coroutineScope {
+            val heartbeat = launch { reporter.progress("ep1", "sess", 60_000) }
+            runCurrent()
+            val ending = launch { reporter.stop("ep1", "sess", 2_400_000) }
+            runCurrent()
+
+            assertEquals(
+                emptyList<String>(),
+                order,
+                "心跳还卡在网络里,stop 不该抢先发出去",
+            )
+
+            progressGate.complete(Unit)
+            heartbeat.join()
+            ending.join()
+        }
+
+        assertEquals(listOf("progress", "stop"), order)
+    }
+
+    /**
+     * 反过来的交错:`stop` 先拿到锁,排在后面的心跳醒来时该条目已经终结 —— 必须被丢弃,
+     * 而不是等 stop 发完再补一条上去。终结判定因此**必须在锁内**做,锁外判定会让一条
+     * 已经通过判定、正在等锁的心跳排到 stop 后面发出去,那正是要防的竞态。
+     */
+    @Test fun `stop 先拿到锁时,排在后面的 progress 被丢弃`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        val dao = mockk<ProgressReportDao>(relaxed = true)
+        val stopGate = CompletableDeferred<Unit>()
+        coEvery { api.reportStop(any()) } coAnswers { stopGate.await() }
+
+        val reporter = ProgressReporter(api, dao, "s1")
+        coroutineScope {
+            val ending = launch { reporter.stop("ep1", "sess", 2_400_000) }
+            runCurrent()
+            val heartbeat = launch { reporter.progress("ep1", "sess", 60_000) }
+            runCurrent()
+
+            stopGate.complete(Unit)
+            ending.join()
+            heartbeat.join()
+        }
+
+        coVerify(exactly = 0) { api.reportProgress(any()) }
+    }
+
+    /**
+     * 补报重放必须**逐条**获取上报锁,不能整批持有:队列上限是 100 条,整批持有会把一条
+     * 实时 `stop` 堵在一次满队列重放的后面。
+     */
+    @Test fun `补报重放期间实时 stop 不必等待整批完成`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        val dao = FakeProgressReportDao()
+        repeat(3) { index ->
+            dao.enqueue(
+                ProgressReportEntity(
+                    id = 0, serverId = "s1", itemId = "old$index", playSessionId = null,
+                    positionMs = 1000, kind = "progress", createdAt = index.toLong()
+                )
+            )
+        }
+        val firstReplayGate = CompletableDeferred<Unit>()
+        var replayed = 0
+        coEvery { api.reportProgress(any()) } coAnswers {
+            if (replayed++ == 0) firstReplayGate.await()
+        }
+
+        val reporter = ProgressReporter(api, dao, "s1")
+        coroutineScope {
+            val flush = launch { reporter.flushPending() }
+            runCurrent()
+            val ending = launch { reporter.stop("ep9", "sess", 2_400_000) }
+            runCurrent()
+
+            // 第一条重放还卡着,整批一共 3 条 —— 如果整批持有锁,stop 到这里必然一次都没发出。
+            firstReplayGate.complete(Unit)
+            flush.join()
+            ending.join()
+        }
+
+        coVerify(exactly = 1) { api.reportStop(match { it.itemId == "ep9" }) }
     }
 }
