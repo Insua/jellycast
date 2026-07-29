@@ -20,6 +20,7 @@ import dev.insua.jellycast.model.AudioDeliveryLevel
 import dev.insua.jellycast.model.Endpoint
 import dev.insua.jellycast.model.MediaItem
 import dev.insua.jellycast.model.Server
+import dev.insua.jellycast.database.ProgressReportEntity
 import dev.insua.jellycast.network.JellyfinApi
 import dev.insua.jellycast.network.dto.AuthRequestDto
 import dev.insua.jellycast.network.mapper.toMediaItem
@@ -38,9 +39,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.After
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
@@ -94,6 +97,7 @@ class PlaybackE2eTest {
     @Inject lateinit var exoPlayer: ExoPlayer
     @Inject lateinit var playQueue: PlayQueue
     @Inject lateinit var playerConnection: MediaControllerPlayerConnection
+    @Inject lateinit var progressReportDao: dev.insua.jellycast.database.ProgressReportDao
 
     private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
     private val context: Context get() = instrumentation.targetContext
@@ -502,6 +506,131 @@ class PlaybackE2eTest {
         }
     }
 
+    // ---------------------------------------------------------------- 场景:上报生命周期
+
+    /**
+     * 🔴 **现场缺陷的自动化复现。**
+     *
+     * 用户报告:已播完、已打蓝勾的剧集,在 Jellyfin Web 上仍带着进度条,赖在「继续观看」里。
+     * 服务端实测(设计文档 §1.1):已标记播完的条目再收到一条 `progress`,位置会被写回去,
+     * 而已播放的勾**不会**撤销。
+     *
+     * 客户端这边的触发路径(设计文档 §1.2 根因 A):补报队列的重放时机是「每次源就绪」,
+     * 而自动连播的顺序恰好是「上一集 stop → 推进 → 下一集就绪 → flushPending」——
+     * 队列里那条上一集的旧心跳正好在它已经被标记播完之后被重放回去。
+     *
+     * 所以这个测试**预置一条陈旧的 progress 补报记录**,再让这一集真的播到结束。
+     *
+     * ## 断言纪律
+     *
+     * 不是「播完之后查一次位置是 0」就完事 —— 缺陷是**迟到的**写入,查得太早会假绿。
+     * 这里分两段:先等服务端确认打了勾,再在一个明确的窗口内持续盯着位置,
+     * **只要它在窗口内任何一刻变成非 0 就判定失败**。
+     *
+     * ## 为什么播得完
+     *
+     * 从距结尾 [TAIL_SEEK_MARGIN_MS] 处起播。转码流按 `startTimeTicks` 重新起流,
+     * 这条流只剩 30 秒,几十秒内自然 `STATE_ENDED`(和 [awaitEnded] 依赖的是同一个事实)。
+     */
+    @Test
+    fun `播完一集之后服务端不再残留播放位置`() {
+        val item = playableItem
+        val serverId = runBlocking { serverStore.activeServerId.first() }
+        assertTrue(
+            "拿不到激活服务器 id,补报记录会被预置到错误的分区里,这个测试就失去判别力了。",
+            serverId != null,
+        )
+
+        // 预置:模拟「这一集开播不久时一次失败的心跳」。位置取靠前的值 —— 它一旦被重放回去,
+        // 就是用户在 Jellyfin 上看到的那条残留进度条。
+        runBlocking {
+            progressReportDao.enqueue(
+                ProgressReportEntity(
+                    serverId = serverId!!,
+                    itemId = item.id,
+                    playSessionId = null,
+                    positionMs = STALE_REPORT_POSITION_MS,
+                    kind = "progress",
+                    createdAt = System.currentTimeMillis(),
+                )
+            )
+        }
+
+        try {
+            val latch = addEndedLatch()
+            try {
+                startPlayback(item, startPositionMs = tailSeekTargetMs(item))
+                awaitEnded(latch, "播完一集(从距结尾 ${TAIL_SEEK_MARGIN_MS}ms 处起播)")
+            } finally {
+                removeEndedLatch(latch)
+            }
+
+            // 第一段:服务端确认这一集播完了。收不到这个,说明完播上报本身坏了 —— 那是另一个缺陷,
+            // 要和「进度残留」区分开报出来。
+            val marked = awaitServerCondition(REPORT_SETTLE_TIMEOUT_MS) { userData(item.id).played }
+            assertTrue(
+                "服务端始终没把这一集标记为已播放。完播上报(位置 ≥ 90% 的 stop)没有发出或没有生效," +
+                    "这不是进度残留的问题。${diagnostics()}",
+                marked,
+            )
+
+            // 第二段:在窗口内持续盯着位置。自动连播会在这期间起来并触发 flushPending ——
+            // 缺陷存在的话,那条预置的旧心跳正是在这一刻被重放回去。
+            val leaked = awaitServerCondition(REPORT_SETTLE_TIMEOUT_MS) {
+                userData(item.id).positionTicks != 0L
+            }
+            assertFalse(
+                "这一集已经打了已播放的勾,播放位置却在收尾之后被写回成 " +
+                    "${userData(item.id).positionTicks} ticks。这就是用户看到的「已播完却还带着进度条、" +
+                    "赖在继续观看里」。触发路径见设计文档 §1.2 根因 A/B。${diagnostics()}",
+                leaked,
+            )
+        } finally {
+            restoreUserData(item.id)
+            restoreUserData(secondItem.id)
+            runCatching { runBlocking { progressReportDao.deleteForItem(serverId!!, item.id) } }
+        }
+    }
+
+    /** 服务端的 `UserData`;条目还没有任何播放记录时 Jellyfin 也会给一个全零的对象。 */
+    private fun userData(itemId: String) =
+        runBlocking { api.itemDetail(itemId, userId) }.userData
+            ?: dev.insua.jellycast.network.dto.UserDataDto()
+
+    /**
+     * 条件等待的服务端版本:轮询间隔比 [POLL_INTERVAL_MS] 大得多,因为每次判定都是一次
+     * 真实的 HTTP 往返 —— 按 250ms 轮询会把服务器打成筛子,还会把测试自己拖慢。
+     */
+    private fun awaitServerCondition(timeoutMs: Long, condition: () -> Boolean): Boolean {
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (runCatching(condition).getOrDefault(false)) return true
+            Thread.sleep(SERVER_POLL_INTERVAL_MS)
+        }
+        return runCatching(condition).getOrDefault(false)
+    }
+
+    /**
+     * 把测试账号在这个条目上的观看记录复原:先把位置清零,再撤销已播放标记。
+     *
+     * 顺序要紧 —— 反过来的话那条位置为 0 的 `stop` 会被服务端当成一次新的观看记录留下来。
+     * 失败不让测试变红:复原是清理,不是断言。
+     */
+    private fun restoreUserData(itemId: String) {
+        runCatching {
+            runBlocking {
+                api.reportStop(
+                    dev.insua.jellycast.network.dto.PlaybackStopInfoDto(
+                        itemId = itemId,
+                        playSessionId = null,
+                        positionTicks = 0L,
+                    )
+                )
+                api.markUnplayed(itemId, userId)
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- 会话预置
 
     /**
@@ -804,5 +933,17 @@ class PlaybackE2eTest {
         const val MIN_ITEM_RUNTIME_MS = 900_000L
 
         const val POLL_INTERVAL_MS = 250L
+
+        /** 预置的陈旧心跳位置:靠前,一旦被重放回去就是用户看到的那条残留进度条。 */
+        const val STALE_REPORT_POSITION_MS = 60_000L
+
+        /**
+         * 等服务端落定的窗口。要覆盖:完播 stop 的往返 + 自动连播解析下一集(两次网络往返)
+         * + 下一集就绪触发的 flushPending。缺陷存在的话,残留写入就发生在这段时间里。
+         */
+        const val REPORT_SETTLE_TIMEOUT_MS = 60_000L
+
+        /** 见 [awaitServerCondition]:每次判定都是一次真实 HTTP 往返,不能按 250ms 轮询。 */
+        const val SERVER_POLL_INTERVAL_MS = 2_000L
     }
 }
