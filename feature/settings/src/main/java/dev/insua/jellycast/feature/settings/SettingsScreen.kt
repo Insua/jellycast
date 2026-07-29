@@ -1,5 +1,6 @@
 package dev.insua.jellycast.feature.settings
 
+import android.widget.Toast
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -26,6 +27,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import dev.insua.jellycast.model.AudioDeliveryLevel
@@ -36,7 +38,7 @@ private val BIT_RATE_OPTIONS = listOf(64, 128, 256)
 
 /**
  * 设置页(Task 21):服务器管理入口 / 默认倍速 / 快退快进秒数 / 自动连播 / 歌词式字幕 /
- * 首选字幕语言 / 音频码率(修正 §3) / 开发者信息(折叠)。
+ * 首选字幕语言 / 音频码率(修正 §3) / 诊断日志开关与导出(Task 5)/ 开发者信息(折叠)。
  */
 @Composable
 fun SettingsScreen(
@@ -109,6 +111,32 @@ fun SettingsScreen(
                 selected = uiState.audioBitRateKbps,
                 onSelect = viewModel::onAudioBitRateKbpsChange,
                 formatOption = { "${it}k" },
+            )
+        }
+
+        item {
+            // Task 5 / design doc §5:真机调试来回成本过高,让 App 自己收集崩溃与关键错误证据,
+            // 设置页一键导出,不需要再搭一遍无线调试环境。落盘前已脱敏(见 :core:diagnostics 的
+            // Redactor)——不含 token / 密码 / 完整服务器地址。
+            SectionTitle("诊断")
+            SwitchRow(
+                label = "记录诊断日志",
+                checked = uiState.diagnosticsEnabled,
+                onCheckedChange = viewModel::onDiagnosticsEnabledChange,
+            )
+            val context = LocalContext.current
+            ListItem(
+                headlineContent = { Text("导出诊断日志") },
+                supportingContent = { Text("崩溃与关键错误记录,已脱敏,通过系统分享发送") },
+                trailingContent = { Icon(Icons.Filled.ChevronRight, contentDescription = null) },
+                modifier = Modifier.clickableItem {
+                    val intent = viewModel.buildDiagnosticsExportIntent()
+                    if (intent != null) {
+                        context.startActivity(intent)
+                    } else {
+                        Toast.makeText(context, "暂无可导出的诊断日志", Toast.LENGTH_SHORT).show()
+                    }
+                },
             )
         }
 

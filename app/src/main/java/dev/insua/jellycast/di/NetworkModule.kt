@@ -4,10 +4,14 @@ import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
+import dev.insua.jellycast.database.CachedItemDao
+import dev.insua.jellycast.database.JellyCastDatabase
 import dev.insua.jellycast.datastore.ServerStore
 import dev.insua.jellycast.model.Server
 import dev.insua.jellycast.network.EndpointSelector
 import dev.insua.jellycast.network.JellyfinApi
+import dev.insua.jellycast.network.repository.CachingMediaRepository
+import dev.insua.jellycast.network.repository.MediaRepository
 import dev.insua.jellycast.network.session.ActiveServerSession
 import dev.insua.jellycast.network.session.JellyfinSession
 import dev.insua.jellycast.network.session.RetrofitSessionApiFactory
@@ -54,6 +58,22 @@ object NetworkModule {
     @Provides
     @Singleton
     fun provideJellyfinApi(session: JellyfinSession): JellyfinApi = SessionJellyfinApi(session)
+
+    @Provides
+    @Singleton
+    fun provideCachedItemDao(database: JellyCastDatabase): CachedItemDao = database.cachedItemDao()
+
+    /**
+     * 列表类数据的唯一取数入口(设计文档 §3.1):先发缓存、后台刷新。没开 VPN 打开 App 时,
+     * 用户看到的是上次的内容而不是白屏 —— 这条绑定就是"零缓存"那个产品级缺陷的修复点。
+     *
+     * `JellyCastDatabase` 由 `:core:player` 的 `PlayerModule` 提供(同一个 SingletonComponent,
+     * 全应用一个 Room 实例),这里只取它的 [CachedItemDao]。
+     */
+    @Provides
+    @Singleton
+    fun provideMediaRepository(dao: CachedItemDao, session: JellyfinSession): MediaRepository =
+        CachingMediaRepository(dao, session)
 
     // `@TrustAwareHttpClient` 的 qualifier + provider(修正 §1c)已挪到
     // `:core:network` 的 `dev.insua.jellycast.network.di.TrustAwareHttpClientModule`

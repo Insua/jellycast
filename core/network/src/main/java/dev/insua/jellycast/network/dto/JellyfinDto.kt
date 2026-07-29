@@ -30,6 +30,12 @@ import kotlinx.serialization.Serializable
     @SerialName("Name") val name: String,
     @SerialName("Type") val type: String,
     @SerialName("SeriesName") val seriesName: String? = null,
+    // 自动连播「跟着剧走」需要的归属 id(见 AutoPlayNextController)。大小写已 jq 核对
+    // docs/jellyfin-openapi.json:
+    // `jq '.components.schemas.BaseItemDto.properties | keys[] | select(test("^(SeriesId|SeasonId)$"))'`
+    // → "SeasonId" / "SeriesId",都是 nullable 的 uuid 字符串。
+    @SerialName("SeriesId") val seriesId: String? = null,
+    @SerialName("SeasonId") val seasonId: String? = null,
     @SerialName("ParentIndexNumber") val seasonNumber: Int? = null,
     @SerialName("IndexNumber") val episodeNumber: Int? = null,
     @SerialName("RunTimeTicks") val runTimeTicks: Long? = null,
@@ -43,6 +49,14 @@ import kotlinx.serialization.Serializable
 @Serializable data class UserDataDto(
     @SerialName("PlaybackPositionTicks") val positionTicks: Long = 0,
     @SerialName("Played") val played: Boolean = false,
+    // 精确大小写核对自 docs/jellyfin-openapi.json UserItemDataDto.properties:
+    // `jq '.components.schemas.UserItemDataDto.properties | keys[] | select(test("unplayed";"i"))'`
+    // → "UnplayedItemCount"(驼峰全大写开头,和本文件其余字段一致)。
+    @SerialName("UnplayedItemCount") val unplayedItemCount: Int? = null,
+    // 收藏状态。核对同上一批(2026-07-28):
+    // `jq '.components.schemas.UserItemDataDto.properties | keys[] | select(test("favorit";"i"))'`
+    // → "IsFavorite"。
+    @SerialName("IsFavorite") val isFavorite: Boolean = false,
 )
 
 @Serializable data class MediaStreamDto(
@@ -52,6 +66,11 @@ import kotlinx.serialization.Serializable
     @SerialName("Language") val language: String? = null,
     @SerialName("DisplayTitle") val displayTitle: String? = null,
     @SerialName("IsTextSubtitleStream") val isTextSubtitle: Boolean = false,
+    // 缺陷 1(docs/superpowers/specs/2026-07-28-crash-and-usability-design.md §3.3):区分外挂
+    // 字幕(含弹幕文件)与内嵌字幕轨的信号。字段名已 jq 核对 docs/jellyfin-openapi.json:
+    // `jq '.components.schemas.MediaStream.properties | keys[] | select(test("external";"i"))'`
+    // → "IsExternal"(boolean)。
+    @SerialName("IsExternal") val isExternal: Boolean = false,
 )
 
 @Serializable data class PlaybackInfoResponseDto(

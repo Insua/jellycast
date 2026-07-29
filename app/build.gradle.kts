@@ -34,6 +34,33 @@ val releaseSigning: Properties? = run {
     Properties().apply { file.inputStream().use { load(it) } }
 }
 
+/**
+ * 端到端测试(:app 的 androidTest)要连一台**真实** Jellyfin 服务器,地址/账号/密码从项目根的
+ * `testing.properties` 读取。该文件已被 .gitignore 排除,**绝不进版本库**;可提交的只有
+ * `testing.properties.example`(纯占位符)。
+ *
+ * 拿不到时三个值都是空字符串,`TestCredentials.assumeConfigured()` 会让端到端测试**跳过**而不是
+ * 失败 —— 和上面签名材料的取舍一致:别人 clone 下来不配服务器也能拿到全绿的构建。
+ */
+val e2eCredentials: Properties = Properties().apply {
+    val file = rootProject.file("testing.properties")
+    if (file.exists()) file.inputStream().use { load(it) }
+}
+
+/**
+ * 生成 `buildConfigField` 用的 Java 字符串字面量。必须转义反斜杠与双引号 —— 密码里出现
+ * 这两个字符时,不转义会直接生成一段语法错误的 BuildConfig.java(而报错信息里会带上密码片段)。
+ */
+fun e2eProp(key: String): String {
+    val raw = e2eCredentials.getProperty(key).orEmpty()
+    val escaped = raw
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    return "\"$escaped\""
+}
+
 android {
     namespace = "dev.insua.jellycast"
     compileSdk = 36
@@ -43,6 +70,9 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
+
+        // HiltTestApplication 需要一个自定义 runner,见 androidTest 下的 CustomTestRunner。
+        testInstrumentationRunner = "dev.insua.jellycast.e2e.CustomTestRunner"
     }
 
     signingConfigs {
@@ -72,6 +102,12 @@ android {
 
     buildTypes {
         debug {
+            // 🔴 端到端凭据**只**注入 debug 变体(androidTest 跑的就是 debug)。
+            // 刻意不写在 defaultConfig 里 —— 那样 release APK 里也会带上真实服务器地址和密码。
+            buildConfigField("String", "E2E_BASE_URL", e2eProp("e2e.baseUrl"))
+            buildConfigField("String", "E2E_USERNAME", e2eProp("e2e.username"))
+            buildConfigField("String", "E2E_PASSWORD", e2eProp("e2e.password"))
+
             // 刻意**不**用发布密钥签 debug —— 保持 Android 默认调试密钥。
             // 发布密钥只在真正出包时使用;用它签日常 debug 会让私钥和密码出现在每次构建里,毫无收益。
             // (参考项目 cuoa_app 把 debug 也指向 release 签名配置,那是应当避免的做法。)
@@ -86,7 +122,27 @@ android {
         }
     }
 
-    buildFeatures { compose = true }
+    /**
+     * 每个 instrumentation 测试跑在**自己的进程**里。
+     *
+     * 不是洁癖,是实测的必要条件:这一套端到端测试全部依赖 `@Singleton`(ExoPlayer、PlayQueue、
+     * PlaybackService、JellyfinSession……),它们在同一个进程里被所有用例共享。
+     * `OfflineE2eTest` 会真的把设备切进飞行模式再切回来 —— 之后 `PlaybackE2eTest` 的"一集播完
+     * 自动连播"就再也不会推进队列(STATE_ENDED 到了、队列一步不动),而它单独跑、或者整套里
+     * 去掉断网用例之后,都是绿的。也就是说进程内残留状态确实会跨用例传染。
+     *
+     * Orchestrator 每跑一个用例重开一次进程,把这类耦合从根上去掉 —— 这也是官方对
+     * "测试互相污染 / 共享单例" 给出的标准答案。代价是每个用例多几秒启动时间。
+     */
+    testOptions {
+        execution = "ANDROIDX_TEST_ORCHESTRATOR"
+    }
+
+    // buildConfig = true:上面的 buildConfigField 需要它才会生成 BuildConfig 类。
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -120,9 +176,14 @@ dependencies {
     implementation(project(":core:network"))
     implementation(project(":core:datastore"))
     implementation(project(":core:database"))
+    // NetworkModule 引用 JellyCastDatabase(继承自 RoomDatabase)取 CachedItemDao——:core:database
+    // 对 room-runtime 是 implementation 依赖不会传递,这里需要显式声明才能在编译期看到父类型
+    // (与 :core:player 的 PlayerModule 同样的理由)。
+    implementation(libs.room.runtime)
     implementation(project(":core:subtitle"))
     implementation(project(":core:designsystem"))
     implementation(project(":core:player"))
+    implementation(project(":core:diagnostics"))
     implementation(project(":feature:server"))
     implementation(project(":feature:home"))
     implementation(project(":feature:library"))
@@ -156,6 +217,26 @@ dependencies {
 
     testImplementation(libs.junit.jupiter)
     testRuntimeOnly(libs.junit.platform.launcher)
+
+    // ⚠️ 源码集纪律:src/test 是 JUnit5 + MockK,src/androidTest 是 JUnit4 + AndroidJUnit4。
+    // 两套框架不混用 —— instrumentation 侧只有 JUnit4 能被 AndroidJUnitRunner 驱动。
+    androidTestImplementation(libs.junit4)
+    // 离线提示条必须被断言成"在视口里真的看得见"(assertIsDisplayed),不能只断言 ViewModel 状态:
+    // 真机验证时出现过 isOffline=true、提示条也被组合出来了,却因为懒列表的锚定行为被顶到视口
+    // 上方,用户一眼看不到。只有 Compose 语义树上的可见性断言能抓住这种形状的缺陷。
+    androidTestImplementation(platform(libs.compose.bom))
+    androidTestImplementation(libs.compose.ui.test.junit4)
+    debugImplementation(libs.compose.ui.test.manifest)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestUtil(libs.androidx.test.orchestrator)
+    androidTestUtil(libs.androidx.test.services)
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.hilt.android.testing)
+    kspAndroidTest(libs.hilt.compiler)
+    // 端到端测试直接注入 @Singleton 的 ExoPlayer(和 PlaybackService 用的是同一个实例),
+    // 需要在编译期看到这个类型 —— :core:player 对 media3 是 implementation 依赖,不传递。
+    androidTestImplementation(libs.media3.exoplayer)
+    androidTestImplementation(libs.kotlinx.coroutines)
 }
 
 tasks.withType<Test>().configureEach {

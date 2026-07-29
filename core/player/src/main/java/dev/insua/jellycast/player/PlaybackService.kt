@@ -6,8 +6,16 @@ import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import dagger.hilt.android.AndroidEntryPoint
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import dev.insua.jellycast.datastore.PreferencesStore
 import dev.insua.jellycast.network.session.JellyfinSession
 import kotlinx.coroutines.CoroutineScope
@@ -31,11 +39,13 @@ import javax.inject.Inject
  * Media3 默认回调会把 seek 命令直接转发给 `player.seekTo()`,而 Spike 实测转码流
  * `Accept-Ranges: none`,`seekTo()` 在这条流上不可靠(见 [SeekInterceptingPlayer] 类注释)。
  * 这里用 [SeekInterceptingPlayer] 包一层 ExoPlayer 再交给 `MediaSession.Builder`,所有 seek
- * 家族调用都被结构性地拦截,委派给 [bindEngine] 注入的 [AudioPlaybackEngine]。
+ * 家族调用都被结构性地拦截,委派给注入的 [playbackEngine]([AudioPlaybackEngine])。
  *
- * ⚠️ 修正 §1(a)/(b)(已闭合):[exoPlayer] / [engine] / [autoPlayNextController] /
+ * ⚠️ 修正 §1(a)/(b)(已闭合):[exoPlayer] / [playbackEngine] / [autoPlayNextController] /
  * [jellyfinSession] 全部经 Hilt 的 `PlayerModule`(见 `di/PlayerModule.kt`)装配注入,不再是
- * "写好了但没有生产调用方"的死代码——[onCreate] 里真的调用了 [bindEngine],`engine` 就是
+ * "写好了但没有生产调用方"的死代码——[onCreate] 直接把注入到手的 [playbackEngine] 交给
+ * [EngineSeekRouter] / [EngineQueueNavigator](原先经一个可空的 `engine` 字段 + `bindEngine()`
+ * 间接绕一手,注入本身已经保证非空,这层间接是多余的,已删除),它就是
  * [Player.STATE_ENDED] 那一刻驱动自动连播的同一个实例,和 `exoPlayer` 也是同一个单例
  * (见 `PlayerModule.provideExoPlayer` 的 KDoc)。
  *
@@ -91,9 +101,6 @@ class PlaybackService : MediaSessionService() {
      */
     private val shutdownScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    @Volatile
-    private var engine: AudioPlaybackEngine? = null
-
     /**
      * 复审 Important 3:`exoPlayer` 是 `@Singleton`,**比本 Service 活得久**。所以在 Service 上注册的
      * 监听器必须在 [onDestroy] 里摘掉——否则每次 Service 重建都往同一个播放器上再挂一份,
@@ -102,11 +109,53 @@ class PlaybackService : MediaSessionService() {
     private var playbackStateListener: Player.Listener? = null
     private var bandwidthListener: AnalyticsListener? = null
 
+    /**
+     * 「进前台」和「退前台」的决策全在这里(见 [ForegroundLifecycleController] 类注释)。
+     * 本类只提供两件 Android 才做得到的事:贴/摘通知、停服务。
+     */
+    private var foregroundLifecycle: ForegroundLifecycleController? = null
+
+    private val foregroundHooks = object : ForegroundLifecycleController.Hooks {
+        override fun enterForeground() = enterForegroundNow()
+
+        /**
+         * 占位通知是本类贴的,只能由本类摘。`STOP_FOREGROUND_REMOVE` 是关键 —— 不带这个标志
+         * 通知会留在栏里;而它 `setOngoing(true)` 且没有 `contentIntent`,用户既划不掉也点不动。
+         *
+         * `stopSelf()` 在有 `MediaController` 绑着的时候不会真的销毁服务(绑定客户端会把它留住),
+         * 那也没关系:用户可见的那条假通知已经没了,进程也不再被钉在前台。
+         */
+        override fun dismissNotificationAndStop() {
+            runCatching {
+                ServiceCompat.stopForeground(this@PlaybackService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+            }
+            stopSelf()
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
-        val router = SeekRouter { positionMs ->
-            engine?.let { e -> serviceScope.launch { e.seekTo(positionMs) } }
-        }
+
+        // 唯一的登录用户 id 来源:自动连播(下方 playbackEndedAdvancer)和上一集/下一集
+        // (queueNavigator)都要用同一份——读取失败(未登录/断网)时安全地返回 null,
+        // 调用方各自静默降级(不连播 / 不切集),不向上抛错(铁律 3/4 的同一条精神)。
+        val userIdProvider: suspend () -> String? = { runCatching { jellyfinSession.userId() }.getOrNull() }
+
+        // 生产实现见 EngineSeekRouter 的类注释:连点快进/拖动进度条在这里被合并(seek 防抖),
+        // 只有最后一次真正触发 AudioPlaybackEngine.seekTo,避免群晖 J4125 上堆孤儿转码任务
+        // (也就避免了"连点后偶发弹出「该条目无法播放」"那个竞态,见 SeekCoalescingTest)。
+        val router = EngineSeekRouter(playbackEngine, serviceScope)
+
+        // 设计文档 §3.3:不给 Media3 塞假播放列表(会和"每次重新 resolve"冲突),让
+        // SeekInterceptingPlayer 按 PlayQueue 的真实状态声明/执行上一集下一集命令,通知栏/锁屏/
+        // 蓝牙/车机才会显示出这两个按钮。
+        val queueNavigator = EngineQueueNavigator(
+            playQueue = playQueue,
+            engine = playbackEngine,
+            userIdProvider = userIdProvider,
+            scope = serviceScope,
+        )
+
         // 复审 Critical 1:交给 MediaSession 的这个 Player 必须报**条目内绝对位置**和**元数据总时长**。
         // 锁屏/通知栏/蓝牙的进度条与快进快退全部读它;底层 ExoPlayer 报的是转码流内的相对位置
         // (每次 seek/续播归零)和常为 C.TIME_UNSET 的时长,两个都不能直接用。
@@ -116,12 +165,9 @@ class PlaybackService : MediaSessionService() {
             exoPlayer,
             router,
             playbackEngine.asAbsoluteTimeline { playQueue.current.value?.runTimeMs },
+            queueNavigator,
         )
         mediaSession = MediaSession.Builder(this, sessionPlayer).build()
-
-        // 修正 §1(a):真正的生产调用方——没有这一行,锁屏/通知栏/蓝牙拖进度条会被
-        // SeekInterceptingPlayer 拦截后静默丢弃(engine 恒为 null)。
-        bindEngine(playbackEngine)
 
         // 修正 §1(b)/Finding 1:自动连播接到 Player.STATE_ENDED。播完一集后,拿当前登录用户 id 问
         // AutoPlayNextController 要不要接着播下一条——它内部已经处理好"关闭自动连播/播完本集
@@ -131,7 +177,7 @@ class PlaybackService : MediaSessionService() {
         val playbackEndedAdvancer = PlaybackEndedAdvancer(
             engine = playbackEngine,
             autoPlayNextController = autoPlayNextController,
-            userIdProvider = { runCatching { jellyfinSession.userId() }.getOrNull() },
+            userIdProvider = userIdProvider,
         )
         val stateListener = object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -165,7 +211,103 @@ class PlaybackService : MediaSessionService() {
 
         observeProgressReporting()
         observePlaybackSpeedPreference()
+
+        // 占位通知的收尾责任方。判据是"播放器手里还有内容吗" —— `STATE_IDLE` 表示 stop/clear 过或者
+        // 从来没 prepare 成功过,也就是"占位通知后面什么都没有"。在主线程 scope 上读播放器,
+        // 满足 ExoPlayer 的 application thread 约束。
+        foregroundLifecycle = ForegroundLifecycleController(
+            scope = serviceScope,
+            engineState = playbackEngine.state,
+            isPlayerActive = { exoPlayer.playbackState != Player.STATE_IDLE },
+            hooks = foregroundHooks,
+        ).also { it.start() }
     }
+
+    /**
+     * ## 🔴 稳定性根因 #1:前台服务时限不得被网络往返绑架
+     *
+     * `Context.startForegroundService()` 之后系统只给 **10 秒**,超时就是
+     * `ForegroundServiceDidNotStartInTimeException` → `bg anr` → 整个进程 `kill -9`。
+     * 用户报的「锁屏就断」「点播放就闪退」都出在这里。
+     *
+     * 在这一行之前,本 Service **自己从不调 `startForeground()`**,完全指望 Media3 的
+     * `MediaNotificationManager` 在"播放器真的开始缓冲"那一刻顺带把服务提到前台。那一刻要等
+     * `POST Items/{id}/PlaybackInfo` 往返 + L1 纯音频探测 + ExoPlayer 拉起远端转码流 ——
+     * Task 1 在**模拟器 + 局域网**实测 `startForegroundDelayMs:10785`,已经越线;真机走公网只会更慢。
+     * 也就是说:**这条时限被网络延迟绑架了,而网络延迟没有上界。**
+     *
+     * ### 为什么选"立刻进前台 + 占位通知",而不是"把解析搬进 Service"
+     *
+     * 把解析搬进 Service 只是把同一段网络往返换个地方跑 —— 只要"进前台"这件事仍然排在解析**之后**,
+     * 时限就仍然和网络耦合。而在这里进前台,时限从 O(网络) 变成 O(微秒),和服务器多慢、
+     * 家宽上行多窄彻底解耦。代价只是可能多显示一秒"正在准备播放",这是诚实的信息。
+     * 另外它也不需要动 `AudioPlaybackEngine` / DI 装配 —— 稳定性修复不该顺手做架构重构。
+     *
+     * ### 为什么用 Media3 的通知 id / channel id
+     *
+     * [MEDIA_NOTIFICATION_ID] / [MEDIA_CHANNEL_ID] 就是 `DefaultMediaNotificationProvider` 的默认值。
+     * 用同一个 id 意味着 Media3 随后 post 的媒体通知是**替换**这条占位通知,而不是并排多出一条;
+     * 用同一个 channel 意味着用户在系统设置里只看到一个「正在播放」通道。
+     *
+     * ### 为什么要先看 `activeNotifications`
+     *
+     * 用户在已经有内容在播时点另一集,会再走一次 `startForegroundService`。这时如果无脑贴占位通知,
+     * 锁屏卡片会从完整的媒体卡片闪回"正在准备播放"再闪回去。所以:媒体通知已经在了就拿它自己
+     * 重新 `startForeground` 一次 —— 视觉上零变化,而"进前台"这个义务照样当场履行完。
+     *
+     * 这里也一并修掉 Task 1 发现的第二个事实:一个进程里只出现过一次 `am_foreground_service_start`。
+     * Service 被销毁重建后 Media3 再也没把它提到前台。现在**每一次带 intent 的** `onStartCommand`
+     * 都会进前台,不依赖 Media3 内部任何状态。
+     *
+     * ### ⚠️ 复审 Important 1(已闭合):进得去也得出得来
+     *
+     * `intent == null` 说明这是系统按 `START_STICKY` 重启本服务 —— 什么都没在播,而且这条路
+     * **根本没有 10s 时限要赶**(时限只针对 `startForegroundService()`)。此时贴占位通知等于凭空
+     * 造一条幽灵通知。判定连同"解析失败 / 长时间空转就收摊"一起交给
+     * [ForegroundLifecycleController](纯 Kotlin,已单测),本方法只负责把事实告诉它。
+     */
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        foregroundLifecycle?.onStartCommand(hasIntent = intent != null)
+        return super.onStartCommand(intent, flags, startId)
+    }
+
+    private fun enterForegroundNow() {
+        val manager = getSystemService(NotificationManager::class.java) ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    MEDIA_CHANNEL_ID,
+                    NOTIFICATION_CHANNEL_NAME,
+                    NotificationManager.IMPORTANCE_LOW,
+                ),
+            )
+        }
+        val existing = runCatching {
+            manager.activeNotifications.firstOrNull { it.id == MEDIA_NOTIFICATION_ID }?.notification
+        }.getOrNull()
+
+        // 铁律 3/4 的同一条精神:进前台失败也绝不把播放搞崩。真进不去,最坏是回到修复前的行为,
+        // 而不是在这里抛一个没人接得住的异常。
+        runCatching {
+            ServiceCompat.startForeground(
+                this,
+                MEDIA_NOTIFICATION_ID,
+                existing ?: preparingNotification(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+            )
+        }
+    }
+
+    /** 占位通知:只在"媒体通知还没被 Media3 贴出来"的那一小段窗口里出现。 */
+    private fun preparingNotification(): Notification =
+        NotificationCompat.Builder(this, MEDIA_CHANNEL_ID)
+            .setSmallIcon(androidx.media3.session.R.drawable.media3_notification_small_icon)
+            .setContentTitle(PREPARING_TITLE)
+            .setOngoing(true)
+            .setSilent(true)
+            .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .build()
 
     /**
      * 复审 Critical 2:进度上报的两个时机。
@@ -212,11 +354,6 @@ class PlaybackService : MediaSessionService() {
         }
     }
 
-    /** 播放会话真正开始时由上层(驱动实际播放的模块)调用,把 seek 接到真实的重新 resolve 逻辑。 */
-    fun bindEngine(engine: AudioPlaybackEngine) {
-        this.engine = engine
-    }
-
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
 
     /**
@@ -261,12 +398,27 @@ class PlaybackService : MediaSessionService() {
 
         mediaSession?.release()
         mediaSession = null
-        engine = null
+        foregroundLifecycle?.stop()
+        foregroundLifecycle = null
         serviceScope.cancel()
+        // 占位通知是本类自己贴的,也必须由本类自己收走 —— 否则 Service 销毁后通知栏会留下一条
+        // 点不动的"正在准备播放"。
+        runCatching { ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE) }
         super.onDestroy()
     }
 
     private companion object {
+        /**
+         * 必须和 `DefaultMediaNotificationProvider.DEFAULT_NOTIFICATION_ID` /
+         * `DEFAULT_CHANNEL_ID` 一致 —— 见 [onStartCommand] 的说明。这两个常量在 Media3 里是
+         * public,但刻意不直接引用:直接引用会让"占位通知"这件事看起来像是 Media3 的一部分,
+         * 而它其实是本类为了不被系统杀掉而必须自己承担的责任。
+         */
+        const val MEDIA_NOTIFICATION_ID = 1001
+        const val MEDIA_CHANNEL_ID = "default_channel_id"
+        const val NOTIFICATION_CHANNEL_NAME = "正在播放"
+        const val PREPARING_TITLE = "正在准备播放"
+
         /** 设计文档 §7:进度上报"每 10s 或 seek 时"。 */
         const val PROGRESS_TICK_INTERVAL_MS = 10_000L
 

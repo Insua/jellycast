@@ -20,6 +20,15 @@ interface JellyfinSession {
     /** 当前登录用户的 id。 */
     suspend fun userId(): String
 
+    /**
+     * 当前激活服务器的 id(不是接入地址)。离线缓存按它分区,这样同一台手机上连过的多台服务器
+     * 各自的缓存不会串号 —— 一台服务器的 `home.resume` 绝不能出现在另一台的首页上。
+     *
+     * 注意它和 [baseUrl] 是两层:一台 Server 有多个 Endpoint(局域网 / Tailscale / 公网),
+     * 用户在家和出门时 baseUrl 不同、serverId 却是同一个,缓存必须跟着 serverId 走。
+     */
+    suspend fun serverId(): String
+
     /** 当前选中 endpoint 的 baseUrl,不带结尾斜杠。 */
     suspend fun baseUrl(): String
 

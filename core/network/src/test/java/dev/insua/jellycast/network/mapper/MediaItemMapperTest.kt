@@ -67,8 +67,20 @@ class MediaItemMapperTest {
 
     @Test
     fun `未知 Type 返回 null 而不是抛异常`() {
-        val dto = BaseItemDto(id = "x1", name = "X", type = "BoxSet")
+        // Playlist 是 Jellyfin 真实存在但本项目浏览页不认识的类型,用来代表"陌生类型"这一档——
+        // 不能再用 BoxSet 举例,BoxSet 从本次改动起是已知类型(合集),见下面的专项测试。
+        val dto = BaseItemDto(id = "x1", name = "X", type = "Playlist")
         assertNull(dto.toMediaItem())
+    }
+
+    // ---- 合集(BoxSet):jq 核对 docs/jellyfin-openapi.json 的 BaseItemKind 枚举确认存在 ----
+
+    @Test
+    fun `BoxSet 映射为 MediaKind_COLLECTION`() {
+        val dto = BaseItemDto(id = "box1", name = "神作合集", type = "BoxSet")
+        val item = dto.toMediaItem()
+        assertEquals(MediaKind.COLLECTION, item?.kind)
+        assertEquals("神作合集", item?.name)
     }
 
     // ---- 封面 URL:GET Items 路径 id in path,maxWidth/tag query,大小写核对自 openapi.json ----
@@ -87,5 +99,83 @@ class MediaItemMapperTest {
     fun `没有 imageTag 时封面 URL 为 null`() {
         val dto = BaseItemDto(id = "m1", name = "Movie", type = "Movie", imageTags = null)
         assertNull(dto.toMediaItem()!!.posterUrl("https://jelly.example.com"))
+    }
+
+    // ---- 「我的媒体」库入口:GET /UserViews 返回条目的 Type 是 CollectionFolder/UserView
+    //      (核对自 docs/jellyfin-openapi.json 的 BaseItemKind 枚举),不是 Series/Season/
+    //      Episode/Movie 之一,原来的 when 会把它们当"未知类型"整个丢弃。 ----
+
+    @Test
+    fun `CollectionFolder 类型映射为 LIBRARY`() {
+        val dto = BaseItemDto(id = "lib1", name = "电视剧", type = "CollectionFolder")
+        assertEquals(MediaKind.LIBRARY, dto.toMediaItem()?.kind)
+    }
+
+    @Test
+    fun `UserView 类型映射为 LIBRARY`() {
+        val dto = BaseItemDto(id = "lib2", name = "电影", type = "UserView")
+        assertEquals(MediaKind.LIBRARY, dto.toMediaItem()?.kind)
+    }
+
+    // ---- 未看数角标:UserItemDataDto.UnplayedItemCount(核对见 UserDataDto 上的注释)----
+
+    @Test
+    fun `UnplayedItemCount 映射到 unplayedItemCount`() {
+        val dto = BaseItemDto(
+            id = "e1", name = "E1", type = "Episode",
+            userData = UserDataDto(unplayedItemCount = 3),
+        )
+        assertEquals(3, dto.toMediaItem()?.unplayedItemCount)
+    }
+
+    @Test
+    fun `没有 UserData 时 unplayedItemCount 为 null`() {
+        val dto = BaseItemDto(id = "e1", name = "E1", type = "Episode", userData = null)
+        assertNull(dto.toMediaItem()?.unplayedItemCount)
+    }
+
+    // ---- 收藏 / 已看:UserItemDataDto.IsFavorite / Played(核对见 UserDataDto 上的注释)----
+
+    @Test
+    fun `IsFavorite 映射到 isFavorite`() {
+        val dto = BaseItemDto(id = "e1", name = "E1", type = "Episode", userData = UserDataDto(isFavorite = true))
+        assertEquals(true, dto.toMediaItem()?.isFavorite)
+    }
+
+    @Test
+    fun `Played 映射到 isPlayed`() {
+        val dto = BaseItemDto(id = "e1", name = "E1", type = "Episode", userData = UserDataDto(played = true))
+        assertEquals(true, dto.toMediaItem()?.isPlayed)
+    }
+
+    @Test
+    fun `没有 UserData 时 isFavorite 与 isPlayed 均为 false`() {
+        val dto = BaseItemDto(id = "e1", name = "E1", type = "Episode", userData = null)
+        val item = dto.toMediaItem()
+        assertEquals(false, item?.isFavorite)
+        assertEquals(false, item?.isPlayed)
+    }
+
+    // ---- 剧集归属:SeriesId / SeasonId(自动连播"跟着剧走"的唯一入口,见
+    //      AutoPlayNextController)。字段名大小写已核对 docs/jellyfin-openapi.json 的
+    //      BaseItemDto.properties —— "SeriesId" / "SeasonId",均为 uuid 字符串。----
+
+    @Test
+    fun `Episode 条目带上 SeriesId 与 SeasonId`() {
+        val dto = BaseItemDto(
+            id = "e1", name = "E1", type = "Episode",
+            seriesId = "series-1", seasonId = "season-1",
+        )
+        val item = dto.toMediaItem()
+        assertEquals("series-1", item?.seriesId)
+        assertEquals("season-1", item?.seasonId)
+    }
+
+    @Test
+    fun `没有 SeriesId 与 SeasonId 时两者为 null`() {
+        val dto = BaseItemDto(id = "m1", name = "M1", type = "Movie")
+        val item = dto.toMediaItem()
+        assertNull(item?.seriesId)
+        assertNull(item?.seasonId)
     }
 }

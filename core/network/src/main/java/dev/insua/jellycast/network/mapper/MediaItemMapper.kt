@@ -10,7 +10,7 @@ private const val TICKS_PER_MS = 10_000L
  * DTO → 领域模型的唯一换算点。项目铁律:ticks(1 tick = 100ns)只在这里换算一次,
  * ViewModel / UI 层禁止再出现 ticks。
  *
- * 返回 null 表示 [BaseItemDto.type] 不是浏览页认识的四种(Series/Season/Episode/Movie,
+ * 返回 null 表示 [BaseItemDto.type] 不是浏览页认识的五种(Series/Season/Episode/Movie/BoxSet,
  * 精确大小写核对自 docs/jellyfin-openapi.json 的 BaseItemKind 枚举)——调用方应该用
  * `mapNotNull` 跳过这类条目,不能让整页因为一条陌生类型的数据而崩溃。
  */
@@ -33,14 +33,26 @@ fun BaseItemDto.toMediaItem(): MediaItem? {
         runTimeMs = runTimeTicks?.let { it / TICKS_PER_MS },
         resumePositionMs = (userData?.positionTicks ?: 0L) / TICKS_PER_MS,
         imageTag = imageTags?.get("Primary"),
+        unplayedItemCount = userData?.unplayedItemCount,
+        isFavorite = userData?.isFavorite ?: false,
+        isPlayed = userData?.played ?: false,
+        seriesId = seriesId,
+        seasonId = seasonId,
     )
 }
 
+// "CollectionFolder" / "UserView" 是 GET /UserViews(「我的媒体」库入口)返回条目的
+// BaseItemKind,核对自 docs/jellyfin-openapi.json 的 BaseItemKind 枚举(两者都在列)。
 private fun String.toMediaKindOrNull(): MediaKind? = when (this) {
     "Series" -> MediaKind.SERIES
     "Season" -> MediaKind.SEASON
     "Episode" -> MediaKind.EPISODE
     "Movie" -> MediaKind.MOVIE
+    // 合集(设计文档 §3.7)。BaseItemKind 枚举里的精确拼写 "BoxSet" 已用
+    // jq '.components.schemas.BaseItemKind.enum | index("BoxSet")' docs/jellyfin-openapi.json 核对。
+    "BoxSet" -> MediaKind.COLLECTION
+    // 「我的媒体」库入口:/UserViews 返回的类型。
+    "CollectionFolder", "UserView" -> MediaKind.LIBRARY
     else -> null
 }
 

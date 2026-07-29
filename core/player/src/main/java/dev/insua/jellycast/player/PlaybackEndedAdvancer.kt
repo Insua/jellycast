@@ -16,9 +16,13 @@ package dev.insua.jellycast.player
  *
  * 修正:自动连播必须和 `MediaControllerPlayerConnection.skipToNext()` / `AppSessionViewModel.play()`
  * 走同一条路——[AudioPlaybackEngine.play],让 engine 内部状态和实际在放的条目保持同步。
- * [AutoPlayNextController.onPlaybackEnded] 内部已经 resolve 过一次(用来判断"要不要连播/连播到
- * 哪一条"),这里再经 `engine.play()` 触发第二次 resolve——多一次网络请求,换来的是"engine 的
- * currentItemId/currentUserId 永远和真实在放的条目一致"这个更重要的不变量,是刻意的工程取舍。
+ *
+ * ⚠️ 稳定性根因 #4(已闭合):这里曾经是"[AutoPlayNextController] 先 resolve 一次拿来判断,
+ * 结果丢掉,再经 `engine.play()` resolve 第二次"——被当成"多一次网络请求换一个不变量"的取舍记在案上。
+ * 真机结论是这个取舍不成立:那次多余的 `POST PlaybackInfo` 往返正好顶在"上一集刚播完、下一集还没
+ * 出声"的静默窗口上,还在 Jellyfin 上凭空多开一个等不到 stop 的播放会话。
+ * 现在 [AutoPlayNextController] 只回答"下一条是哪个条目",解析只发生在 `engine.play()` 里一次,
+ * 不变量原样保持。
  *
  * 重入保护:[AudioPlaybackEngine.play] 内部会触发 prepare,prepare 本身可能间接产生更多播放器
  * 状态回调。[isAdvancing] 保证同一时刻只有一次 advance 在跑——如果一次 advance 还没结束就再收到
@@ -39,7 +43,7 @@ class PlaybackEndedAdvancer(
         try {
             val userId = userIdProvider() ?: return
             val next = autoPlayNextController.onPlaybackEnded(userId) ?: return
-            engine.play(next.itemId, userId, 0L)
+            engine.play(next.id, userId, 0L)
         } finally {
             isAdvancing = false
         }

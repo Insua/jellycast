@@ -8,10 +8,14 @@ import dev.insua.jellycast.model.PageState
 import dev.insua.jellycast.network.JellyfinApi
 import dev.insua.jellycast.network.dto.ItemsResponseDto
 import dev.insua.jellycast.network.mapper.toMediaItem
+import dev.insua.jellycast.network.repository.CacheBuckets
+import dev.insua.jellycast.network.repository.ItemPage
+import dev.insua.jellycast.network.repository.MediaRepository
 import dev.insua.jellycast.network.session.JellyfinSession
 import javax.inject.Inject
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -29,10 +33,99 @@ private const val PAGE_SIZE = 50
 /** 搜索防抖窗口:用户连续输入期间不发请求,停顿这么久之后才真正发出去。 */
 private const val SEARCH_DEBOUNCE_MS = 300L
 
-enum class LibraryTab { SERIES, MOVIES }
+/** 无缓存又连不上服务器时给用户看的话。不带技术细节——用户能做的只有"重试"。 */
+private const val OFFLINE_MESSAGE = "无法连接服务器"
+
+enum class LibraryTab { SERIES, MOVIES, COLLECTIONS }
 
 /** 当前可见的分页列表是哪一个——浏览态下按 Tab 分流,搜索态下统一走 searchResults。 */
-private enum class ListTarget { SERIES, MOVIES, SEARCH }
+private enum class ListTarget { SERIES, MOVIES, COLLECTIONS, SEARCH }
+
+/**
+ * 浏览排序字段。[apiValue] 对应 `/Items` 的 `sortBy`,取值来自 Jellyfin `ItemSortBy` 枚举,
+ * 2026-07-28 用 `jq '.components.schemas.ItemSortBy.enum' docs/jellyfin-openapi.json` 核对过
+ * 三个取值的精确大小写(SortName / DateCreated / DatePlayed)——写错大小写会被服务端静默忽略。
+ */
+enum class LibrarySortBy(internal val apiValue: String) {
+    /** 名称(拼音/字母序),对应"按名称"。 */
+    NAME("SortName"),
+    /** 入库时间,对应"按添加日期"。 */
+    DATE_ADDED("DateCreated"),
+    /** 最近观看时间,对应"按观看日期"。 */
+    DATE_PLAYED("DatePlayed"),
+}
+
+/**
+ * 排序方向。[wireValue] 对应 `/Items` 的 `sortOrder`,取值来自 Jellyfin `SortOrder` 枚举
+ * (jq 核对:Ascending / Descending)。
+ *
+ * [ASCENDING] 故意映射到 `null`(不发送这个查询参数)而不是字面量 `"Ascending"`——
+ * Jellyfin 在未指定 `sortOrder` 时的默认行为就是升序,这里不发送只是省一个查询参数,
+ * **不影响服务端实际返回的顺序**。这与既有代码"不发送即代表默认值"的写法一致(见
+ * [LibraryFilters.toApiFilters] 对空筛选的处理)。缓存 bucket key 的区分逻辑
+ * ([libraryBucketKey])不依赖这个 wire 层面的省略,而是直接比较枚举本身,所以这个优化
+ * 不会影响"不同排序选择互不覆盖缓存"这条铁律。
+ */
+enum class LibrarySortOrder {
+    ASCENDING,
+    DESCENDING,
+    ;
+
+    internal val wireValue: String?
+        get() = when (this) {
+            ASCENDING -> null
+            DESCENDING -> "Descending"
+        }
+}
+
+/**
+ * 浏览筛选:仅未看 / 仅收藏,两者可同时生效。对应 `/Items` 的 `filters` 参数,取值来自
+ * Jellyfin `ItemFilter` 枚举,2026-07-28 用
+ * `jq '.components.schemas.ItemFilter.enum' docs/jellyfin-openapi.json` 核对过精确拼写:
+ * `IsUnplayed` / `IsFavorite`(枚举里还有 IsPlayed/IsResumable 等本次不用)。
+ */
+data class LibraryFilters(
+    val unplayedOnly: Boolean = false,
+    val favoritesOnly: Boolean = false,
+) {
+    /** 都未选中时返回 null——不发送这个参数,而不是空字符串(空字符串的服务端行为未经核实)。 */
+    fun toApiFilters(): String? {
+        val values = buildList {
+            if (unplayedOnly) add("IsUnplayed")
+            if (favoritesOnly) add("IsFavorite")
+        }
+        return values.takeIf { it.isNotEmpty() }?.joinToString(",")
+    }
+}
+
+/**
+ * 缓存 bucket key 的唯一组装处(feature:library 内部)——排序/筛选选择必须参与这个 key,
+ * 否则"剧集按名称升序"和"剧集按添加时间降序"会共用同一个缓存位置,后加载的那个会覆盖前一个,
+ * 用户切换排序再切回来时会看到刚才那次选择残留的内容,而不是真正属于当前选择的数据。
+ *
+ * 默认选择(名称 / 升序 / 无筛选)刻意映射回 [base] 原样,不追加任何后缀——这样"从未特意选过
+ * 排序筛选"的既有用户拿到的缓存 key 和改动前完全一致,不会因为这次改动让老缓存全部失效。
+ * 只有真正偏离默认值的那些维度才会被编码进 key,且顺序固定(排序字段、排序方向、筛选项),
+ * 不因为用户操作顺序不同而产生不同的 key(否则"先选未看再选收藏"和"先选收藏再选未看"会被
+ * 误判成两个不同的桶)。
+ *
+ * 之所以放在 `internal`(而不是 private)——[LibraryViewModelTest] 需要用同一份公式算出
+ * "某个排序筛选组合对应的 bucket key"去 seed [FakeMediaRepository],以此证明"切换排序/筛选
+ * 读到的是各自独立的缓存,不会互相串桶"。两处如果各写一份拼接逻辑,拼法一旦不一致,
+ * 测试就会失去意义(测的是"我以为的公式"而不是"真正在用的公式")。
+ */
+internal fun libraryBucketKey(
+    base: String,
+    sortBy: LibrarySortBy,
+    sortOrder: LibrarySortOrder,
+    filters: LibraryFilters,
+): String = buildString {
+    append(base)
+    if (sortBy != LibrarySortBy.NAME) append(".sort=").append(sortBy.name.lowercase())
+    if (sortOrder != LibrarySortOrder.ASCENDING) append(".order=").append(sortOrder.name.lowercase())
+    if (filters.unplayedOnly) append(".unplayed")
+    if (filters.favoritesOnly) append(".favorite")
+}
 
 /** 剧集详情:季列表(按季号排序)+ 当前选中季的完整集列表。[episodes] 就是自动连播的播放队列。 */
 data class SeriesDetailUiState(
@@ -41,21 +134,83 @@ data class SeriesDetailUiState(
     val selectedSeasonId: String? = null,
     val episodes: List<MediaItem> = emptyList(),
     val isLoading: Boolean = true,
+    /** 显示的是缓存、且这次刷新没成功。用于"离线,显示的是上次内容"的提示。 */
+    val isOffline: Boolean = false,
+    /** 既没有缓存又连不上服务器时的可重试错误态。 */
+    val error: String? = null,
+)
+
+/**
+ * 合集(BoxSet)详情:直接是一份条目列表(电影/剧集混排),不像剧集详情那样有"季"这层
+ * 结构。合集不是自动连播的队列语境——里面的条目彼此独立,点开电影直接播放,点开剧集导航
+ * 到 [SeriesDetailUiState] 那条既有路径,所以这里不需要 `queueFor` 那样的概念。
+ */
+data class CollectionDetailUiState(
+    val collectionId: String,
+    val items: List<MediaItem> = emptyList(),
+    val isLoading: Boolean = true,
+    val isOffline: Boolean = false,
+    val error: String? = null,
+)
+
+/**
+ * 首页「我的媒体」库卡片点进来的单个库浏览页(修正 §3.1)。分页规则与 [LibraryUiState.series]/
+ * [movies] 完全一致(第一页缓存优先整体替换,第二页起纯网络追加、不缓存)——只是范围被
+ * [libraryId] 圈定在这一个库内。剧集与电影混排、不预设库的类型,与 [CollectionDetailUiState]/
+ * 搜索同样的处理方式(见 [LibraryViewModel.fetchLibraryViewPage])。
+ *
+ * [isOffline] 只反映**这一个库浏览页**当前这次刷新是不是失败、显示的是缓存——与
+ * [LibraryUiState.isOffline](顶层三个浏览 Tab 用的)互不相干,是完全独立的一块屏幕状态。
+ */
+data class LibraryViewUiState(
+    val libraryId: String,
+    val page: PageState<MediaItem> = PageState(),
+    val isOffline: Boolean = false,
 )
 
 data class LibraryUiState(
     val tab: LibraryTab = LibraryTab.SERIES,
     val series: PageState<MediaItem> = PageState(),
     val movies: PageState<MediaItem> = PageState(),
+    /** 合集(BoxSet)列表——第三个浏览 Tab(设计文档 §3.7)。 */
+    val collections: PageState<MediaItem> = PageState(),
+    /** 当前排序/筛选选择——三个 Tab 共用同一套选择(顶部只有一处排序筛选入口)。 */
+    val sortBy: LibrarySortBy = LibrarySortBy.NAME,
+    val sortOrder: LibrarySortOrder = LibrarySortOrder.ASCENDING,
+    val filters: LibraryFilters = LibraryFilters(),
     val query: String = "",
     val searchResults: PageState<MediaItem> = PageState(),
     val detail: SeriesDetailUiState? = null,
+    val collectionDetail: CollectionDetailUiState? = null,
+    /** 首页库卡片点进来的单个库浏览页(修正 §3.1)。null = 当前没有打开任何库。 */
+    val libraryView: LibraryViewUiState? = null,
+    /** 当前可见的浏览列表显示的是缓存、且这次刷新没成功。 */
+    val isOffline: Boolean = false,
+    /**
+     * 收藏/已看乐观更新失败时给用户看的一次性提示(见 [LibraryViewModel.toggleFavorite]/
+     * [LibraryViewModel.togglePlayed])。[LibraryScreen] 用 `ActionMessageHost` 显示一次后
+     * 调 [LibraryViewModel.consumeActionError] 清空,不然重组会重复弹出同一条。
+     */
+    val actionError: String? = null,
+    /**
+     * 下拉刷新手势(设计文档 §2.3)是否正在进行,驱动 `PullToRefreshBox` 的指示器。只覆盖
+     * "当前可见的浏览 Tab"这一份,搜索态下恒为 false(见 [LibraryViewModel.refresh])。
+     */
+    val isRefreshing: Boolean = false,
 ) {
     val isSearching: Boolean get() = query.isNotBlank()
 
     /** 当前该显示哪一页数据:搜索态下永远是 searchResults,否则跟随当前 Tab。 */
     val visible: PageState<MediaItem>
-        get() = if (isSearching) searchResults else if (tab == LibraryTab.SERIES) series else movies
+        get() = if (isSearching) {
+            searchResults
+        } else {
+            when (tab) {
+                LibraryTab.SERIES -> series
+                LibraryTab.MOVIES -> movies
+                LibraryTab.COLLECTIONS -> collections
+            }
+        }
 }
 
 /**
@@ -68,6 +223,16 @@ data class LibraryUiState(
  * 这条必须在 [loadNextPage] 里再挡一层——它检查 `isLoading`/`endReached` 后**同步**标记
  * `isLoading = true`,而不是在挂起协程内部才检查,否则两次连续调用会在协程真正跑起来之前
  * 都读到"未在加载"的旧状态,双双发出请求。
+ *
+ * **缓存优先(本次改动)**:浏览列表的**第一页**、季列表、集列表都改走 [MediaRepository]
+ * ——先发缓存再后台刷新,断网打开看到的是上次的内容而不是白屏(设计文档 §3.1/§3.2)。
+ * 第二页起**不走缓存**:分页的下一页是"接着刚才那批往后要",离线时既没有可用的缓存页、
+ * 也没有意义(见 [ItemPage.total] 的 KDoc——总数是服务端此刻的口径,不进缓存)。
+ * 第一页的发射是**整体替换**而不是 `onPageLoaded` 追加:同一条流会先后发缓存和新数据两次,
+ * 追加语义会把两批内容拼起来变成重复列表。
+ *
+ * **搜索不缓存**:搜索结果是"这一刻针对这个词的服务端答案",缓存它没有意义(换个词就失效),
+ * 而且会把大量一次性结果塞满缓存表。所以 [applySearchResult] 这条路径与改动前完全一致。
  *
  * **搜索**:[onQueryChange] 把新查询词写进 [queryFlow];真正发请求的是 `init` 里那条
  * `debounce + flatMapLatest` 管线——防抖负责按下请求风暴(用户连续敲字符时只有停顿超过
@@ -87,12 +252,34 @@ data class LibraryUiState(
 class LibraryViewModel @Inject constructor(
     private val api: JellyfinApi,
     private val session: JellyfinSession,
+    private val repository: MediaRepository,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(LibraryUiState())
     val uiState: StateFlow<LibraryUiState> = _uiState.asStateFlow()
 
     private val queryFlow = MutableStateFlow("")
+
+    /** 每个浏览列表当前那条"第一页"流的协程。重新加载时先取消上一条,免得两条流交替覆盖状态。 */
+    private val firstPageJobs = mutableMapOf<ListTarget, Job>()
+
+    private var seasonsJob: Job? = null
+    private var episodesJob: Job? = null
+    private var collectionDetailJob: Job? = null
+    private var libraryViewFirstPageJob: Job? = null
+
+    /**
+     * 浏览列表(剧集/电影)**各自**最近一次的刷新是否失败,用来 OR 出 [LibraryUiState.isOffline]。
+     *
+     * SERIES 和 MOVIES 两个 Tab 的第一页刷新是各自独立并发的流([loadFirstPage] 对每个
+     * target 单独 launch),谁先落地谁先发射。如果 [LibraryUiState.isOffline] 直接被最新一次
+     * `cached.refreshFailed` 覆盖(不分是哪个 target 发的),后落地的那个流会把先落地的结论
+     * 冲掉——剧集刷新失败、电影刷新成功时,电影的发射（`refreshFailed = false`）如果恰好后到,
+     * 离线横幅会消失,即使屏幕上显示的仍是剧集的旧数据。跟 [HomeViewModel] 的
+     * `sectionRefreshFailed` 是同一个模式:按 target 分别记录,再 `.any { it }`,
+     * 顺序不影响结论。
+     */
+    private val listRefreshFailed = mutableMapOf<ListTarget, Boolean>()
 
     /**
      * **当前 searchResults 里那批结果是哪个查询词产生的** —— 搜索分页请求的"身份证"。
@@ -125,7 +312,7 @@ class LibraryViewModel @Inject constructor(
                             // 结果换人的同一时刻改身份:此后迟到的旧词分页都对不上号,会被丢弃。
                             displayedSearchTerm = query
                             updatePageState(ListTarget.SEARCH) { it.reset().startLoading() }
-                            emit(runCatching { fetchPage(types = "Series,Movie", startIndex = 0, searchTerm = query) })
+                            emit(runCatching { fetchSearchPage(startIndex = 0, searchTerm = query) })
                         }
                     }
                 }
@@ -133,16 +320,42 @@ class LibraryViewModel @Inject constructor(
         }
     }
 
-    /** 首屏加载:剧集 / 电影各自独立并发拉第一页。 */
+    /** 首屏加载:剧集 / 电影 / 合集各自独立并发拉第一页(缓存优先)。 */
     fun loadLibrary() {
-        listOf(ListTarget.SERIES, ListTarget.MOVIES).forEach { target ->
-            updatePageState(target) { PageState<MediaItem>().startLoading() }
-            requestPage(target, startIndex = 0, searchTerm = null)
-        }
+        listOf(ListTarget.SERIES, ListTarget.MOVIES, ListTarget.COLLECTIONS).forEach { loadFirstPage(it) }
     }
 
     fun selectTab(tab: LibraryTab) {
         _uiState.update { it.copy(tab = tab) }
+    }
+
+    /**
+     * 排序/筛选选择变更:更新状态并重新拉取两个浏览 Tab 的第一页(缓存优先,同
+     * [loadLibrary])。选择不变时不重复触发([reloadBrowseLists] 会取消并重开两条第一页流,
+     * 没有实际变化就重开一次没有意义,还会打断正在展示的转圈状态)。
+     *
+     * 搜索不受影响——[fetchSearchPage] 固定使用默认排序,不读这里的状态(见其 KDoc)。
+     */
+    fun setSortBy(sortBy: LibrarySortBy) {
+        if (_uiState.value.sortBy == sortBy) return
+        _uiState.update { it.copy(sortBy = sortBy) }
+        reloadBrowseLists()
+    }
+
+    fun setSortOrder(sortOrder: LibrarySortOrder) {
+        if (_uiState.value.sortOrder == sortOrder) return
+        _uiState.update { it.copy(sortOrder = sortOrder) }
+        reloadBrowseLists()
+    }
+
+    fun setFilters(filters: LibraryFilters) {
+        if (_uiState.value.filters == filters) return
+        _uiState.update { it.copy(filters = filters) }
+        reloadBrowseLists()
+    }
+
+    private fun reloadBrowseLists() {
+        listOf(ListTarget.SERIES, ListTarget.MOVIES, ListTarget.COLLECTIONS).forEach { loadFirstPage(it) }
     }
 
     fun onQueryChange(query: String) {
@@ -165,6 +378,12 @@ class LibraryViewModel @Inject constructor(
         // 更不能拿 searchTerm = null 去发请求 —— 那会退化成拉取整个未过滤的库。
         if (target == ListTarget.SEARCH && searchTerm == null) return
         val startIndex = current.loadedCount
+        // 浏览列表一条都没加载成功时,"下一页"其实就是第一页 —— 走缓存优先那条路(重试路径),
+        // 这样重试成功也会写回缓存,不会出现"重试成功了,下次断网还是白屏"。
+        if (target != ListTarget.SEARCH && startIndex == 0) {
+            loadFirstPage(target)
+            return
+        }
         updatePageState(target) { it.startLoading() }
         requestPage(target, startIndex, searchTerm)
     }
@@ -172,37 +391,124 @@ class LibraryViewModel @Inject constructor(
     /** 重试当前可见列表的失败页——本质就是"再要一次下一页",因为失败没有推进 loadedCount。 */
     fun retry() = loadNextPage()
 
+    /**
+     * 下拉刷新(设计文档 §2.3)。走的是与 [loadFirstPage] 完全相同的仓储路径
+     * ([repository.pagedBucket] 的"先缓存后网络"编排),**不是另起一套取数逻辑**。
+     *
+     * 与 [loadFirstPage] 唯一的区别:[loadFirstPage] 一上来把 `PageState` 整个重置为空
+     * (服务于排序/筛选切换那种"这其实是另一个 bucket"的场景,见 [reloadBrowseLists]),这里
+     * **不重置**——下拉刷新发生在同一个 bucket 已经有内容展示的时候,重置会先闪成空白再一点点
+     * 补回来,是这个手势明确要求禁止的行为。[updatePageState] 里的 `copy` 本来就是"整份覆盖",
+     * 缓存那次发射(同一个 bucket,几乎必定和屏幕上已经显示的一致)不会产生可见变化,真正的
+     * 新内容随后台网络到达时才会替换进去。
+     *
+     * 只刷新**当前可见的浏览 Tab**——首页三个分区并发是因为它们本来就同屏可见,媒体库一次只
+     * 展示一个 Tab,刷新看不见的另外两个没有意义。搜索态直接忽略:搜索结果不缓存(见类 KDoc),
+     * 没有仓储路径可复用,不为它另起一套取数逻辑,指示器也不会转起来。
+     */
+    fun refresh() {
+        if (_uiState.value.isSearching) return
+        val target = currentTarget()
+        val bucket = bucketFor(target) ?: return
+        firstPageJobs[target]?.cancel()
+        _uiState.update { it.copy(isRefreshing = true) }
+        firstPageJobs[target] = viewModelScope.launch {
+            repository.pagedBucket(bucket) {
+                val response = fetchBrowsePage(target, startIndex = 0)
+                ItemPage(response.items.mapNotNull { it.toMediaItem() }, response.total)
+            }.collect { cached ->
+                updatePageState(target) { state ->
+                    state.copy(
+                        items = cached.data.items,
+                        totalCount = cached.data.total ?: state.totalCount,
+                        isLoading = false,
+                        error = null,
+                    )
+                }
+                listRefreshFailed[target] = cached.refreshFailed
+                _uiState.update { it.copy(isOffline = listRefreshFailed.values.any { it }) }
+            }
+            // 等整条流(缓存 + 网络)都跑完再收起指示器——只等第一次(缓存)发射就收起的话,
+            // 后台网络还没回来,指示器却已经消失,"刷新完成"这个信号就撒谎了。
+            _uiState.update { it.copy(isRefreshing = false) }
+        }
+    }
+
     /** 进入某部剧的详情:加载季列表(按季号排序)并自动选中第一季。 */
     fun openSeries(seriesId: String) {
+        seasonsJob?.cancel()
+        episodesJob?.cancel()
         _uiState.update { it.copy(detail = SeriesDetailUiState(seriesId = seriesId, isLoading = true)) }
-        viewModelScope.launch {
-            val userId = session.userId()
-            val seasons = runCatching {
-                api.seasons(seriesId, userId).items.mapNotNull { it.toMediaItem() }
-            }.getOrDefault(emptyList()).sortedBy { it.seasonNumber ?: Int.MAX_VALUE }
-
-            val firstSeasonId = seasons.firstOrNull()?.id
-            _uiState.update { state ->
-                state.copy(detail = state.detail?.copy(seasons = seasons, selectedSeasonId = firstSeasonId))
+        seasonsJob = viewModelScope.launch {
+            var delivered = false
+            repository.bucket(CacheBuckets.seasonsOf(seriesId)) {
+                api.seasons(seriesId, session.userId()).items
+                    .mapNotNull { it.toMediaItem() }
+                    // 排序放在写回缓存**之前**:缓存表按 position 保存顺序,存的就是排好序的样子,
+                    // 离线读回来无需再排一次,也就不会出现"在线是 1、2、3,离线变成 2、1、3"。
+                    .sortedBy { it.seasonNumber ?: Int.MAX_VALUE }
+            }.collect { cached ->
+                delivered = true
+                val seasons = cached.data
+                val previous = _uiState.value.detail?.selectedSeasonId
+                // 刷新后原来选中的季可能已经不在了(服务端删了),这时才重新落到第一季;
+                // 否则保持用户的选择不变,不能让一次后台刷新把用户正在看的季跳走。
+                val selected = previous?.takeIf { id -> seasons.any { it.id == id } }
+                    ?: seasons.firstOrNull()?.id
+                _uiState.update { state ->
+                    state.copy(
+                        detail = state.detail?.copy(
+                            seasons = seasons,
+                            selectedSeasonId = selected,
+                            isOffline = cached.refreshFailed,
+                            error = null,
+                        ),
+                    )
+                }
+                when {
+                    selected == null ->
+                        _uiState.update { s -> s.copy(detail = s.detail?.copy(isLoading = false)) }
+                    selected != previous -> selectSeason(seriesId, selected)
+                }
             }
-            if (firstSeasonId != null) selectSeason(seriesId, firstSeasonId)
-            else _uiState.update { state -> state.copy(detail = state.detail?.copy(isLoading = false)) }
+            if (!delivered) {
+                // 既没缓存又连不上:进可重试的错误态,绝不抛异常、绝不崩溃。
+                _uiState.update { state ->
+                    state.copy(detail = state.detail?.copy(isLoading = false, error = OFFLINE_MESSAGE))
+                }
+            }
         }
     }
 
     /** 切换季:重新加载该季的完整集列表(即新的播放队列)。 */
     fun selectSeason(seriesId: String, seasonId: String) {
+        episodesJob?.cancel()
         _uiState.update { state ->
             state.copy(detail = state.detail?.copy(selectedSeasonId = seasonId, isLoading = true))
         }
-        viewModelScope.launch {
-            val userId = session.userId()
-            val episodes = runCatching {
-                api.episodes(seriesId, seasonId, userId).items.mapNotNull { it.toMediaItem() }
-            }.getOrDefault(emptyList())
-
-            _uiState.update { state ->
-                state.copy(detail = state.detail?.copy(episodes = episodes, isLoading = false))
+        episodesJob = viewModelScope.launch {
+            var delivered = false
+            repository.bucket(CacheBuckets.episodesOf(seasonId)) {
+                api.episodes(seriesId, seasonId, session.userId()).items.mapNotNull { it.toMediaItem() }
+            }.collect { cached ->
+                delivered = true
+                _uiState.update { state ->
+                    val detail = state.detail ?: return@update state
+                    state.copy(
+                        detail = detail.copy(
+                            episodes = cached.data,
+                            // 缓存已到、新数据还在路上时仍算"加载中";刷新失败就别再转圈了。
+                            isLoading = cached.isStale && !cached.refreshFailed,
+                            isOffline = detail.isOffline || cached.refreshFailed,
+                            error = null,
+                        ),
+                    )
+                }
+            }
+            if (!delivered) {
+                _uiState.update { state ->
+                    state.copy(detail = state.detail?.copy(isLoading = false, error = OFFLINE_MESSAGE))
+                }
             }
         }
     }
@@ -215,10 +521,286 @@ class LibraryViewModel @Inject constructor(
     fun queueFor(episode: MediaItem): List<MediaItem> =
         _uiState.value.detail?.episodes?.takeIf { it.isNotEmpty() } ?: listOf(episode)
 
-    /** 浏览列表(剧集/电影)的分页请求:成功走 onPageLoaded(自带幂等丢弃),失败走 onError,绝不抛错。 */
+    /** 进入某个合集:缓存优先加载它的直接子条目(电影/剧集混排,不递归)。 */
+    fun openCollection(collectionId: String) {
+        collectionDetailJob?.cancel()
+        _uiState.update { it.copy(collectionDetail = CollectionDetailUiState(collectionId = collectionId, isLoading = true)) }
+        collectionDetailJob = viewModelScope.launch {
+            var delivered = false
+            repository.bucket(CacheBuckets.collectionItemsOf(collectionId)) {
+                fetchCollectionItems(collectionId)
+            }.collect { cached ->
+                delivered = true
+                _uiState.update { state ->
+                    state.copy(
+                        collectionDetail = state.collectionDetail?.copy(
+                            items = cached.data,
+                            isLoading = cached.isStale && !cached.refreshFailed,
+                            isOffline = cached.refreshFailed,
+                            error = null,
+                        ),
+                    )
+                }
+            }
+            if (!delivered) {
+                _uiState.update { state ->
+                    state.copy(collectionDetail = state.collectionDetail?.copy(isLoading = false, error = OFFLINE_MESSAGE))
+                }
+            }
+        }
+    }
+
+    /** 重试当前合集详情的加载——本质就是重新 openCollection 同一个 id。 */
+    fun retryCollection() {
+        _uiState.value.collectionDetail?.collectionId?.let { openCollection(it) }
+    }
+
+    /**
+     * 进入某个库(首页「我的媒体」卡片,修正 §3.1):缓存优先加载该库的直接子条目,分页规则与
+     * [loadFirstPage]/[requestPage] 完全一致——第一页整体替换(缓存优先),第二页起追加、不缓存。
+     * bucket key 按 [libraryId] 区分([CacheBuckets.libraryViewOf]),两个库不会互相覆盖缓存。
+     */
+    fun openLibrary(libraryId: String) {
+        _uiState.update { it.copy(libraryView = LibraryViewUiState(libraryId = libraryId)) }
+        loadLibraryViewFirstPage(libraryId)
+    }
+
+    private fun loadLibraryViewFirstPage(libraryId: String) {
+        libraryViewFirstPageJob?.cancel()
+        updateLibraryViewPage(libraryId) { PageState<MediaItem>().startLoading() }
+        libraryViewFirstPageJob = viewModelScope.launch {
+            var delivered = false
+            repository.pagedBucket(CacheBuckets.libraryViewOf(libraryId)) {
+                val response = fetchLibraryViewPage(libraryId, startIndex = 0)
+                ItemPage(response.items.mapNotNull { it.toMediaItem() }, response.total)
+            }.collect { cached ->
+                delivered = true
+                updateLibraryViewPage(libraryId) { state ->
+                    state.copy(
+                        items = cached.data.items,
+                        totalCount = cached.data.total ?: state.totalCount,
+                        isLoading = cached.isStale && !cached.refreshFailed,
+                        error = null,
+                    )
+                }
+                _uiState.update { state ->
+                    val current = state.libraryView ?: return@update state
+                    if (current.libraryId != libraryId) return@update state
+                    state.copy(libraryView = current.copy(isOffline = cached.refreshFailed))
+                }
+            }
+            if (!delivered) {
+                // 既没缓存又连不上:进可重试的错误态,绝不抛异常、绝不崩溃。
+                updateLibraryViewPage(libraryId) { it.onError(OFFLINE_MESSAGE) }
+            }
+        }
+    }
+
+    /** 库浏览页的下一页——与 [loadNextPage] 同样的幂等保证:同步先标 `isLoading = true` 再
+     *  launch 协程,连点两次只发一次请求。 */
+    fun loadLibraryViewNextPage() {
+        val libraryView = _uiState.value.libraryView ?: return
+        val current = libraryView.page
+        if (current.isLoading || current.endReached) return
+        val startIndex = current.loadedCount
+        if (startIndex == 0) {
+            // 一条都没加载成功时,"下一页"其实就是第一页——走缓存优先那条路(重试路径)。
+            loadLibraryViewFirstPage(libraryView.libraryId)
+            return
+        }
+        updateLibraryViewPage(libraryView.libraryId) { it.startLoading() }
+        requestLibraryViewPage(libraryView.libraryId, startIndex)
+    }
+
+    /** 重试库浏览页——失败没有推进 loadedCount,"重试"本质就是"再要一次下一页"(同 [retry])。 */
+    fun retryLibraryView() = loadLibraryViewNextPage()
+
+    private fun requestLibraryViewPage(libraryId: String, startIndex: Int) {
+        viewModelScope.launch {
+            val result = runCatching { fetchLibraryViewPage(libraryId, startIndex) }
+            result.fold(
+                onSuccess = { response ->
+                    updateLibraryViewPage(libraryId) {
+                        it.onPageLoaded(response.items.mapNotNull { dto -> dto.toMediaItem() }, startIndex, response.total)
+                    }
+                },
+                onFailure = { error ->
+                    updateLibraryViewPage(libraryId) { it.onError(error.message ?: "加载失败") }
+                },
+            )
+        }
+    }
+
+    /**
+     * 某个库的直接子条目:剧集/电影混排([types] 与合集/搜索一致,不预设这个库的类型),
+     * `parentId` 圈定这一个库——精确拼写 `parentId` 已用 jq 核对 docs/jellyfin-openapi.json 的
+     * /Items 参数表(详见任务报告)。
+     */
+    private suspend fun fetchLibraryViewPage(libraryId: String, startIndex: Int): ItemsResponseDto =
+        api.items(
+            userId = session.userId(),
+            types = "Series,Movie",
+            sortBy = "SortName",
+            startIndex = startIndex,
+            limit = PAGE_SIZE,
+            parentId = libraryId,
+        )
+
+    /** 忽略掉与当前打开的库不一致的迟到更新——同 [applySearchResult] 的"身份校验"取舍:
+     *  用户已经切换到另一个库时,上一个库迟到的响应不该覆盖当前正在看的这个库。 */
+    private fun updateLibraryViewPage(libraryId: String, transform: (PageState<MediaItem>) -> PageState<MediaItem>) {
+        _uiState.update { state ->
+            val current = state.libraryView ?: return@update state
+            if (current.libraryId != libraryId) return@update state
+            state.copy(libraryView = current.copy(page = transform(current.page)))
+        }
+    }
+
+    /** [LibraryUiState.actionError] 显示过一次后由 [LibraryScreen] 调这个清空。 */
+    fun consumeActionError() {
+        _uiState.update { it.copy(actionError = null) }
+    }
+
+    /**
+     * 收藏 / 取消收藏(设计文档 §3.7)。**乐观更新**:先同步改 [item] 在浏览列表/搜索结果/
+     * 剧集详情/合集详情里所有出现的那一份(见 [mutateItem]),点击立刻有反馈,不等网络。
+     *
+     * 成功:调 [MediaRepository.patchItem] 把这份状态写透缓存——否则下次离线打开,缓存里
+     * 还是收藏前的旧值,乐观更新等于白做(见类 KDoc 对缓存交互的要求)。
+     * 失败:把[item]**原样**改回去(它是闭包捕获的、切换前的快照,天然就是"回滚目标"),
+     * 并把 [LibraryUiState.actionError] 置位——一个静默复原的收藏比明确报错更让人困惑
+     * (下次刷新前用户会一直以为收藏成功了)。绝不写缓存:半途而废的乐观状态不该落盘。
+     */
+    fun toggleFavorite(item: MediaItem) {
+        val target = !item.isFavorite
+        mutateItem(item.id) { it.copy(isFavorite = target) }
+        viewModelScope.launch {
+            val result = runCatching {
+                val userId = session.userId()
+                if (target) api.addFavorite(item.id, userId) else api.removeFavorite(item.id, userId)
+            }
+            if (result.isSuccess) {
+                repository.patchItem(item.id) { it.copy(isFavorite = target) }
+            } else {
+                mutateItem(item.id) { item }
+                _uiState.update {
+                    it.copy(actionError = if (target) "收藏失败,请重试" else "取消收藏失败,请重试")
+                }
+            }
+        }
+    }
+
+    /**
+     * 标记已看 / 未看(设计文档 §3.7)。同 [toggleFavorite] 的乐观更新 + 失败回滚模式,
+     * 多一步:标为已看时**同时把 [MediaItem.resumePositionMs] 清零**——服务端的
+     * `POST UserPlayedItems` 语义就是"这一集听完了",继续显示一条听了一半的进度条会让 UI
+     * 自相矛盾(铁律:标记已看不能让界面自己打自己脸)。标为未看不去猜一个新的进度,原样保留。
+     *
+     * 未看数角标(季/剧集级别的 `UnplayedItemCount`)是服务端聚合出来的,单条集的已看状态变化
+     * 不在客户端重新计算它——那需要知道"这一集属于哪一季/剧"并重新拉一次父级聚合,成本远超
+     * 这个操作本身。留给"该 bucket 的下一次自然刷新"去更新(任务说明里明确允许这个取舍)。
+     */
+    fun togglePlayed(item: MediaItem) {
+        val target = !item.isPlayed
+        mutateItem(item.id) { it.copy(isPlayed = target, resumePositionMs = if (target) 0L else it.resumePositionMs) }
+        viewModelScope.launch {
+            val result = runCatching {
+                val userId = session.userId()
+                if (target) api.markPlayed(item.id, userId) else api.markUnplayed(item.id, userId)
+            }
+            if (result.isSuccess) {
+                repository.patchItem(item.id) {
+                    it.copy(isPlayed = target, resumePositionMs = if (target) 0L else it.resumePositionMs)
+                }
+            } else {
+                // item 是切换前的快照——原样放回去,连听过进度一起回滚,不留半改的矛盾状态。
+                mutateItem(item.id) { item }
+                _uiState.update {
+                    it.copy(actionError = if (target) "标记已看失败,请重试" else "标记未看失败,请重试")
+                }
+            }
+        }
+    }
+
+    /**
+     * 把 [transform] 应用到 [itemId] 在**当前 UI 状态**里出现的每一处:三个浏览列表、搜索结果、
+     * 剧集详情的集列表、合集详情的条目列表——收藏/已看是条目自身的属性,同一个条目可能同时出现
+     * 在好几处(比如"搜索结果"和"剧集详情"),都要保持一致,不能只改点击发生的那一处。
+     */
+    private fun mutateItem(itemId: String, transform: (MediaItem) -> MediaItem) {
+        _uiState.update { state ->
+            state.copy(
+                series = state.series.mapItems(itemId, transform),
+                movies = state.movies.mapItems(itemId, transform),
+                collections = state.collections.mapItems(itemId, transform),
+                searchResults = state.searchResults.mapItems(itemId, transform),
+                detail = state.detail?.copy(episodes = state.detail.episodes.replaceIfMatches(itemId, transform)),
+                collectionDetail = state.collectionDetail?.copy(
+                    items = state.collectionDetail.items.replaceIfMatches(itemId, transform),
+                ),
+                libraryView = state.libraryView?.copy(page = state.libraryView.page.mapItems(itemId, transform)),
+            )
+        }
+    }
+
+    /**
+     * 合集内的直接子条目:`parentId` 定位到这个合集,`recursive=false` 只要直接子项
+     * (合集本身可能混装电影和整部剧集,不需要也不应该展开到季/集那一层)。
+     */
+    private suspend fun fetchCollectionItems(collectionId: String): List<MediaItem> =
+        api.items(
+            userId = session.userId(),
+            types = "Movie,Series",
+            recursive = false,
+            parentId = collectionId,
+        ).items.mapNotNull { it.toMediaItem() }
+
+    /**
+     * 浏览列表的**第一页**:缓存优先。一条流会先后发"缓存"和"新数据"两次,所以这里是
+     * **整体替换**而不是 [PageState.onPageLoaded] 的追加语义(追加会把两批拼成重复列表)。
+     *
+     * `totalCount` 只在网络那次发射里有值——缓存不存总数(见 [ItemPage]),用 `?:` 保留旧值,
+     * 免得一次缓存发射把已知的总数抹成 null 让 `endReached` 退回 false。
+     */
+    private fun loadFirstPage(target: ListTarget) {
+        val bucket = bucketFor(target) ?: return
+        firstPageJobs[target]?.cancel()
+        updatePageState(target) { PageState<MediaItem>().startLoading() }
+        firstPageJobs[target] = viewModelScope.launch {
+            var delivered = false
+            repository.pagedBucket(bucket) {
+                val response = fetchBrowsePage(target, startIndex = 0)
+                ItemPage(response.items.mapNotNull { it.toMediaItem() }, response.total)
+            }.collect { cached ->
+                delivered = true
+                updatePageState(target) { state ->
+                    state.copy(
+                        items = cached.data.items,
+                        totalCount = cached.data.total ?: state.totalCount,
+                        isLoading = cached.isStale && !cached.refreshFailed,
+                        error = null,
+                    )
+                }
+                listRefreshFailed[target] = cached.refreshFailed
+                _uiState.update { it.copy(isOffline = listRefreshFailed.values.any { it }) }
+            }
+            if (!delivered) {
+                // 一次都没发射 = 没缓存 + 网络失败。转成可重试的错误态,不崩溃、不空白。
+                updatePageState(target) { it.onError(OFFLINE_MESSAGE) }
+            }
+        }
+    }
+
+    /** 浏览列表(剧集/电影)**第二页起**的分页请求:成功走 onPageLoaded(自带幂等丢弃),失败走 onError,绝不抛错。 */
     private fun requestPage(target: ListTarget, startIndex: Int, searchTerm: String?) {
         viewModelScope.launch {
-            val result = runCatching { fetchPage(types = typesFor(target), startIndex = startIndex, searchTerm = searchTerm) }
+            val result = runCatching {
+                if (target == ListTarget.SEARCH) {
+                    fetchSearchPage(startIndex, requireNotNull(searchTerm))
+                } else {
+                    fetchBrowsePage(target, startIndex)
+                }
+            }
             // 身份校验:响应回来时,屏幕上显示的结果如果已经换成别的查询词(或已退出搜索),
             // 这一页就是"上一场比赛的成绩",直接丢弃 —— 既不追加条目也不覆盖 totalCount。
             // 此时 searchResults 的 isLoading 由新查询那条管线自己负责收尾,不会卡住。
@@ -250,10 +832,33 @@ class LibraryViewModel @Inject constructor(
         )
     }
 
-    private suspend fun fetchPage(types: String, startIndex: Int, searchTerm: String? = null): ItemsResponseDto =
+    /**
+     * 浏览列表(剧集/电影)取数——带上用户当前选择的排序字段/方向/筛选(设计文档 §3.7)。
+     * `sortOrder`/`filters` 的取值构造见 [LibrarySortOrder.wireValue] / [LibraryFilters.toApiFilters]
+     * 的 KDoc:默认选择时不发送这两个参数,行为与改动前完全一致。
+     */
+    private suspend fun fetchBrowsePage(target: ListTarget, startIndex: Int): ItemsResponseDto {
+        val state = _uiState.value
+        return api.items(
+            userId = session.userId(),
+            types = typesFor(target),
+            sortBy = state.sortBy.apiValue,
+            startIndex = startIndex,
+            limit = PAGE_SIZE,
+            sortOrder = state.sortOrder.wireValue,
+            filters = state.filters.toApiFilters(),
+        )
+    }
+
+    /**
+     * 搜索固定用名称排序、不带任何筛选——搜索关心的是"这个词命中了什么",用户在浏览页选的
+     * 排序/筛选是浏览语境下的偏好,套到搜索结果上没有意义,也会让"清空搜索词回到浏览态"和
+     * "搜索结果与浏览列表互不影响"这两条既有保证变得含糊。
+     */
+    private suspend fun fetchSearchPage(startIndex: Int, searchTerm: String): ItemsResponseDto =
         api.items(
             userId = session.userId(),
-            types = types,
+            types = "Series,Movie",
             sortBy = "SortName",
             startIndex = startIndex,
             limit = PAGE_SIZE,
@@ -264,15 +869,37 @@ class LibraryViewModel @Inject constructor(
         val state = _uiState.value
         return when {
             state.isSearching -> ListTarget.SEARCH
-            state.tab == LibraryTab.SERIES -> ListTarget.SERIES
-            else -> ListTarget.MOVIES
+            else -> when (state.tab) {
+                LibraryTab.SERIES -> ListTarget.SERIES
+                LibraryTab.MOVIES -> ListTarget.MOVIES
+                LibraryTab.COLLECTIONS -> ListTarget.COLLECTIONS
+            }
         }
     }
 
     private fun typesFor(target: ListTarget): String = when (target) {
         ListTarget.SERIES -> "Series"
         ListTarget.MOVIES -> "Movie"
+        // BaseItemKind 精确拼写 "BoxSet" 已用 jq 核对(见 MediaItemMapper 里的同一处核对)。
+        ListTarget.COLLECTIONS -> "BoxSet"
         ListTarget.SEARCH -> "Series,Movie"
+    }
+
+    /**
+     * 搜索结果不缓存(见类 KDoc),所以 SEARCH 没有 bucket。
+     *
+     * 剧集/电影的 bucket key 由 [libraryBucketKey] 拼出当前排序/筛选选择——这是本次改动的
+     * 关键点:不同选择必须落到不同的缓存位置,否则会互相覆盖(见 [libraryBucketKey] 的 KDoc)。
+     */
+    private fun bucketFor(target: ListTarget): String? {
+        val base = when (target) {
+            ListTarget.SERIES -> CacheBuckets.LIBRARY_SERIES
+            ListTarget.MOVIES -> CacheBuckets.LIBRARY_MOVIES
+            ListTarget.COLLECTIONS -> CacheBuckets.LIBRARY_COLLECTIONS
+            ListTarget.SEARCH -> return null
+        }
+        val state = _uiState.value
+        return libraryBucketKey(base, state.sortBy, state.sortOrder, state.filters)
     }
 
     /**
@@ -286,6 +913,7 @@ class LibraryViewModel @Inject constructor(
     private fun getPageState(target: ListTarget): PageState<MediaItem> = when (target) {
         ListTarget.SERIES -> _uiState.value.series
         ListTarget.MOVIES -> _uiState.value.movies
+        ListTarget.COLLECTIONS -> _uiState.value.collections
         ListTarget.SEARCH -> _uiState.value.searchResults
     }
 
@@ -294,8 +922,17 @@ class LibraryViewModel @Inject constructor(
             when (target) {
                 ListTarget.SERIES -> state.copy(series = transform(state.series))
                 ListTarget.MOVIES -> state.copy(movies = transform(state.movies))
+                ListTarget.COLLECTIONS -> state.copy(collections = transform(state.collections))
                 ListTarget.SEARCH -> state.copy(searchResults = transform(state.searchResults))
             }
         }
     }
 }
+
+/** [LibraryViewModel.mutateItem] 用:某个分页列表里,把命中 id 的那一条换成 [transform] 的结果。 */
+private fun PageState<MediaItem>.mapItems(itemId: String, transform: (MediaItem) -> MediaItem): PageState<MediaItem> =
+    copy(items = items.replaceIfMatches(itemId, transform))
+
+/** [LibraryViewModel.mutateItem] 用:普通列表(季/集、合集条目)里同样的替换语义。 */
+private fun List<MediaItem>.replaceIfMatches(itemId: String, transform: (MediaItem) -> MediaItem): List<MediaItem> =
+    map { if (it.id == itemId) transform(it) else it }

@@ -17,16 +17,24 @@ import okhttp3.Request
  * [PlaybackSourceResolver] 走 L3 兜底,而不是让整个 resolve() 崩掉。
  */
 class HttpStreamProbe(private val client: OkHttpClient) : StreamProbe {
-    override suspend fun isAudioOnly(url: String): Boolean = withContext(Dispatchers.IO) {
+    /**
+     * 返回值三态,见 [StreamProbe]:
+     * - `true` / `false` —— 服务端 2xx 回来了,`Content-Type` 说了算,**有结论**。
+     * - `null` —— 非 2xx 或者压根没连上,**没问出结论**。J4125 上并发转码打架时
+     *   `/Audio/{item}/universal` 回 500 是常态,把它当成"这个源不是纯音频"记下来,
+     *   会让整个会话被钉死在 L3。
+     */
+    override suspend fun isAudioOnly(url: String): Boolean? = withContext(Dispatchers.IO) {
         try {
             val request = Request.Builder().url(url).get().build()
             client.newCall(request).execute().use { response ->
-                response.isSuccessful && response.header("Content-Type")?.startsWith("audio/", ignoreCase = true) == true
+                if (!response.isSuccessful) return@use null
+                response.header("Content-Type")?.startsWith("audio/", ignoreCase = true) == true
             }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            false
+            null
         }
     }
 }

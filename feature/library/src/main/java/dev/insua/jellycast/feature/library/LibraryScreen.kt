@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -17,7 +18,13 @@ import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -25,11 +32,18 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -39,6 +53,8 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import dev.insua.jellycast.designsystem.ActionMessageHost
+import dev.insua.jellycast.designsystem.OfflineBanner
 import dev.insua.jellycast.designsystem.PosterCard
 import dev.insua.jellycast.model.MediaItem
 import dev.insua.jellycast.model.MediaKind
@@ -56,6 +72,12 @@ object LibraryScreenTestTags {
     const val LOADING_MORE = "library_loading_more"
     const val ERROR_ROW = "library_error_row"
     const val EMPTY_STATE = "library_empty_state"
+    const val OFFLINE_BANNER = "library_offline_banner"
+    const val SORT_BUTTON = "library_sort_button"
+    const val FILTER_UNPLAYED = "library_filter_unplayed"
+    const val FILTER_FAVORITES = "library_filter_favorites"
+    const val PULL_REFRESH_CONTAINER = "library_pull_refresh_container"
+    const val PULL_REFRESH_INDICATOR = "library_pull_refresh_indicator"
 
     fun item(id: String) = "library_item_$id"
 }
@@ -73,6 +95,7 @@ object LibraryScreenTestTags {
 fun LibraryScreen(
     onSeriesClick: (String) -> Unit,
     onPlay: (MediaItem) -> Unit,
+    onCollectionClick: (String) -> Unit = {},
     baseUrl: String = "",
     viewModel: LibraryViewModel = hiltViewModel(),
 ) {
@@ -84,8 +107,16 @@ fun LibraryScreen(
         onSelectTab = viewModel::selectTab,
         onLoadNextPage = viewModel::loadNextPage,
         onRetry = viewModel::retry,
+        onRefresh = viewModel::refresh,
         onSeriesClick = onSeriesClick,
         onPlay = onPlay,
+        onCollectionClick = onCollectionClick,
+        onSortByChange = viewModel::setSortBy,
+        onSortOrderChange = viewModel::setSortOrder,
+        onFiltersChange = viewModel::setFilters,
+        onToggleFavorite = viewModel::toggleFavorite,
+        onTogglePlayed = viewModel::togglePlayed,
+        onActionErrorShown = viewModel::consumeActionError,
     )
 }
 
@@ -100,6 +131,7 @@ fun LibraryScreen(
  * 3. `loadedCount == 0`:空态文案,按 `isSearching` 区分「没有匹配」/「库还没有内容」
  * 4. 都不是:只有 items,没有底部状态行
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LibraryScreenContent(
     uiState: LibraryUiState,
@@ -108,11 +140,23 @@ fun LibraryScreenContent(
     onSelectTab: (LibraryTab) -> Unit,
     onLoadNextPage: () -> Unit,
     onRetry: () -> Unit,
+    onRefresh: () -> Unit = {},
     onSeriesClick: (String) -> Unit,
     onPlay: (MediaItem) -> Unit,
+    onCollectionClick: (String) -> Unit = {},
+    onSortByChange: (LibrarySortBy) -> Unit = {},
+    onSortOrderChange: (LibrarySortOrder) -> Unit = {},
+    onFiltersChange: (LibraryFilters) -> Unit = {},
+    onToggleFavorite: (MediaItem) -> Unit = {},
+    onTogglePlayed: (MediaItem) -> Unit = {},
+    onActionErrorShown: () -> Unit = {},
 ) {
     val visible = uiState.visible
 
+    // 见 [HomeScreen]:关闭状态是页面级的,不进 ViewModel。
+    var offlineNoticeDismissed by rememberSaveable { mutableStateOf(false) }
+
+    Box {
     Column {
         OutlinedTextField(
             value = uiState.query,
@@ -152,7 +196,30 @@ fun LibraryScreenContent(
                     onClick = { onSelectTab(LibraryTab.MOVIES) },
                     text = { Text("电影") },
                 )
+                Tab(
+                    selected = uiState.tab == LibraryTab.COLLECTIONS,
+                    onClick = { onSelectTab(LibraryTab.COLLECTIONS) },
+                    text = { Text("合集") },
+                )
             }
+
+            SortAndFilterRow(
+                sortBy = uiState.sortBy,
+                sortOrder = uiState.sortOrder,
+                filters = uiState.filters,
+                onSortByChange = onSortByChange,
+                onSortOrderChange = onSortOrderChange,
+                onFiltersChange = onFiltersChange,
+            )
+        }
+
+        // 显示的是上次的内容:顶部一条可关闭的提示,底下的网格照常可滚动可点(不是弹窗)。
+        // 搜索态不显示 —— 搜索结果不缓存(见 [LibraryViewModel] 类 KDoc),那一屏没有"上次内容"可言。
+        if (uiState.isOffline && !uiState.isSearching && visible.loadedCount > 0 && !offlineNoticeDismissed) {
+            OfflineBanner(
+                onDismiss = { offlineNoticeDismissed = true },
+                modifier = Modifier.testTag(LibraryScreenTestTags.OFFLINE_BANNER),
+            )
         }
 
         // 三份列表(剧集 / 电影 / 搜索结果)各自一个滚动状态:共用一个的话,从剧集第 80 条
@@ -178,6 +245,33 @@ fun LibraryScreenContent(
             }
         }
 
+        // 下拉刷新(设计文档 §2.3):只包住网格本身,不含搜索框/TabRow/排序筛选行/离线横幅——
+        // 手势应该发生在列表上。[LibraryViewModel.refresh] 只刷新当前可见的浏览 Tab,搜索态下
+        // 是空操作(搜索结果不缓存,见 ViewModel 类 KDoc),指示器也就不会转起来。
+        val pullRefreshState = rememberPullToRefreshState()
+        PullToRefreshBox(
+            isRefreshing = uiState.isRefreshing,
+            onRefresh = onRefresh,
+            state = pullRefreshState,
+            modifier = Modifier
+                .fillMaxSize()
+                .testTag(LibraryScreenTestTags.PULL_REFRESH_CONTAINER),
+            indicator = {
+                // 同 [dev.insua.jellycast.feature.home.HomeScreenContent]:只在真的有事情发生时
+                // (拖拽中 / 回弹动画中 / 真的在刷新)才把指示器组合进树,不让它靠 M3 内部的
+                // alpha/scale 动画常驻树上却"看不见"——那样 `assertIsDisplayed()` 量不出区别,
+                // 与 v3 离线横幅"存在但被挤出可视区"是同一类坑。
+                if (uiState.isRefreshing || pullRefreshState.distanceFraction > 0f || pullRefreshState.isAnimating) {
+                    PullToRefreshDefaults.Indicator(
+                        state = pullRefreshState,
+                        isRefreshing = uiState.isRefreshing,
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .testTag(LibraryScreenTestTags.PULL_REFRESH_INDICATOR),
+                    )
+                }
+            },
+        ) {
         LazyVerticalGrid(
             state = gridState,
             columns = GridCells.Adaptive(minSize = 140.dp),
@@ -192,9 +286,17 @@ fun LibraryScreenContent(
                     subtitle = if (uiState.isSearching) mediaItem.kind.searchSubtitle() else null,
                     imageUrl = if (baseUrl.isBlank()) null else mediaItem.posterUrl(baseUrl),
                     onClick = {
-                        if (mediaItem.kind == MediaKind.SERIES) onSeriesClick(mediaItem.id) else onPlay(mediaItem)
+                        when (mediaItem.kind) {
+                            MediaKind.SERIES -> onSeriesClick(mediaItem.id)
+                            MediaKind.COLLECTION -> onCollectionClick(mediaItem.id)
+                            else -> onPlay(mediaItem)
+                        }
                     },
                     modifier = Modifier.testTag(LibraryScreenTestTags.item(mediaItem.id)),
+                    isFavorite = mediaItem.isFavorite,
+                    onToggleFavorite = { onToggleFavorite(mediaItem) },
+                    isPlayed = mediaItem.isPlayed,
+                    onTogglePlayed = { onTogglePlayed(mediaItem) },
                 )
             }
 
@@ -246,6 +348,12 @@ fun LibraryScreenContent(
                 }
             }
         }
+        }
+    }
+
+    // 收藏/已看乐观更新失败时的一次性提示——见 [ActionMessageHost] 的 KDoc,故意不嵌第二层
+    // Scaffold。放在最外层 Box 里,盖在 LazyVerticalGrid 之上但不拦截它的点击/滚动手势。
+    ActionMessageHost(message = uiState.actionError, onMessageShown = onActionErrorShown)
     }
 }
 
@@ -254,4 +362,74 @@ private fun MediaKind.searchSubtitle(): String? = when (this) {
     MediaKind.SERIES -> "剧集"
     MediaKind.MOVIE -> "电影"
     else -> null
+}
+
+/**
+ * 浏览态下的排序 + 筛选控制条(设计文档 §3.6/§3.7)。排序用一个下拉菜单(字段 + 方向合并
+ * 在同一个入口,避免占太多横向空间——库里条目多,横向空间要留给网格);筛选用两个可独立
+ * 切换的 [FilterChip],未看/收藏可以同时选中(对应 [LibraryFilters] 两个布尔字段独立生效)。
+ */
+@Composable
+private fun SortAndFilterRow(
+    sortBy: LibrarySortBy,
+    sortOrder: LibrarySortOrder,
+    filters: LibraryFilters,
+    onSortByChange: (LibrarySortBy) -> Unit,
+    onSortOrderChange: (LibrarySortOrder) -> Unit,
+    onFiltersChange: (LibraryFilters) -> Unit,
+) {
+    var sortMenuExpanded by remember { mutableStateOf(false) }
+
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp),
+    ) {
+        Box {
+            AssistChip(
+                onClick = { sortMenuExpanded = true },
+                label = { Text("${sortBy.displayName()} · ${sortOrder.displayName()}") },
+                modifier = Modifier.testTag(LibraryScreenTestTags.SORT_BUTTON),
+            )
+            DropdownMenu(expanded = sortMenuExpanded, onDismissRequest = { sortMenuExpanded = false }) {
+                LibrarySortBy.entries.forEach { option ->
+                    DropdownMenuItem(
+                        text = { Text(option.displayName()) },
+                        onClick = { onSortByChange(option); sortMenuExpanded = false },
+                    )
+                }
+                HorizontalDivider()
+                LibrarySortOrder.entries.forEach { option ->
+                    DropdownMenuItem(
+                        text = { Text(option.displayName()) },
+                        onClick = { onSortOrderChange(option); sortMenuExpanded = false },
+                    )
+                }
+            }
+        }
+        FilterChip(
+            selected = filters.unplayedOnly,
+            onClick = { onFiltersChange(filters.copy(unplayedOnly = !filters.unplayedOnly)) },
+            label = { Text("仅未看") },
+            modifier = Modifier.testTag(LibraryScreenTestTags.FILTER_UNPLAYED),
+        )
+        FilterChip(
+            selected = filters.favoritesOnly,
+            onClick = { onFiltersChange(filters.copy(favoritesOnly = !filters.favoritesOnly)) },
+            label = { Text("仅收藏") },
+            modifier = Modifier.testTag(LibraryScreenTestTags.FILTER_FAVORITES),
+        )
+    }
+}
+
+private fun LibrarySortBy.displayName(): String = when (this) {
+    LibrarySortBy.NAME -> "名称"
+    LibrarySortBy.DATE_ADDED -> "添加日期"
+    LibrarySortBy.DATE_PLAYED -> "观看日期"
+}
+
+private fun LibrarySortOrder.displayName(): String = when (this) {
+    LibrarySortOrder.ASCENDING -> "升序"
+    LibrarySortOrder.DESCENDING -> "降序"
 }

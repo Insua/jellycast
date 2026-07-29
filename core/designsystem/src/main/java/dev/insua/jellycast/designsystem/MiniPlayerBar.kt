@@ -14,9 +14,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -35,11 +37,15 @@ import coil3.compose.AsyncImage
 object MiniPlayerBarTestTags {
     const val ROOT = "mini_player_bar"
     const val PLAY_PAUSE_BUTTON = "mini_player_bar_play_pause"
+    const val SKIP_NEXT_BUTTON = "mini_player_bar_skip_next"
 }
 
 /**
- * 常驻迷你播放条:高 64dp,左侧方形封面 + 中间双行文字 + 右侧播放/暂停,底部 2dp 进度条。
- * 整条可点击展开全屏播放页(Task 20)。播放/暂停按钮独立可点,不冒泡到整条的 onExpand。
+ * 常驻迷你播放条:高 64dp,左侧方形封面 + 中间双行文字 + 右侧播放/暂停 + 下一集,底部 2dp 进度条。
+ * 整条可点击展开全屏播放页(Task 20)。播放/暂停、下一集按钮独立可点,不冒泡到整条的 onExpand。
+ *
+ * [hasNext] 为 false(队列没有下一条可以推进,比如单集播放/已在最后一集)时下一集按钮禁用——
+ * 保留在布局里而不是整个消失,避免播放/暂停按钮的位置随播放状态左右跳动。
  */
 @Composable
 fun MiniPlayerBar(
@@ -48,7 +54,9 @@ fun MiniPlayerBar(
     posterUrl: String?,
     isPlaying: Boolean,
     progress: Float,
+    hasNext: Boolean,
     onPlayPause: () -> Unit,
+    onSkipNext: () -> Unit,
     onExpand: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -101,6 +109,21 @@ fun MiniPlayerBar(
                 Icon(
                     imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                     contentDescription = if (isPlaying) "暂停" else "播放",
+                )
+            }
+            IconButton(
+                onClick = onSkipNext,
+                enabled = hasNext,
+                modifier = Modifier.testTag(MiniPlayerBarTestTags.SKIP_NEXT_BUTTON),
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.SkipNext,
+                    contentDescription = "下一集",
+                    tint = if (hasNext) {
+                        LocalContentColor.current
+                    } else {
+                        LocalContentColor.current.copy(alpha = 0.38f)
+                    },
                 )
             }
         }

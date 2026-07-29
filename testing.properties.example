@@ -1,0 +1,17 @@
+# 端到端测试(:app 的 androidTest)连的是一台**真实** Jellyfin 服务器。
+#
+# 用法:把本文件复制成 `testing.properties`(项目根目录)并填入真实值。
+#   cp testing.properties.example testing.properties
+#
+# 🔴 `testing.properties` 已被 .gitignore 排除,**绝不允许提交**。
+#    本文件只含占位符,可以提交;不要把真实地址/账号/密码写进这里。
+#
+# 缺失 `testing.properties`(或任一项留空)时,端到端测试会用 JUnit `Assume` **自动跳过**,
+# 不会让构建变红 —— clone 本仓库的人不配服务器也能拿到全绿的构建。
+#
+# 这些值会被写进 **debug** 变体的 BuildConfig(release 变体不含这些字段),
+# 只给 androidTest 用。测试代码不允许 log / 断言消息里出现其中任何一个值。
+
+e2e.baseUrl=http://your-server:8096
+e2e.username=your-username
+e2e.password=your-password

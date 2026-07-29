@@ -34,7 +34,12 @@ interface PlayerControl {
      */
     val currentPositionMs: Long
 
-    fun setMediaItemAndPrepare(url: String)
+    /**
+     * [metadata] 是 Task「媒体元数据」的落地点:锁屏/通知/蓝牙/流体云共同的前提。可以是 `null`
+     * (没有对应的 [PlaybackDisplayMetadata] 时,比如引擎还不认识这个 itemId)——生产实现
+     * ([ExoPlayerControl])对 `null` 的处理是"标题/副标题/封面都不设",不是崩溃或抛错。
+     */
+    fun setMediaItemAndPrepare(url: String, metadata: PlaybackDisplayMetadata?)
     fun release()
 }
 
@@ -68,6 +73,18 @@ interface AudioPlaybackEngine {
      * 所有位置消费方(歌词定位、进度条、快进快退起点、进度上报)都必须读这里。Idle 时为 0。
      */
     val absolutePositionMs: Long
+
+    /**
+     * "此刻引擎认为自己该播哪个条目" —— [play] 一被调用就同步更新,不等 resolve 落地成功/失败。
+     * `null` = 还没有任何 [play] 发生过(Idle)。
+     *
+     * ⚠️ 复审 Finding 1(v3):和 [state] 里 `Ready`/`Error` 携带的 itemId **不是**一回事——那两个
+     * 只在一次 resolve **完成**(成功或失败)之后才更新,存在滞后,读不到"`play()` 刚被调用、
+     * resolve 还没跑完"这个窗口。[EngineSeekRouter] 的防抖 seek 落地前必须核对的正是这个同步更新的
+     * 值:如果拿 [state] 去判断,`play()` 触发的新 resolve 还没完成时,`state` 仍然是旧条目的
+     * `Ready`,防抖 seek 会误以为"条目没变"而照常拿旧位置去 resolve 新条目。
+     */
+    val currentItemId: String?
 
     suspend fun play(itemId: String, userId: String, startPositionMs: Long = 0L)
     suspend fun seekTo(positionMs: Long)
@@ -147,12 +164,22 @@ fun AudioPlaybackEngine.asAbsoluteTimeline(durationProvider: () -> Long? = { nul
 class AudioPlaybackEngineImpl(
     private val sourceProvider: PlaybackSourceProvider,
     private val playerControl: PlayerControl,
+    /**
+     * 按 itemId 查一份 [PlaybackDisplayMetadata] 给 [PlayerControl.setMediaItemAndPrepare]。
+     * 引擎本身不认识 `:core:model` 之外的任何东西、也不持有"当前队列都有哪些条目"这份状态——
+     * 生产实现由 `PlayerModule` 接到 [PlayQueue.current](和 [AbsoluteTimeline] 的
+     * `durationProvider` 是同一种"外部只读查表"模式)。默认返回 `null`:不接这根线的调用方
+     * (绝大多数既有单测)行为不变,元数据整体缺失时降级为"标题/副标题/封面都不设",不影响播放。
+     */
+    private val metadataProvider: (itemId: String) -> PlaybackDisplayMetadata? = { null },
 ) : AudioPlaybackEngine {
 
     private val _state = MutableStateFlow<PlaybackEngineState>(PlaybackEngineState.Idle)
     override val state: StateFlow<PlaybackEngineState> = _state.asStateFlow()
 
-    private var currentItemId: String? = null
+    /** 见接口 [AudioPlaybackEngine.currentItemId]:对外只读,`play`/`reset` 在本类内部写。 */
+    override var currentItemId: String? = null
+        private set
     private var currentUserId: String? = null
 
     /**
@@ -165,6 +192,26 @@ class AudioPlaybackEngineImpl(
      */
     @Volatile
     private var currentStartPositionMs: Long? = null
+
+    /**
+     * ## 稳定性根因 #2:连点快进时"最后请求的那一次说了算"
+     *
+     * 生产路径上唯一存在并发的地方:`SeekInterceptingPlayer.seekForward()` → [EngineSeekRouter] →
+     * `scope.launch { engine.seekTo(...) }` —— **每一次按键都新起一个协程,谁也不等谁**。用户连点
+     * 三下快进,就是三个并发的 [resolveAndPrepare] 各自跑一次 `PlaybackInfo` 往返 + 一次 L1 探测。
+     *
+     * 在这个计数器之前,**哪一次先完成哪一次说了算**。而"先按下的那次"完全可能后完成(撞上一次慢的
+     * PlaybackInfo、或者服务端起转码起得慢),于是进度条跳到最后一个目标之后又自己退回去;更糟的是
+     * 一个**迟到的失败**会把 `state` 打成 `Error`、UI 弹「该条目无法播放」,而耳机里明明在响。
+     *
+     * 每次请求领一个单调递增的号,拿到结果时号已经不是最新的就整条丢弃 —— 不 prepare、不动流基准、
+     * 不改 state。
+     *
+     * **线程契约:** "对号"和"落地"之间没有挂起点,而生产上所有 play/seek 都发生在主线程
+     * (`PlaybackService` 的 main-looper scope、`viewModelScope`、`Dispatchers.Main.immediate`),
+     * 所以这段检查-然后-写入是原子的。
+     */
+    private val requestSeq = java.util.concurrent.atomic.AtomicLong(0L)
 
     override val absolutePositionMs: Long
         get() = currentStartPositionMs
@@ -185,9 +232,11 @@ class AudioPlaybackEngineImpl(
     }
 
     private suspend fun resolveAndPrepare(itemId: String, userId: String, startPositionMs: Long) {
+        val token = requestSeq.incrementAndGet()
         try {
             val source = sourceProvider.resolve(itemId, userId, startPositionMs)
-            playerControl.setMediaItemAndPrepare(source.streamUrl)
+            if (isStale(token)) return
+            playerControl.setMediaItemAndPrepare(source.streamUrl, metadataProvider(itemId))
             // 顺序要紧:先换基准,再发 Ready。反过来的话观察 Ready 的进度上报可能读到旧基准 + 已归零
             // 的流内位置,报出一个"倒退"的绝对位置。
             currentStartPositionMs = startPositionMs
@@ -195,12 +244,25 @@ class AudioPlaybackEngineImpl(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            // 迟到的失败同样要丢弃:此刻在播的是**更新的那一次请求**接上的流,把它打成 Error
+            // 会让用户在"耳机里正在响"的同时看到「该条目无法播放」。
+            if (isStale(token)) return
             _state.value = PlaybackEngineState.Error(itemId)
         }
     }
 
-    /** 见 [AudioPlaybackEngine.reset]。刻意**不**碰 [playerControl]:那个播放器是 `@Singleton`。 */
+    /** 见 [requestSeq]:领号之后又有更新的请求进来,这一次的结果就已经没有意义了。 */
+    private fun isStale(token: Long): Boolean = requestSeq.get() != token
+
+    /**
+     * 见 [AudioPlaybackEngine.reset]。刻意**不**碰 [playerControl]:那个播放器是 `@Singleton`。
+     *
+     * 领一个新号(见 [requestSeq]):Service 销毁那一刻可能正有一次 resolve 在飞,它落地时播放器
+     * 已经被 `stop()` + `clearMediaItems()` 了,再让它 prepare 一条流 + 发 `Ready` 就是凭空复活
+     * 一个没人在听的播放会话。
+     */
     override fun reset() {
+        requestSeq.incrementAndGet()
         currentItemId = null
         currentUserId = null
         currentStartPositionMs = null

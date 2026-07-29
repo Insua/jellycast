@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- context.filesDir/diagnostics/ —— 落盘的诊断日志本体(current + 一份轮转备份)。 -->
+    <files-path name="diagnostics" path="diagnostics/" />
+    <!-- context.cacheDir/diagnostics_export/ —— 导出时合并 current+备份生成的临时分享文件,
+         分享结束后可被系统随时回收,不属于需要长期保留的数据。 -->
+    <cache-path name="diagnostics_export" path="diagnostics_export/" />
+</paths>

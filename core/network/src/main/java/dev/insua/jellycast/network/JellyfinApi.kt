@@ -23,6 +23,10 @@ interface JellyfinApi {
     // 原文 GET Users/{userId}/Items 在 10.10.7 已移除,改为 GET Items?userId=
     // startIndex / searchTerm 均已核对 docs/jellyfin-openapi.json 的 /Items 参数表。
     // 注意 Jellyfin 对错误大小写的查询参数静默忽略,不报错 —— 参数名必须逐字与 OpenAPI 一致。
+    // sortOrder / filters / isFavorite / isPlayed 于 2026-07-28 核对 /Items 参数表新增,
+    // 供排序筛选与「我的最爱」使用。filters 取 ItemFilter 枚举(IsUnplayed/IsPlayed/IsFavorite/
+    // IsResumable…),多值以逗号分隔——与 includeItemTypes/sortBy 同为 OpenAPI 里标注
+    // "comma delimited" 的数组参数,故用 String 承载。
     @GET("Items")
     suspend fun items(
         @Query("userId") userId: String,
@@ -33,7 +37,29 @@ interface JellyfinApi {
         @Query("limit") limit: Int? = null,
         @Query("parentId") parentId: String? = null,
         @Query("searchTerm") searchTerm: String? = null,
+        @Query("sortOrder") sortOrder: String? = null,
+        @Query("filters") filters: String? = null,
+        @Query("isFavorite") isFavorite: Boolean? = null,
+        @Query("isPlayed") isPlayed: Boolean? = null,
     ): ItemsResponseDto
+
+    /** 用户的媒体库列表(「我的媒体」入口)。参数已核对 /UserViews。 */
+    @GET("UserViews")
+    suspend fun userViews(@Query("userId") userId: String): ItemsResponseDto
+
+    // 收藏与已看标记:两个端点都是 POST 添加 / DELETE 移除,参数已核对 OpenAPI。
+    // 服务端返回 UserItemDataDto,这里不解析——调用方做乐观更新,失败回滚即可。
+    @POST("UserFavoriteItems/{itemId}")
+    suspend fun addFavorite(@Path("itemId") itemId: String, @Query("userId") userId: String)
+
+    @DELETE("UserFavoriteItems/{itemId}")
+    suspend fun removeFavorite(@Path("itemId") itemId: String, @Query("userId") userId: String)
+
+    @POST("UserPlayedItems/{itemId}")
+    suspend fun markPlayed(@Path("itemId") itemId: String, @Query("userId") userId: String)
+
+    @DELETE("UserPlayedItems/{itemId}")
+    suspend fun markUnplayed(@Path("itemId") itemId: String, @Query("userId") userId: String)
 
     // 原文 GET Users/{userId}/Items/Resume 在 10.10.7 已移除,改为 GET UserItems/Resume?userId=
     @GET("UserItems/Resume")

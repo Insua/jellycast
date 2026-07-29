@@ -19,12 +19,16 @@ private val KEY_AUTO_PLAY_NEXT = booleanPreferencesKey("auto_play_next")
 private val KEY_LYRICS_ENABLED = booleanPreferencesKey("lyrics_enabled")
 private val KEY_PREFERRED_SUBTITLE_LANGUAGE = stringPreferencesKey("preferred_subtitle_language")
 private val KEY_AUDIO_BIT_RATE_KBPS = intPreferencesKey("audio_bit_rate_kbps")
+private val KEY_DIAGNOSTICS_ENABLED = booleanPreferencesKey("diagnostics_enabled")
 
 private const val DEFAULT_PLAYBACK_SPEED = 1.0f
 private const val DEFAULT_REWIND_SECONDS = 15
 private const val DEFAULT_FORWARD_SECONDS = 30
 private const val DEFAULT_AUTO_PLAY_NEXT = true
 private const val DEFAULT_LYRICS_ENABLED = true
+
+/** design doc §5:诊断日志"默认开启,但用户可关闭"。 */
+private const val DEFAULT_DIAGNOSTICS_ENABLED = true
 
 /** Spike 实测建议默认值(见 docs/superpowers/specs/2026-07-25-spike-results.md):128kbps ≈ 58MB/小时。 */
 private const val DEFAULT_AUDIO_BIT_RATE_KBPS = 128
@@ -57,6 +61,10 @@ class PreferencesStore(private val context: Context) {
     val audioBitRateKbps: Flow<Int> = context.preferencesDataStore.data
         .map { it[KEY_AUDIO_BIT_RATE_KBPS] ?: DEFAULT_AUDIO_BIT_RATE_KBPS }
 
+    /** design doc §5:诊断日志开关,默认开启。 */
+    val diagnosticsEnabled: Flow<Boolean> = context.preferencesDataStore.data
+        .map { it[KEY_DIAGNOSTICS_ENABLED] ?: DEFAULT_DIAGNOSTICS_ENABLED }
+
     suspend fun setPlaybackSpeed(v: Float) {
         context.preferencesDataStore.edit { it[KEY_PLAYBACK_SPEED] = v }
     }
@@ -85,5 +93,9 @@ class PreferencesStore(private val context: Context) {
 
     suspend fun setAudioBitRateKbps(v: Int) {
         context.preferencesDataStore.edit { it[KEY_AUDIO_BIT_RATE_KBPS] = v }
+    }
+
+    suspend fun setDiagnosticsEnabled(v: Boolean) {
+        context.preferencesDataStore.edit { it[KEY_DIAGNOSTICS_ENABLED] = v }
     }
 }

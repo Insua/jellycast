@@ -119,6 +119,37 @@ class ActiveServerSessionTest {
         assertTrue(failure is IllegalStateException)
     }
 
+    /**
+     * 🔴 离线缓存的命门:[ActiveServerSession.serverId] **不允许**依赖选路探测。
+     *
+     * `CachingMediaRepository` 每次读缓存前都要先问一句"当前是哪台服务器"(缓存按 serverId 分区)。
+     * 如果这一问会触发 `EndpointSelector.select`,那么**断网冷启动时它必然失败** ——
+     * 于是"读不到缓存",于是有缓存也当成没缓存,于是用户看到的还是一片空白。
+     * 整套离线缓存在最需要它的那一刻恰好失效,而且不报任何错。
+     *
+     * 哪台服务器是激活的,是本地 DataStore 里的事实,和"这一刻哪个地址连得上"无关。
+     */
+    @Test fun `所有 endpoint 都不可达时仍能拿到 serverId`() = runTest {
+        val activeServer = MutableStateFlow(server("1", listOf(lan, tailscale)))
+        val apiFactory = RecordingApiFactory()
+        // 一个都探不通 = 断网。
+        val session = ActiveServerSession(activeServer, EndpointSelector(probe(emptySet())), apiFactory)
+
+        val serverId = session.serverId()
+
+        assertEquals("1", serverId, "断网时也必须能回答「当前是哪台服务器」,否则离线缓存永远读不到")
+        assertTrue(apiFactory.created.isEmpty(), "serverId 不该触发选路/建 api")
+    }
+
+    @Test fun `没有已激活服务器时 serverId 失败`() = runTest {
+        val activeServer = MutableStateFlow<Server?>(null)
+        val session = ActiveServerSession(activeServer, EndpointSelector(probe(emptySet())), RecordingApiFactory())
+
+        val failure = runCatching { session.serverId() }.exceptionOrNull()
+
+        assertTrue(failure is IllegalStateException)
+    }
+
     @Test fun `解析成功前同步缓存读取返回 null,成功后返回新鲜值`() = runTest {
         val activeServer = MutableStateFlow(server("1", listOf(lan)))
         val session = ActiveServerSession(activeServer, EndpointSelector(probe(setOf(lan))), RecordingApiFactory())
@@ -146,7 +177,16 @@ private object NoopJellyfinApi : JellyfinApi {
         limit: Int?,
         parentId: String?,
         searchTerm: String?,
+        sortOrder: String?,
+        filters: String?,
+        isFavorite: Boolean?,
+        isPlayed: Boolean?,
     ): ItemsResponseDto = error("not used in test")
+    override suspend fun userViews(userId: String): ItemsResponseDto = error("not used in test")
+    override suspend fun addFavorite(itemId: String, userId: String) = error("not used in test")
+    override suspend fun removeFavorite(itemId: String, userId: String) = error("not used in test")
+    override suspend fun markPlayed(itemId: String, userId: String) = error("not used in test")
+    override suspend fun markUnplayed(itemId: String, userId: String) = error("not used in test")
     override suspend fun resume(userId: String): ItemsResponseDto = error("not used in test")
     override suspend fun nextUp(userId: String, limit: Int): ItemsResponseDto = error("not used in test")
     override suspend fun seasons(seriesId: String, userId: String): ItemsResponseDto = error("not used in test")

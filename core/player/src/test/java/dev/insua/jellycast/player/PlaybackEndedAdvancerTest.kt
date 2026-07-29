@@ -5,6 +5,9 @@ import dev.insua.jellycast.model.MediaItem
 import dev.insua.jellycast.model.MediaKind
 import dev.insua.jellycast.model.PlaybackSource
 import dev.insua.jellycast.network.JellyfinApi
+import dev.insua.jellycast.network.dto.BaseItemDto
+import dev.insua.jellycast.network.dto.ItemsResponseDto
+import io.mockk.coEvery
 import io.mockk.mockk
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -15,7 +18,35 @@ import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
 
-private fun ep(id: String) = MediaItem(id, MediaKind.EPISODE, "第 $id 集")
+private const val SERIES = "series-A"
+private const val SEASON = "series-A-s1"
+
+private fun ep(id: String) = MediaItem(
+    id = id,
+    kind = MediaKind.EPISODE,
+    name = "E$id",
+    seasonNumber = 1,
+    seriesId = SERIES,
+    seasonId = SEASON,
+)
+
+private fun epDto(id: String) = BaseItemDto(
+    id = id,
+    name = "E$id",
+    type = "Episode",
+    seriesId = SERIES,
+    seasonId = SEASON,
+    seasonNumber = 1,
+)
+
+/**
+ * 自动连播现在跟着**剧**走(见 [AutoPlayNextController] 类注释),所以造假的 api 必须能回答
+ * "本季的集序是什么"——队列里排在后面的项已经不再决定连播到哪一条。
+ */
+private fun JellyfinApi.stubSeason(vararg episodeIds: String) {
+    coEvery { episodes(SERIES, SEASON, "u1") } returns
+        ItemsResponseDto(items = episodeIds.map { epDto(it) })
+}
 
 /**
  * Finding 1(闭合):Task 21/22 的 `PlaybackService` 在 `Player.STATE_ENDED` 时直接调
@@ -48,21 +79,21 @@ class PlaybackEndedAdvancerTest {
     private class RecordingPlayerControl : PlayerControl {
         val urls = mutableListOf<String>()
         override val currentPositionMs: Long = 0L
-        override fun setMediaItemAndPrepare(url: String) {
+        override fun setMediaItemAndPrepare(url: String, metadata: PlaybackDisplayMetadata?) {
             urls += url
         }
         override fun release() {}
     }
 
     @Test fun `STATE_ENDED 自动连播后,seekTo 针对新一集重新 resolve,不再停在旧一集`() = runTest {
-        val queue = PlayQueue().apply { setQueue(listOf(ep("1"), ep("2")), 0) }
-        val api = mockk<JellyfinApi>()
+        val queue = PlayQueue().apply { setQueue(listOf(ep("1")), 0) }
+        val api = mockk<JellyfinApi>().apply { stubSeason("1", "2") }
         val resolvedItemIds = mutableListOf<String>()
         val provider = PlaybackSourceProvider { itemId, _, _ ->
             resolvedItemIds += itemId
             source(itemId)
         }
-        val controller = AutoPlayNextController(queue, provider, api, flowOf(true))
+        val controller = AutoPlayNextController(queue, api, flowOf(true))
         val engine = AudioPlaybackEngineImpl(provider, RecordingPlayerControl())
         val advancer = PlaybackEndedAdvancer(engine, controller) { "u1" }
 
@@ -79,11 +110,47 @@ class PlaybackEndedAdvancerTest {
         assertEquals("2", resolvedItemIds.last(), "seekTo 应该针对新一集重新 resolve,不是停在旧一集的 itemId")
     }
 
+    /**
+     * ## 稳定性根因 #4:一次换集只该解析一次播放源
+     *
+     * [AutoPlayNextController] 原本自己 `resolve()` 一次(只为了回答"要不要连播/连播到哪一条"),
+     * 结果被整个丢掉;紧接着 [PlaybackEndedAdvancer] 又经 `engine.play()` 再 resolve 一次才是真正
+     * 用来播的那一条。于是**每次换集都白跑一整个 `POST Items/{id}/PlaybackInfo` 往返**,
+     * 并在 Jellyfin 上凭空多开一个等不到 stop 的播放会话。
+     *
+     * "要不要连播"这个决策**根本不需要播放源** —— 它只依赖偏好开关、睡眠定时武装状态和队列。
+     * 把 resolve 留给唯一真正需要它的地方([AudioPlaybackEngine.play]),换集路径就只剩一次往返,
+     * 而且 engine 的 `currentItemId` 和实际在放的条目依然是同一条(Finding 1 的不变量不受影响)。
+     */
+    @Test fun `一次自动连播只解析一次播放源`() = runTest {
+        val queue = PlayQueue().apply { setQueue(listOf(ep("1")), 0) }
+        val api = mockk<JellyfinApi>().apply { stubSeason("1", "2") }
+        val resolvedItemIds = mutableListOf<String>()
+        val provider = PlaybackSourceProvider { itemId, _, _ ->
+            resolvedItemIds += itemId
+            source(itemId)
+        }
+        val controller = AutoPlayNextController(queue, api, flowOf(true))
+        val engine = AudioPlaybackEngineImpl(provider, RecordingPlayerControl())
+        val advancer = PlaybackEndedAdvancer(engine, controller) { "u1" }
+
+        engine.play("1", "u1", 0L)
+        resolvedItemIds.clear()
+
+        advancer.onPlaybackEnded()
+
+        assertEquals(
+            listOf("2"),
+            resolvedItemIds,
+            "一次换集只该解析一次播放源;多出来的那次是白跑的 PlaybackInfo 往返 + 一个等不到 stop 的幽灵会话",
+        )
+    }
+
     @Test fun `武装播完本集时,STATE_ENDED 不推进,engine 状态保持当前集`() = runTest {
-        val queue = PlayQueue().apply { setQueue(listOf(ep("1"), ep("2")), 0) }
-        val api = mockk<JellyfinApi>()
+        val queue = PlayQueue().apply { setQueue(listOf(ep("1")), 0) }
+        val api = mockk<JellyfinApi>().apply { stubSeason("1", "2") }
         val provider = PlaybackSourceProvider { itemId, _, _ -> source(itemId) }
-        val controller = AutoPlayNextController(queue, provider, api, flowOf(true))
+        val controller = AutoPlayNextController(queue, api, flowOf(true))
         val engine = AudioPlaybackEngineImpl(provider, RecordingPlayerControl())
         val advancer = PlaybackEndedAdvancer(engine, controller) { "u1" }
 
@@ -99,8 +166,8 @@ class PlaybackEndedAdvancerTest {
 
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test fun `advance 进行中重入 STATE_ENDED 不会让队列被重复推进`() = runTest {
-        val queue = PlayQueue().apply { setQueue(listOf(ep("1"), ep("2"), ep("3")), 0) }
-        val api = mockk<JellyfinApi>()
+        val queue = PlayQueue().apply { setQueue(listOf(ep("1")), 0) }
+        val api = mockk<JellyfinApi>().apply { stubSeason("1", "2", "3") }
         val gate = CompletableDeferred<Unit>()
         var gateArmed = true
         val provider = PlaybackSourceProvider { itemId, _, _ ->
@@ -110,7 +177,7 @@ class PlaybackEndedAdvancerTest {
             }
             source(itemId)
         }
-        val controller = AutoPlayNextController(queue, provider, api, flowOf(true))
+        val controller = AutoPlayNextController(queue, api, flowOf(true))
         val engine = AudioPlaybackEngineImpl(provider, RecordingPlayerControl())
         val advancer = PlaybackEndedAdvancer(engine, controller) { "u1" }
 

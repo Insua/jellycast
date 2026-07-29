@@ -3,9 +3,11 @@ package dev.insua.jellycast.subtitle
 import dev.insua.jellycast.model.SubtitleLine
 
 object VttParser : SubtitleParser {
-    private val TIME = Regex(
-        """(\d{2,}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2,}):(\d{2}):(\d{2})\.(\d{3})"""
-    )
+    // by lazy 而非属性初始化器:见 SubtitleTags 的说明——避免正则编译失败以不可捕获的
+    // ExceptionInInitializerError 形式从 object 的静态初始化里逃逸。
+    private val TIME by lazy {
+        Regex("""(\d{2,}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2,}):(\d{2}):(\d{2})\.(\d{3})""")
+    }
 
     override fun parse(content: String): List<SubtitleLine> =
         SubtitleTags.stripBom(content).replace("\r\n", "\n").split(Regex("\n\\s*\n"))
