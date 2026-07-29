@@ -26,6 +26,12 @@ data class MediaItem(
     // UserData 时(理论上不该发生,但防御性地)不冒充"已收藏"/"已看"。
     val isFavorite: Boolean = false,
     val isPlayed: Boolean = false,
+    // 剧集归属(BaseItemDto.SeriesId / SeasonId)。自动连播「跟着剧走」只认这两个字段:
+    // 有了它们才能问服务端"本季还有没有下一集""下一季的第一集是哪个",而不必依赖播放队列
+    // 恰好装的是本剧的集序(首页分区把整行当队列,那一行里可能是别的剧)。
+    // 非剧集条目(电影/合集/库入口)为 null。
+    val seriesId: String? = null,
+    val seasonId: String? = null,
 )
 
 /** 播放页展示用的标题组合 */

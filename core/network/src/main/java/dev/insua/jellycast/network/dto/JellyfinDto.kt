@@ -30,6 +30,12 @@ import kotlinx.serialization.Serializable
     @SerialName("Name") val name: String,
     @SerialName("Type") val type: String,
     @SerialName("SeriesName") val seriesName: String? = null,
+    // 自动连播「跟着剧走」需要的归属 id(见 AutoPlayNextController)。大小写已 jq 核对
+    // docs/jellyfin-openapi.json:
+    // `jq '.components.schemas.BaseItemDto.properties | keys[] | select(test("^(SeriesId|SeasonId)$"))'`
+    // → "SeasonId" / "SeriesId",都是 nullable 的 uuid 字符串。
+    @SerialName("SeriesId") val seriesId: String? = null,
+    @SerialName("SeasonId") val seasonId: String? = null,
     @SerialName("ParentIndexNumber") val seasonNumber: Int? = null,
     @SerialName("IndexNumber") val episodeNumber: Int? = null,
     @SerialName("RunTimeTicks") val runTimeTicks: Long? = null,
