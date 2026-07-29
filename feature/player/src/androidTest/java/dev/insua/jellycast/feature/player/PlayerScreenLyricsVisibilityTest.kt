@@ -1,6 +1,5 @@
 package dev.insua.jellycast.feature.player
 
-import androidx.compose.ui.test.SemanticsNodeInteraction
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
@@ -90,20 +89,4 @@ class PlayerScreenLyricsVisibilityTest {
         composeTestRule.onNodeWithTag(LyricsViewTestTags.line(0)).assertFullyVisible("首行")
         composeTestRule.onNodeWithTag(LyricsViewTestTags.line(1)).assertIsDisplayed()
     }
-}
-
-/**
- * "完整可见":先要求 [assertIsDisplayed](节点被放置、在窗口内、不透明),再要求裁剪后的可见
- * 高度不小于该节点自身的布局高度——被父级 LazyColumn 裁掉一角的行会在这里被抓住。
- */
-private fun SemanticsNodeInteraction.assertFullyVisible(label: String) {
-    assertIsDisplayed()
-    val node = fetchSemanticsNode()
-    val visibleHeight = node.boundsInRoot.height
-    val layoutHeight = node.size.height.toFloat()
-    assertTrue(
-        "$label 被裁剪了:可见高度 ${visibleHeight}px < 布局高度 ${layoutHeight}px" +
-            "(bounds=${node.boundsInRoot})",
-        visibleHeight >= layoutHeight - 1f,
-    )
 }

@@ -23,6 +23,12 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -189,28 +195,61 @@ fun LyricsView(
         val verticalPaddingPx = viewportPx / 2
         val verticalPadding = with(LocalDensity.current) { verticalPaddingPx.toDp() }
 
+        // 上一次滚动落在哪一行:视口高度变化(封面收起/展开的动画每一帧都在改视口)重新居中时
+        // 必须是**瞬时**的,不能用动画——否则每一帧都取消上一帧还没跑完的滚动动画,当前行会
+        // 跟不上视口的变化而被裁到边缘。只有"换行了"才值得动画。
+        var lastScrolledIndex by remember { mutableIntStateOf(-1) }
+
         LaunchedEffect(currentIndex, autoFollow, viewportPx) {
             if (currentIndex < 0 || !autoFollow || viewportPx <= 0) return@LaunchedEffect
+            val animate = currentIndex != lastScrolledIndex
+            lastScrolledIndex = currentIndex
             // LazyColumn 把 contentPadding 也算进滚动内容:animateScrollToItem(index, offset) 最终把
             // 该行顶边放在"视口顶 + beforeContentPadding - offset"处(真机实测,见任务报告)。
             // 要让这一行居中,目标顶边是 (视口高 - 行高) / 2,于是
             //   offset = beforeContentPadding - 目标顶边
             // 原来的实现漏掉了 beforeContentPadding 这一项,当前行因此被推到视口底部并被裁掉。
+            // ⚠️ verticalPaddingPx 跟着 viewportPx 走,封面尺寸一变这两项都要重算(Task 1b)。
             fun offsetFor(itemHeight: Int) = verticalPaddingPx - (viewportPx - itemHeight) / 2
             fun measuredHeight() = listState.layoutInfo.visibleItemsInfo.find { it.index == currentIndex }?.size
+            suspend fun scrollTo(itemHeight: Int) {
+                if (animate) {
+                    listState.animateScrollToItem(currentIndex, offsetFor(itemHeight))
+                } else {
+                    listState.scrollToItem(currentIndex, offsetFor(itemHeight))
+                }
+            }
             // 首帧时目标行还没被测量过,先用估算值把它滚到大致中央;滚完拿到真实行高再校正一次
             // (当前行是放大加粗的 titleLarge,和估算值差得比较多)。
             val assumedHeight = measuredHeight() ?: ESTIMATED_LINE_HEIGHT_PX
-            listState.animateScrollToItem(currentIndex, offsetFor(assumedHeight))
+            scrollTo(assumedHeight)
             val actualHeight = measuredHeight()
             if (actualHeight != null && actualHeight != assumedHeight) {
-                listState.animateScrollToItem(currentIndex, offsetFor(actualHeight))
+                scrollTo(actualHeight)
             }
         }
 
         LazyColumn(
             state = listState,
-            modifier = Modifier.fillMaxSize(),
+            // 上下边缘渐隐(Apple Music / 小宇宙 的歌词观感):视口装不下整数行时,边缘那一行
+            // 会被硬生生切掉一截——尤其是暂停态封面放大之后歌词区变矮,切口特别刺眼。
+            // 渐隐让它"淡出"而不是"被剪断"。纯绘制效果,不改变布局与语义,当前行始终在中央
+            // 的实心区域内,不受影响。
+            modifier = Modifier
+                .fillMaxSize()
+                .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+                .drawWithContent {
+                    drawContent()
+                    drawRect(
+                        brush = Brush.verticalGradient(
+                            0f to Color.Transparent,
+                            EDGE_FADE_FRACTION to Color.Black,
+                            1f - EDGE_FADE_FRACTION to Color.Black,
+                            1f to Color.Transparent,
+                        ),
+                        blendMode = BlendMode.DstIn,
+                    )
+                },
             contentPadding = PaddingValues(vertical = verticalPadding),
         ) {
             itemsIndexed(timeline.lines, key = { index, _ -> index }) { index, line ->
@@ -251,6 +290,9 @@ private fun LyricsLineRow(
             .padding(horizontal = 24.dp, vertical = 10.dp),
     )
 }
+
+/** 歌词区上下各多少比例的高度做渐隐。只影响绘制,不影响布局/语义/可点区域。 */
+private const val EDGE_FADE_FRACTION = 0.14f
 
 private const val MANUAL_SCROLL_RESUME_DELAY_MS = 3000L
 private const val ESTIMATED_LINE_HEIGHT_PX = 140
