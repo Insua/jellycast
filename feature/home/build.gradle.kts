@@ -57,6 +57,10 @@ dependencies {
 
     androidTestImplementation(platform(libs.compose.bom))
     androidTestImplementation(libs.compose.ui.test.junit4)
+    // createAndroidComposeRule<ComponentActivity> + WindowCompat:inset 测试要拿到真实 Activity
+    // 的 window,把 edge-to-edge 打开(真机 targetSdk 36 在 Android 15+ 上就是这个状态)。
+    androidTestImplementation(libs.androidx.activity.compose)
+    androidTestImplementation(libs.androidx.core.ktx)
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.junit4)

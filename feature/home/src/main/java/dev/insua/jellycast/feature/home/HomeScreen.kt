@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -201,12 +202,24 @@ fun HomeScreenContent(
 /**
  * 顶部栏(设计文档 §3.6):App 身份(名称)+ 搜索入口 + 账户入口。参照的是 Jellyfin Web mobile
  * 的结构——一行放"你在哪个 App"和两个跳转口子,不是它的深色配色,JellyCast 全程保持浅色。
+ *
+ * ⚠️ **[windowInsets] 显式清零,状态栏 inset 由外层 `Scaffold` 统一消费一次。**
+ * Material3 的 `TopAppBar` 默认带 `TopAppBarDefaults.windowInsets`(含状态栏),而
+ * `JellyCastNavHost` 的 `Scaffold` 也把系统栏 inset 计入内容内边距、通过 `padding(padding)`
+ * 传给 NavHost —— 两者叠加,首页顶部就凭空多出一个状态栏的高度(真机实测 66px @440dpi,
+ * 见 `HomeScreenInsetTest`)。
+ *
+ * 为什么让顶栏让路、而不是让 Scaffold 让路:Scaffold 是**全 App 唯一**的那层外壳,它同时
+ * 负责底部——迷你播放条和底部 tab 栏就长在它的 `bottomBar` 里,导航栏 inset 靠它。把它改成
+ * `contentWindowInsets = WindowInsets(0)` 就得让**每一个**页面各自处理系统栏,是更大的改动、
+ * 更多的出错面。顶栏这一处清零只影响首页,底部完全不受牵连。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun HomeTopBar(onSearchClick: () -> Unit, onAccountClick: () -> Unit) {
     TopAppBar(
         title = { Text("JellyCast") },
+        windowInsets = WindowInsets(0, 0, 0, 0),
         actions = {
             IconButton(
                 onClick = onSearchClick,
