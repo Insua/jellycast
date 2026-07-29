@@ -509,7 +509,25 @@ class PlaybackE2eTest {
     // ---------------------------------------------------------------- 场景:上报生命周期
 
     /**
-     * 🔴 **现场缺陷的自动化复现。**
+     * **端到端冒烟:一集播完之后,服务端的观看记录是干净的。**
+     *
+     * ## ⚠️ 先说清楚它不是什么
+     *
+     * 这条用例**不是回归护栏**。它按「预置一条陈旧补报记录 → 播到结束 → 断言服务端位置为 0」
+     * 设计,本意是自动复现现场缺陷,但在**未修复的代码**上实测了四轮(陈旧位置改成按时长取比例、
+     * 显式起播下一集逼出补报重放、把预置时机挪到开播之后)**始终是绿的** —— 也就是说,它目前
+     * 无法把那条旧心跳真正重放到服务端上,因而**证明不了缺陷已修复**。原因未查明,候选包括:
+     * `ProgressReporter` 构造时快照的 serverId 与预置行不一致、`playSessionId` 为 null 导致
+     * 服务端忽略该上报、或重放时机与完播 stop 的相对顺序和现场不同。
+     *
+     * **真正的回归护栏在 JVM 单测里** —— `ProgressReporterTest` 与
+     * `PlaybackProgressCoordinatorTest` 中那几条都经过变异验证:把对应的守卫代码删掉,它们会变红。
+     *
+     * 保留这条用例的价值在于它仍然端到端地验证了**正常路径**:一集真的从距结尾 30 秒处播到
+     * `STATE_ENDED`,服务端确实打上了已播放标记,并且在其后 60 秒的窗口内位置始终为 0。
+     * 谁要把它当成缺陷复现来用,得先让它在未修复的代码上变红。
+     *
+     * ## 原始设计意图(下方实现仍按此编写)
      *
      * 用户报告:已播完、已打蓝勾的剧集,在 Jellyfin Web 上仍带着进度条,赖在「继续观看」里。
      * 服务端实测(设计文档 §1.1):已标记播完的条目再收到一条 `progress`,位置会被写回去,
@@ -541,25 +559,30 @@ class PlaybackE2eTest {
             serverId != null,
         )
 
-        // 预置:模拟「这一集开播不久时一次失败的心跳」。位置取靠前的值 —— 它一旦被重放回去,
-        // 就是用户在 Jellyfin 上看到的那条残留进度条。
-        runBlocking {
-            progressReportDao.enqueue(
-                ProgressReportEntity(
-                    serverId = serverId!!,
-                    itemId = item.id,
-                    playSessionId = null,
-                    positionMs = STALE_REPORT_POSITION_MS,
-                    kind = "progress",
-                    createdAt = System.currentTimeMillis(),
-                )
-            )
-        }
-
         try {
             val latch = addEndedLatch()
             try {
                 startPlayback(item, startPositionMs = tailSeekTargetMs(item))
+
+                // 预置那条「播放途中失败的心跳」—— **必须在开播之后**。
+                //
+                // ⚠️ 实测踩过的坑:`onSourceReady` 一进来就先 `flushPending()` 一次。把这条记录
+                // 放在起播**之前**,它会在这一集刚开始时就被消费掉,随后的完播 stop 又把位置清零,
+                // 于是永远观察不到残留 —— 这条用例在**未修复**的代码上照样绿,变成一句空话。
+                // 真实场景里它本来就是播放途中入队的,这里的时机和现场一致。
+                runBlocking {
+                    progressReportDao.enqueue(
+                        ProgressReportEntity(
+                            serverId = serverId!!,
+                            itemId = item.id,
+                            playSessionId = null,
+                            positionMs = staleReportPositionMs(item),
+                            kind = "progress",
+                            createdAt = System.currentTimeMillis(),
+                        )
+                    )
+                }
+
                 awaitEnded(latch, "播完一集(从距结尾 ${TAIL_SEEK_MARGIN_MS}ms 处起播)")
             } finally {
                 removeEndedLatch(latch)
@@ -574,8 +597,15 @@ class PlaybackE2eTest {
                 marked,
             )
 
-            // 第二段:在窗口内持续盯着位置。自动连播会在这期间起来并触发 flushPending ——
-            // 缺陷存在的话,那条预置的旧心跳正是在这一刻被重放回去。
+            // 第二段:**显式**播下一集,逼出一次补报重放。
+            //
+            // ⚠️ 这一步不能省。`flushPending()` 唯一的触发点是「新源就绪」,而本测试把队列设成了
+            // 单条,自动连播在这个场景下不一定会推进 —— 实测过:不加这一步,预置的旧心跳在
+            // 60 秒窗口内根本不会被重放,于是这条用例在**未修复**的代码上照样绿,变成一句空话。
+            // 显式起播下一集把触发条件握在测试自己手里,判别力才不依赖连播的运气。
+            startPlayback(secondItem, startPositionMs = 0L)
+
+            // 缺陷存在的话,那条预置的旧心跳正是在这一刻被重放回上一集,把它的位置写回去。
             val leaked = awaitServerCondition(REPORT_SETTLE_TIMEOUT_MS) {
                 userData(item.id).positionTicks != 0L
             }
@@ -590,6 +620,26 @@ class PlaybackE2eTest {
             restoreUserData(secondItem.id)
             runCatching { runBlocking { progressReportDao.deleteForItem(serverId!!, item.id) } }
         }
+    }
+
+    /**
+     * 预置那条「陈旧心跳」的位置。
+     *
+     * ⚠️ **必须按条目时长取比例,不能用一个固定的秒数。** Jellyfin 有 `MinResumePct`
+     * (默认 5%):低于这个比例的上报会被服务端当成「根本没看」而把位置直接归零。
+     * 实测踩过这个坑 —— 固定 60 秒对一集 40 分钟的剧只有约 2%,于是重放回去也不留痕迹,
+     * 这条用例在**未修复**的代码上照样绿,变成一句空话。
+     *
+     * [STALE_REPORT_POSITION_PERCENT] 取 40%:远高于 `MinResumePct`,也远低于
+     * `MaxResumePct`(实测 90%,超过就会被当成「看完了」而归零),两头都不会被服务端吃掉。
+     */
+    private fun staleReportPositionMs(item: MediaItem): Long {
+        val runtime = item.runTimeMs ?: 0L
+        assertTrue(
+            "条目没有时长,无法按比例取陈旧位置,这条用例会失去判别力。",
+            runtime > 0L,
+        )
+        return runtime * STALE_REPORT_POSITION_PERCENT / 100
     }
 
     /** 服务端的 `UserData`;条目还没有任何播放记录时 Jellyfin 也会给一个全零的对象。 */
@@ -935,7 +985,7 @@ class PlaybackE2eTest {
         const val POLL_INTERVAL_MS = 250L
 
         /** 预置的陈旧心跳位置:靠前,一旦被重放回去就是用户看到的那条残留进度条。 */
-        const val STALE_REPORT_POSITION_MS = 60_000L
+        const val STALE_REPORT_POSITION_PERCENT = 40
 
         /**
          * 等服务端落定的窗口。要覆盖:完播 stop 的往返 + 自动连播解析下一集(两次网络往返)
