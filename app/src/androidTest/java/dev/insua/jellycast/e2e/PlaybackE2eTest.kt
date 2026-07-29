@@ -22,7 +22,6 @@ import dev.insua.jellycast.model.MediaItem
 import dev.insua.jellycast.model.Server
 import dev.insua.jellycast.network.JellyfinApi
 import dev.insua.jellycast.network.dto.AuthRequestDto
-import dev.insua.jellycast.network.dto.BaseItemDto
 import dev.insua.jellycast.network.mapper.toMediaItem
 import dev.insua.jellycast.network.session.JellyfinSession
 import dev.insua.jellycast.player.AudioPlaybackEngine
@@ -102,8 +101,17 @@ class PlaybackE2eTest {
     private lateinit var userId: String
     private lateinit var playableItem: MediaItem
 
-    /** 自动连播场景需要队列里有第二条;和 [playableItem] 来自同一次挑选。 */
+    /**
+     * 自动连播场景的期望落点:**[playableItem] 所属剧集本季集序里的下一集**(服务端给的顺序),
+     * 不是"列表里随便另一条"。和 [playableItem] 来自同一次挑选。
+     */
     private lateinit var secondItem: MediaItem
+
+    /**
+     * 诱饵:**别的剧**的一集,放进播放队列里排在 [playableItem] 后面。连播如果还跟着队列走,
+     * 就会跳到它——那正是要防住的缺陷。服务器上凑不出第二部剧时为 null,断言不受影响。
+     */
+    private var decoyItem: MediaItem? = null
 
     @Before
     fun setUp() {
@@ -123,8 +131,9 @@ class PlaybackE2eTest {
             seedSession()
             userId = session.userId()
             val picked = pickPlayableItems(userId)
-            playableItem = picked.first()
-            secondItem = picked[1]
+            playableItem = picked.first
+            secondItem = picked.second
+            decoyItem = pickDecoy(userId, playableItem)
         }
 
         // Media3 的标准路径:UI 只通过 MediaController 跟会话对话。这里把它拉起来,让
@@ -414,13 +423,18 @@ class PlaybackE2eTest {
      * 为了不用等一整集播完,这里从**距结尾 [AUTOPLAY_TAIL_MS] 处**开始播 —— 转码流从这个
      * `startTimeTicks` 起,播到头就是真实的 `STATE_ENDED`,和播完整集触发的是同一个回调。
      *
-     * 断言分两级:引擎当前 `Ready` 的条目 id 必须换成第二条(状态真的推进了),
+     * 断言分两级:引擎当前 `Ready` 的条目 id 必须换成**本剧的下一集**(状态真的推进了),
      * 而且**新的一集要真的在出声**(位置继续前进)——只换 id 不出声正是"切集之后没声音"。
+     *
+     * **队列里刻意放一条别的剧的条目当诱饵**([decoyItem]):这正是 2026-07-29 用户报的问题的形状——
+     * 首页分区把整行当队列传进来,一行里全是不同的剧。连播必须跟着**剧**走,取
+     * [secondItem](服务端给的本剧本季集序里的下一集),而不是队列里排在后面的那条诱饵。
      */
     @Test
-    fun `一集播完自动连播到下一集`() {
+    fun `一集播完自动连播到本剧的下一集而不是队列里的下一项`() {
         val next = secondItem
-        val queue = listOf(playableItem, next)
+        // 队列 = 被点开的这一集 + 一条别的剧的诱饵(拿不到诱饵时退化成单条队列,断言依旧成立)。
+        val queue = listOfNotNull(playableItem, decoyItem)
         playQueue.setQueue(queue, 0)
         ContextCompat.startForegroundService(context, Intent(context, PlaybackService::class.java))
 
@@ -433,8 +447,8 @@ class PlaybackE2eTest {
 
         val switched = awaitCondition(AUTOPLAY_TIMEOUT_MS) { currentReadyItemId() == next.id }
         assertTrue(
-            "第一集播完之后没有连播到下一集:引擎当前条目仍是 ${currentReadyItemId()}," +
-                "期望 ${next.id}。${diagnostics()}",
+            "第一集播完之后没有连播到**本剧的下一集**:引擎当前条目是 ${currentReadyItemId()}," +
+                "期望 ${next.id}(诱饵是 ${decoyItem?.id})。${diagnostics()}",
             switched,
         )
 
@@ -521,31 +535,47 @@ class PlaybackE2eTest {
     }
 
     /**
-     * 挑一个能跑完这四个场景的条目:优先够长的剧集(seek 到 10 分钟需要足够时长),
-     * 没有剧集就退回电影。挑不到就让测试**失败**而不是跳过 —— 服务器配好了却一个可播条目都没有,
-     * 那是需要人看一眼的事实,不是"环境没配"。
+     * 挑一对能跑完这几个场景的条目:**一集 + 它在本剧本季集序里真正的下一集**。
+     *
+     * 为什么必须成对地从服务端集序里挑,而不是"列表里随便两条":自动连播现在跟着**剧**走
+     * (见 `AutoPlayNextController`),期望落点只能由服务端的集序决定。条目全部**动态挑选**,
+     * 不把任何条目 id / 剧名写死进代码。
+     *
+     * 第一条优先挑够长的(seek 场景要跳到 10 分钟)。挑不到就让测试**失败**而不是跳过 ——
+     * 服务器配好了却凑不出"一集 + 下一集",那是需要人看一眼的事实,不是"环境没配"。
      */
-    private suspend fun pickPlayableItems(userId: String): List<MediaItem> {
-        val candidates = mutableListOf<BaseItemDto>()
-        candidates += runCatching { api.items(userId = userId, types = "Episode", limit = 50).items }
+    private suspend fun pickPlayableItems(userId: String): Pair<MediaItem, MediaItem> {
+        val episodes = runCatching { api.items(userId = userId, types = "Episode", limit = 50).items }
             .getOrElse { emptyList() }
-        if (candidates.none { it.longEnough }) {
-            candidates += runCatching { api.items(userId = userId, types = "Movie", limit = 50).items }
-                .getOrElse { emptyList() }
+            .mapNotNull { it.toMediaItem() }
+        if (episodes.isEmpty()) {
+            throw AssertionError("服务器上找不到任何 Episode 条目,无法验证「连播跟着剧走」。")
         }
 
-        // 第一条要够长(seek 场景要跳到 10 分钟);第二条只用来验证自动连播换集,不挑长度。
-        val mapped = candidates.mapNotNull { it.toMediaItem() }
-        val first = mapped.firstOrNull { (it.runTimeMs ?: 0L) >= MIN_ITEM_RUNTIME_MS }
-            ?: mapped.firstOrNull()
-            ?: throw AssertionError("服务器上找不到任何 Episode / Movie 条目,无法进行端到端播放验证。")
-        val second = mapped.firstOrNull { it.id != first.id }
-            ?: throw AssertionError("服务器上只有一个可播条目,无法验证自动连播换集。")
-        return listOf(first, second)
+        // 够长的优先,其余按原顺序兜底;第一个能问出"下一集"的就是这一对。
+        val ordered = episodes.sortedByDescending { (it.runTimeMs ?: 0L) >= MIN_ITEM_RUNTIME_MS }
+        return ordered.firstNotNullOfOrNull { candidate ->
+            nextEpisodeInSeason(candidate, userId)?.let { candidate to it }
+        } ?: throw AssertionError("服务器上找不到「同剧同季后面还有一集」的剧集,无法验证自动连播。")
     }
 
-    private val BaseItemDto.longEnough: Boolean
-        get() = (runTimeTicks ?: 0L) / 10_000L >= MIN_ITEM_RUNTIME_MS
+    /** 服务端集序里 [episode] 的下一集(同剧同季);它已经是本季最后一集时返回 null。 */
+    private suspend fun nextEpisodeInSeason(episode: MediaItem, userId: String): MediaItem? {
+        val seriesId = episode.seriesId ?: return null
+        val seasonId = episode.seasonId ?: return null
+        val season = runCatching {
+            api.episodes(seriesId, seasonId, userId).items.mapNotNull { it.toMediaItem() }
+        }.getOrElse { return null }
+        val index = season.indexOfFirst { it.id == episode.id }
+        return if (index >= 0 && index < season.lastIndex) season[index + 1] else null
+    }
+
+    /** 诱饵:任何一条**别的剧**的剧集(见 [decoyItem])。凑不出来就返回 null。 */
+    private suspend fun pickDecoy(userId: String, avoid: MediaItem): MediaItem? =
+        runCatching { api.items(userId = userId, types = "Episode", limit = 50).items }
+            .getOrElse { emptyList() }
+            .mapNotNull { it.toMediaItem() }
+            .firstOrNull { it.seriesId != null && it.seriesId != avoid.seriesId }
 
     /**
      * 严格复刻 `AppSessionViewModel.play()` 的调用序列 —— 队列、前台服务、引擎,一步不差。

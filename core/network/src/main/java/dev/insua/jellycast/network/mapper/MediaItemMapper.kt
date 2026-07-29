@@ -36,6 +36,8 @@ fun BaseItemDto.toMediaItem(): MediaItem? {
         unplayedItemCount = userData?.unplayedItemCount,
         isFavorite = userData?.isFavorite ?: false,
         isPlayed = userData?.played ?: false,
+        seriesId = seriesId,
+        seasonId = seasonId,
     )
 }
 

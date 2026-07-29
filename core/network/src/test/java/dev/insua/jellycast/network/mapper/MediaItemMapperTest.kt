@@ -155,4 +155,27 @@ class MediaItemMapperTest {
         assertEquals(false, item?.isFavorite)
         assertEquals(false, item?.isPlayed)
     }
+
+    // ---- 剧集归属:SeriesId / SeasonId(自动连播"跟着剧走"的唯一入口,见
+    //      AutoPlayNextController)。字段名大小写已核对 docs/jellyfin-openapi.json 的
+    //      BaseItemDto.properties —— "SeriesId" / "SeasonId",均为 uuid 字符串。----
+
+    @Test
+    fun `Episode 条目带上 SeriesId 与 SeasonId`() {
+        val dto = BaseItemDto(
+            id = "e1", name = "E1", type = "Episode",
+            seriesId = "series-1", seasonId = "season-1",
+        )
+        val item = dto.toMediaItem()
+        assertEquals("series-1", item?.seriesId)
+        assertEquals("season-1", item?.seasonId)
+    }
+
+    @Test
+    fun `没有 SeriesId 与 SeasonId 时两者为 null`() {
+        val dto = BaseItemDto(id = "m1", name = "M1", type = "Movie")
+        val item = dto.toMediaItem()
+        assertNull(item?.seriesId)
+        assertNull(item?.seasonId)
+    }
 }

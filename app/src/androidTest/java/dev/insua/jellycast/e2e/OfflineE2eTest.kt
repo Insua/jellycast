@@ -35,6 +35,7 @@ import dev.insua.jellycast.network.mapper.toMediaItem
 import dev.insua.jellycast.network.repository.MediaRepository
 import dev.insua.jellycast.network.session.JellyfinSession
 import dev.insua.jellycast.player.AudioPlaybackEngine
+import dev.insua.jellycast.player.AutoPlayNextController
 import dev.insua.jellycast.player.PlayQueue
 import dev.insua.jellycast.player.PlaybackService
 import kotlinx.coroutines.runBlocking
@@ -107,6 +108,7 @@ class OfflineE2eTest {
     @Inject lateinit var database: JellyCastDatabase
     @Inject lateinit var playQueue: PlayQueue
     @Inject lateinit var engine: AudioPlaybackEngine
+    @Inject lateinit var autoPlayNextController: AutoPlayNextController
     @Inject lateinit var playerConnection: PlayerConnection
 
     private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
@@ -355,7 +357,9 @@ class OfflineE2eTest {
     private fun libraryViewModel(): LibraryViewModel = LibraryViewModel(api, session, repository).track()
 
     private fun appSessionViewModel(): AppSessionViewModel =
-        AppSessionViewModel(serverStore, session, playQueue, engine, playerConnection, context).track()
+        AppSessionViewModel(
+            serverStore, session, playQueue, engine, autoPlayNextController, playerConnection, context,
+        ).track()
 
     /** 交给 [viewModelStore] 保管,`@After` 时统一取消它们的 `viewModelScope`(见字段 KDoc)。 */
     private fun <T : ViewModel> T.track(): T = also {
