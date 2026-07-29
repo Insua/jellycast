@@ -111,6 +111,10 @@ class ProgressReporterTest {
         override suspend fun delete(ids: List<Long>) {
             store.removeAll { it.id in ids }
         }
+
+        override suspend fun deleteForItem(serverId: String, itemId: String) {
+            store.removeAll { it.serverId == serverId && it.itemId == itemId }
+        }
     }
 
     @Test fun `flushPending 只重放和删除属于自己 serverId 的记录,不影响其他 server`() = runTest {
@@ -178,5 +182,128 @@ class ProgressReporterTest {
         coEvery { dao.pending(any(), any()) } throws IllegalStateException("database corrupted")
 
         ProgressReporter(api, dao, "s1").flushPending()   // 不应抛出
+    }
+
+    // ---- 设计文档 §2.3 规则 1 / 规则 2:条目的上报生命周期以 stop 终结 ----
+
+    /**
+     * 🔴 现场缺陷的核心。实测的服务端行为(设计文档 §1.1):已被标记播完的条目再收到一条
+     * `progress`,播放位置就会被写回去,而已播放的勾不会撤销 —— 这一集于是永远赖在
+     * 「继续观看」里,还带着一条进度条。
+     */
+    @Test fun `stop 之后同一条目的 progress 不发出也不入队`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        val dao = mockk<ProgressReportDao>(relaxed = true)
+        val reporter = ProgressReporter(api, dao, "s1")
+
+        reporter.stop("ep1", "sess", 2_400_000)
+        reporter.progress("ep1", "sess", 60_000)
+
+        coVerify(exactly = 0) { api.reportProgress(any()) }
+        coVerify(exactly = 0) { dao.enqueue(match { it.kind == "progress" }) }
+    }
+
+    /** 终结标记必须只作用于被终结的那个条目。 */
+    @Test fun `stop 之后其它条目的 progress 照常发出`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        val dao = mockk<ProgressReportDao>(relaxed = true)
+        val reporter = ProgressReporter(api, dao, "s1")
+
+        reporter.stop("ep1", "sess", 2_400_000)
+        reporter.progress("ep2", "sess", 60_000)
+
+        coVerify(exactly = 1) { api.reportProgress(match { it.itemId == "ep2" }) }
+    }
+
+    /**
+     * `stop` 本身必须放行 —— `PlaybackService.onDestroy` 的兜底 stop 和 `STATE_ENDED` 的 stop
+     * 可能落在同一条目上,重发一条位置相同的 stop 对服务端无害,把它挡掉反而会丢掉真正的收尾。
+     */
+    @Test fun `stop 之后同一条目的 stop 仍然发出`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        val dao = mockk<ProgressReportDao>(relaxed = true)
+        val reporter = ProgressReporter(api, dao, "s1")
+
+        reporter.stop("ep1", "sess", 2_400_000)
+        reporter.stop("ep1", "sess", 2_400_000)
+
+        coVerify(exactly = 2) { api.reportStop(any()) }
+    }
+
+    /** 重看:`start` 清除终结标记,之后的心跳恢复正常。 */
+    @Test fun `start 清除终结标记,之后的 progress 恢复发出`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        val dao = mockk<ProgressReportDao>(relaxed = true)
+        val reporter = ProgressReporter(api, dao, "s1")
+
+        reporter.stop("ep1", "sess", 2_400_000)
+        reporter.start("ep1", "sess2", 0)
+        reporter.progress("ep1", "sess2", 60_000)
+
+        coVerify(exactly = 1) { api.reportProgress(match { it.itemId == "ep1" }) }
+    }
+
+    /** 规则 2:发 stop 之前先清空该条目在队列里的旧记录。 */
+    @Test fun `stop 之前先删除该条目在补报队列里的旧记录`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        val dao = mockk<ProgressReportDao>(relaxed = true)
+
+        ProgressReporter(api, dao, "s1").stop("ep1", "sess", 2_400_000)
+
+        coVerify(exactly = 1) { dao.deleteForItem("s1", "ep1") }
+    }
+
+    /** 铁律:上报失败不得打断播放 —— 连清队列这一步自己失败了,stop 也必须照发。 */
+    @Test fun `清空队列失败不影响 stop 的发出`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        val dao = mockk<ProgressReportDao>(relaxed = true)
+        coEvery { dao.deleteForItem(any(), any()) } throws IllegalStateException("database corrupted")
+
+        ProgressReporter(api, dao, "s1").stop("ep1", "sess", 2_400_000)   // 不应抛出
+
+        coVerify(exactly = 1) { api.reportStop(any()) }
+    }
+
+    /**
+     * 🔴 §1.2 根因 A 的直接复现。补报重放是「每次源就绪」都跑的,而自动连播的顺序是
+     * 「上一集 stop → 推进到下一集 → 下一集就绪 → flushPending」——
+     * 队列里那条上一集的旧心跳正好在它已经被标记播完之后被重放回去。
+     */
+    @Test fun `重放时跳过已终结条目的旧 progress,并把它从队列里清掉`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        val dao = FakeProgressReportDao()
+        dao.enqueue(
+            ProgressReportEntity(
+                id = 0, serverId = "s1", itemId = "ep1", playSessionId = null,
+                positionMs = 60_000, kind = "progress", createdAt = 1
+            )
+        )
+        val reporter = ProgressReporter(api, dao, "s1")
+
+        // 这一集播完了。注意:stop 自己会先 deleteForItem 清队列,所以这里用
+        // FakeProgressReportDao 走真实语义,验证「清了」和「就算没清,重放也会跳过」两层防御。
+        reporter.stop("ep1", "sess", 2_400_000)
+        reporter.flushPending()
+
+        coVerify(exactly = 0) { api.reportProgress(any()) }
+        assertEquals(emptyList<String>(), dao.store.map { it.itemId })
+    }
+
+    /** 已终结条目的**队列里的 stop** 仍然要重放 —— 它是这一集真正的收尾,丢了就白播了。 */
+    @Test fun `重放时不跳过已终结条目的 stop`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        val dao = FakeProgressReportDao()
+        val reporter = ProgressReporter(api, dao, "s1")
+
+        // stop 上报失败 → 入队;此时该条目已被标成终结。
+        coEvery { api.reportStop(any()) } throws java.io.IOException("offline")
+        reporter.stop("ep1", "sess", 2_400_000)
+        clearMocks(api, answers = false, recordedCalls = true)
+        coEvery { api.reportStop(any()) } returns Unit
+
+        reporter.flushPending()
+
+        coVerify(exactly = 1) { api.reportStop(match { it.itemId == "ep1" }) }
+        assertEquals(emptyList<String>(), dao.store.map { it.itemId })
     }
 }
