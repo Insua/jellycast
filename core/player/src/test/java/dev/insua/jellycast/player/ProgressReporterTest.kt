@@ -271,17 +271,23 @@ class ProgressReporterTest {
      */
     @Test fun `重放时跳过已终结条目的旧 progress,并把它从队列里清掉`() = runTest {
         val api = mockk<JellyfinApi>(relaxed = true)
-        val dao = FakeProgressReportDao()
+        // spyk 而不是 FakeProgressReportDao():stop 自己的 deleteForItem 会在发 stop 之前
+        // 就把这条旧记录清掉,导致队列在 flushPending 之前已经是空的 —— 那样 replay() 里
+        // 的终结标记判断根本不会被走到,测出来的是「清队列」这一层,不是这条测试真正要盯的
+        // 「重放」这一层。这里把 deleteForItem 打桩成失败,让旧记录活着进入 flushPending(),
+        // 真正验证 replay() 的 isFinished 判断兜住了它。
+        val dao = spyk(FakeProgressReportDao())
         dao.enqueue(
             ProgressReportEntity(
                 id = 0, serverId = "s1", itemId = "ep1", playSessionId = null,
                 positionMs = 60_000, kind = "progress", createdAt = 1
             )
         )
+        coEvery { dao.deleteForItem(any(), any()) } throws IllegalStateException("database corrupted")
         val reporter = ProgressReporter(api, dao, "s1")
 
-        // 这一集播完了。注意:stop 自己会先 deleteForItem 清队列,所以这里用
-        // FakeProgressReportDao 走真实语义,验证「清了」和「就算没清,重放也会跳过」两层防御。
+        // 这一集播完了,但队列清理失败(模拟数据库故障)—— 旧的 progress 记录活着留在队列里,
+        // 全靠 replay() 的终结标记判断这第二层防御把它挡掉。
         reporter.stop("ep1", "sess", 2_400_000)
         reporter.flushPending()
 

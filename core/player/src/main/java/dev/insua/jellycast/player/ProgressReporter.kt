@@ -82,9 +82,17 @@ class ProgressReporter(
             KIND_START -> finishedItems.clearFinished(itemId)
             KIND_STOP -> {
                 finishedItems.markFinished(itemId)
-                // 铁律:上报路径上的任何失败都不得打断播放。清队列失败(数据库损坏/迁移失败)
-                // 也不例外 —— 顶多是漏掉一条旧记录,而重放侧还有一层同样的判断兜着。
-                runCatching { dao.deleteForItem(serverId, itemId) }
+                // 铁律:上报路径上的任何失败都不得打断播放,但 CancellationException 必须重抛
+                // ——`runCatching` 会连它也吞掉,导致取消信号在这里被吸收、协程无法正常unwind。
+                // 清队列失败(数据库损坏/迁移失败)本身不例外:顶多是漏掉一条旧记录,而重放侧
+                // 还有一层同样的判断兜着。
+                try {
+                    dao.deleteForItem(serverId, itemId)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    // 静默:见上方注释。
+                }
             }
             KIND_PROGRESS -> if (finishedItems.isFinished(itemId)) return
         }
