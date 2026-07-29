@@ -95,6 +95,20 @@ fun JellyCastNavHost(
         sessionViewModel.onMessageShown()
     }
 
+    // 「这一串播完了」→ 收起播放页、回首页(2026-07-29 用户需求:整部剧播完 / 电影播完都回首页;
+    // 「已播放完」的提示走上面那条 message 通道)。决策本身在 AppSessionViewModel 的纯函数
+    // playbackSequenceEndEffect 里,:core:player 只发信号、不认识导航(设计文档 §5)。
+    val returnToHome by sessionViewModel.returnToHome.collectAsState()
+    LaunchedEffect(returnToHome) {
+        if (!returnToHome) return@LaunchedEffect
+        playerExpanded = false
+        navController.navigate(Routes.HOME) {
+            popUpTo(Routes.HOME) { inclusive = true }
+            launchSingleTop = true
+        }
+        sessionViewModel.onReturnToHomeHandled()
+    }
+
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {

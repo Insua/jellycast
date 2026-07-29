@@ -14,7 +14,9 @@ import dev.insua.jellycast.model.displaySubtitle
 import dev.insua.jellycast.network.mapper.posterUrl
 import dev.insua.jellycast.network.session.JellyfinSession
 import dev.insua.jellycast.player.AudioPlaybackEngine
+import dev.insua.jellycast.player.AutoPlayNextController
 import dev.insua.jellycast.player.PlaybackEngineState
+import dev.insua.jellycast.player.PlaybackSequenceEnd
 import dev.insua.jellycast.player.PlaybackService
 import dev.insua.jellycast.player.PlayQueue
 import kotlinx.coroutines.currentCoroutineContext
@@ -35,6 +37,29 @@ import javax.inject.Inject
  * 而不是"重试"。不带任何技术细节(不出现 endpoint、超时、异常类名)。
  */
 const val PLAYBACK_REQUIRES_SERVER_MESSAGE = "需要连接服务器才能播放"
+
+/** 整部剧的所有季所有集都播完时给用户的话(2026-07-29 用户需求)。 */
+const val SERIES_COMPLETED_MESSAGE = "已播放完"
+
+/** 「这一串播完了」在导航层该产生的动作。 */
+internal data class PlaybackSequenceEndEffect(val returnToHome: Boolean, val message: String?)
+
+/**
+ * `:core:player` 的 [PlaybackSequenceEnd] → 导航层动作的映射。
+ *
+ * **这是模块边界的落点**(设计文档 §5):`:core:player` 只说"发生了什么"——整部剧播完了 /
+ * 单条目播完了——它不认识导航,也不该认识。"回哪个页面、弹什么提示"是这一侧的决定,
+ * 而且是个纯函数,离线可单测(项目铁律 6)。
+ */
+internal fun playbackSequenceEndEffect(end: PlaybackSequenceEnd?): PlaybackSequenceEndEffect? = when (end) {
+    null -> null
+    // 剧集全部播完:回首页 + 提示。
+    PlaybackSequenceEnd.SERIES_COMPLETED ->
+        PlaybackSequenceEndEffect(returnToHome = true, message = SERIES_COMPLETED_MESSAGE)
+    // 电影:回首页,不必额外提示——用户自己点开的单部片子,播完了是意料之中的事。
+    PlaybackSequenceEnd.ITEM_COMPLETED ->
+        PlaybackSequenceEndEffect(returnToHome = true, message = null)
+}
 
 /** 常驻迷你播放条(修正 §4/§9)需要的最小展示状态。 */
 data class MiniPlayerUiState(
@@ -77,6 +102,7 @@ class AppSessionViewModel @Inject constructor(
     private val session: JellyfinSession,
     private val playQueue: PlayQueue,
     private val audioPlaybackEngine: AudioPlaybackEngine,
+    private val autoPlayNextController: AutoPlayNextController,
     private val playerConnection: PlayerConnection,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
@@ -100,6 +126,16 @@ class AppSessionViewModel @Inject constructor(
     private val _message = MutableStateFlow<String?>(null)
     val message: StateFlow<String?> = _message.asStateFlow()
 
+    /**
+     * 「播完了,回首页」——true = 导航层该把播放页收起来并回到首页。
+     *
+     * 和 [message] 同一个模式(StateFlow + 消费后清空):导航层用 `LaunchedEffect` 消费,
+     * 处理完调 [onReturnToHomeHandled]。旋转屏幕/重组不会重复导航,也不会因为此刻没有订阅者
+     * 而把信号整个丢掉。
+     */
+    private val _returnToHome = MutableStateFlow(false)
+    val returnToHome: StateFlow<Boolean> = _returnToHome.asStateFlow()
+
     init {
         viewModelScope.launch {
             val activeId = serverStore.activeServerId.first()
@@ -108,11 +144,34 @@ class AppSessionViewModel @Inject constructor(
         }
         observeMiniPlayer()
         observePlaybackFailure()
+        observePlaybackSequenceEnd()
     }
 
     /** 提示已经展示过了,清空,免得下一次重组又弹一遍。 */
     fun onMessageShown() {
         _message.value = null
+    }
+
+    /** 导航层已经回到首页了,清空信号。 */
+    fun onReturnToHomeHandled() {
+        _returnToHome.value = false
+    }
+
+    /**
+     * "这一串播完了"(整部剧播完 / 电影播完)时回首页并按需提示 —— 见 [playbackSequenceEndEffect]。
+     *
+     * 信号来自 `:core:player` 的 [AutoPlayNextController.sequenceEnd]:那一侧只说"发生了什么",
+     * 由这里翻译成导航动作,`:core:player` 因此始终不认识导航(设计文档 §5)。
+     */
+    private fun observePlaybackSequenceEnd() {
+        viewModelScope.launch {
+            autoPlayNextController.sequenceEnd.collect { end ->
+                val effect = playbackSequenceEndEffect(end) ?: return@collect
+                effect.message?.let { _message.value = it }
+                if (effect.returnToHome) _returnToHome.value = true
+                autoPlayNextController.onSequenceEndHandled()
+            }
+        }
     }
 
     /**
