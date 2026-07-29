@@ -360,35 +360,67 @@ class ProgressReporterTest {
 
     /**
      * 反过来的交错:`stop` 先拿到锁,排在后面的心跳醒来时该条目已经终结 —— 必须被丢弃,
-     * 而不是等 stop 发完再补一条上去。终结判定因此**必须在锁内**做,锁外判定会让一条
-     * 已经通过判定、正在等锁的心跳排到 stop 后面发出去,那正是要防的竞态。
+     * 而不是等 stop 发完再补一条上去。终结判定因此**必须在锁内**做:如果判定被挪到锁外,
+     * 一条在 `stop` 真正执行 `markFinished` 之前就完成判定(读到"未终结")的心跳,会绕过
+     * 判定直接排队等锁,锁轮到它时不会再复查,照样把 progress 发出去。
+     *
+     * 要让这条测试真正区分"判定在锁内 / 判定在锁外"这两种实现,必须制造一个时间窗口,让心跳
+     * 的判定**先于** `stop` 的 `markFinished` 执行,然后才轮到心跳去抢锁。只让 `stop` 和
+     * `progress` 两个角色错开 `runCurrent()` 是不够的 —— `markFinished` 是锁内代码,不会在
+     * `stop` 拿到锁之前跑,所以心跳无论判定在锁内还是锁外,读到的都会是"未终结"这同一个值,
+     * 两种实现测出来的结果没有差别(用变异验证过,见 fix report)。
+     *
+     * 因此这里引入第三个角色:一条无关条目 `other` 的心跳先卡在网络里、占住 `reportMutex`。
+     * 这样当 `stop("ep1", …)` 发出时,它连锁都还没排上,`markFinished("ep1")` 自然也没执行;
+     * 紧接着 `progress("ep1", …)` 入场——如果判定在锁外,它此刻就会读到"未终结"并直接排队
+     * 等锁;如果判定在锁内,它同样排队,但轮到它时会在锁内重新判定。占位的心跳一放行,
+     * `stop` 先拿到锁执行 `markFinished` 并发出,`ep1` 的心跳随后拿到锁——锁内判定版本此时
+     * 才会把它丢弃,锁外判定版本则会照样把它发出去。
      */
-    @Test fun `stop 先拿到锁时,排在后面的 progress 被丢弃`() = runTest {
+    @Test fun `stop 先拿到锁时,排在后面的 progress 在锁内被终结判定丢弃`() = runTest {
         val api = mockk<JellyfinApi>(relaxed = true)
         val dao = mockk<ProgressReportDao>(relaxed = true)
-        val stopGate = CompletableDeferred<Unit>()
-        coEvery { api.reportStop(any()) } coAnswers { stopGate.await() }
+        val otherGate = CompletableDeferred<Unit>()
+        coEvery { api.reportProgress(match { it.itemId == "other" }) } coAnswers { otherGate.await() }
 
         val reporter = ProgressReporter(api, dao, "s1")
         coroutineScope {
+            // 占住 reportMutex,制造"markFinished 还没跑"的窗口。
+            val holder = launch { reporter.progress("other", "sess", 1000) }
+            runCurrent()
+
+            // stop 此刻连锁都还没排上,markFinished("ep1") 尚未执行。
             val ending = launch { reporter.stop("ep1", "sess", 2_400_000) }
             runCurrent()
+
+            // 心跳入场:锁外判定的话,它现在就会读到"未终结"。
             val heartbeat = launch { reporter.progress("ep1", "sess", 60_000) }
             runCurrent()
 
-            stopGate.complete(Unit)
+            otherGate.complete(Unit)
+            holder.join()
             ending.join()
             heartbeat.join()
         }
 
-        coVerify(exactly = 0) { api.reportProgress(any()) }
+        coVerify(exactly = 1) { api.reportStop(match { it.itemId == "ep1" }) }
+        coVerify(exactly = 0) { api.reportProgress(match { it.itemId == "ep1" }) }
     }
 
     /**
      * 补报重放必须**逐条**获取上报锁,不能整批持有:队列上限是 100 条,整批持有会把一条
      * 实时 `stop` 堵在一次满队列重放的后面。
+     *
+     * 光看"最终"调用次数测不出这一点——批量持锁和逐条持锁在 `flush.join(); ending.join()`
+     * 之后的最终调用计数是一样的,差别只在于 `stop` **能在虚拟时间的哪一刻**发出去(用变异
+     * 验证过,见 fix report:把锁挪到包住整个 for 循环,原本的断言依然全绿)。
+     *
+     * 所以断言必须卡在中途的一个检查点:给重放批次里的三条记录各配一个独立的网关,只放行
+     * 第一条。逐条持锁的话,第一条一发完就会释放锁,而排在锁队列里的实时 `stop`(先于第二条
+     * 重放开始等锁)会先于第二条抢到锁并发出去——这时第二、三条还各自卡在网关里没有执行。
+     * 整批持锁的话,锁要等整个 for 循环跑完才会释放,这个检查点上 `stop` 必然一次都没发出去。
      */
-    @Test fun `补报重放期间实时 stop 不必等待整批完成`() = runTest {
+    @Test fun `补报重放逐条持锁,实时 stop 能在第一条重放完成后立刻插队`() = runTest {
         val api = mockk<JellyfinApi>(relaxed = true)
         val dao = FakeProgressReportDao()
         repeat(3) { index ->
@@ -399,25 +431,30 @@ class ProgressReporterTest {
                 )
             )
         }
-        val firstReplayGate = CompletableDeferred<Unit>()
+        val gates = List(3) { CompletableDeferred<Unit>() }
         var replayed = 0
-        coEvery { api.reportProgress(any()) } coAnswers {
-            if (replayed++ == 0) firstReplayGate.await()
-        }
+        coEvery { api.reportProgress(any()) } coAnswers { gates[replayed++].await() }
 
         val reporter = ProgressReporter(api, dao, "s1")
         coroutineScope {
             val flush = launch { reporter.flushPending() }
-            runCurrent()
+            runCurrent() // 第一条重放拿到锁,卡在自己的网关里
+
             val ending = launch { reporter.stop("ep9", "sess", 2_400_000) }
+            runCurrent() // 实时 stop 排队等锁,此时第一条重放还没放行
+
+            gates[0].complete(Unit)
             runCurrent()
 
-            // 第一条重放还卡着,整批一共 3 条 —— 如果整批持有锁,stop 到这里必然一次都没发出。
-            firstReplayGate.complete(Unit)
+            // 检查点:第一条重放刚完成。逐条持锁的话,锁已经被释放又被排队中的 stop
+            // 抢先拿走并发完了;整批持锁的话,锁还攥在 flush 手里,第二条正在跑,
+            // stop 一次都还没发出去。
+            coVerify(exactly = 1) { api.reportStop(match { it.itemId == "ep9" }) }
+
+            gates[1].complete(Unit)
+            gates[2].complete(Unit)
             flush.join()
             ending.join()
         }
-
-        coVerify(exactly = 1) { api.reportStop(match { it.itemId == "ep9" }) }
     }
 }
