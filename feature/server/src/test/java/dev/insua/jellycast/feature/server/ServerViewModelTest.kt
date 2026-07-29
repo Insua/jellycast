@@ -1,8 +1,10 @@
 package dev.insua.jellycast.feature.server
 
+import dev.insua.jellycast.database.CachedItemDao
 import dev.insua.jellycast.datastore.ServerStore
 import dev.insua.jellycast.model.Endpoint
 import dev.insua.jellycast.model.EndpointHealth
+import dev.insua.jellycast.model.Server
 import dev.insua.jellycast.network.EndpointSelector
 import dev.insua.jellycast.network.JellyfinApi
 import dev.insua.jellycast.network.dto.AuthRequestDto
@@ -15,6 +17,7 @@ import io.mockk.mockk
 import io.mockk.slot
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
@@ -42,6 +45,7 @@ class ServerViewModelTest {
     private val serverStore = mockk<ServerStore>(relaxed = true)
     private val endpointSelector = mockk<EndpointSelector>()
     private val jellyfinApiFactory = mockk<JellyfinApiFactory>()
+    private val cachedItemDao = mockk<CachedItemDao>(relaxed = true)
 
     @BeforeEach
     fun setUp() {
@@ -56,7 +60,10 @@ class ServerViewModelTest {
     }
 
     private fun viewModel(certificateFetcher: PeerCertificateFetcher = mockk(relaxed = true)) =
-        ServerViewModel(serverStore, endpointSelector, jellyfinApiFactory, certificateFetcher)
+        ServerViewModel(serverStore, endpointSelector, jellyfinApiFactory, cachedItemDao, certificateFetcher)
+
+    private fun server(id: String, name: String = "server-$id") =
+        Server(id = id, name = name, endpoints = listOf(lan()))
 
     /** 构造一张可被 [sha256Fingerprint] 计算出确定性指纹的假证书,内容本身无所谓。 */
     private fun fakeCertificate(seed: Byte): X509Certificate {
@@ -426,5 +433,97 @@ class ServerViewModelTest {
         assertNotEquals(serverError, ioError)
         assertTrue(unauthorized.contains("用户名或密码不正确"), unauthorized)
         assertTrue(serverError.contains("503"), serverError)
+    }
+
+    // ---- Task 4:删除服务器——误删会丢登录态,必须先二次确认,确认前绝不能调用 delete ----
+
+    @Test
+    fun `点删除仅弹出确认_未确认不调用delete`() = runTest {
+        val vm = viewModel()
+
+        vm.requestDeleteServer("srv-1")
+
+        assertEquals("srv-1", vm.uiState.value.deleteConfirmation)
+        coVerify(exactly = 0) { serverStore.delete(any()) }
+    }
+
+    @Test
+    fun `取消删除确认时不删除且清空确认弹窗`() = runTest {
+        val vm = viewModel()
+
+        vm.requestDeleteServer("srv-1")
+        vm.dismissDeleteConfirmation()
+
+        assertNull(vm.uiState.value.deleteConfirmation)
+        coVerify(exactly = 0) { serverStore.delete(any()) }
+    }
+
+    @Test
+    fun `确认删除后调用ServerStore_delete`() = runTest {
+        val vm = viewModel()
+
+        vm.requestDeleteServer("srv-1")
+        vm.confirmDeleteServer()
+
+        coVerify(exactly = 1) { serverStore.delete("srv-1") }
+        assertNull(vm.uiState.value.deleteConfirmation)
+    }
+
+    @Test
+    fun `删除当前活跃服务器时清掉活跃标记并清除该服务器缓存`() = runTest {
+        every { serverStore.activeServerId } returns MutableStateFlow("srv-1")
+        val vm = viewModel()
+
+        vm.requestDeleteServer("srv-1")
+        vm.confirmDeleteServer()
+
+        coVerify(exactly = 1) { serverStore.delete("srv-1") }
+        coVerify(exactly = 1) { serverStore.clearActive() }
+        coVerify(exactly = 1) { cachedItemDao.clearServer("srv-1") }
+    }
+
+    @Test
+    fun `删除非活跃服务器不清活跃标记也不清缓存`() = runTest {
+        every { serverStore.activeServerId } returns MutableStateFlow("srv-other")
+        val vm = viewModel()
+
+        vm.requestDeleteServer("srv-1")
+        vm.confirmDeleteServer()
+
+        coVerify(exactly = 1) { serverStore.delete("srv-1") }
+        coVerify(exactly = 0) { serverStore.clearActive() }
+        coVerify(exactly = 0) { cachedItemDao.clearServer(any()) }
+    }
+
+    @Test
+    fun `删到列表为空时uiState servers跟随store回到空列表`() = runTest {
+        val serversFlow = MutableStateFlow(listOf(server("srv-1")))
+        every { serverStore.servers } returns serversFlow
+        coEvery { endpointSelector.select(any()) } returns null
+        val vm = viewModel()
+
+        assertEquals(1, vm.uiState.value.servers.size)
+
+        vm.requestDeleteServer("srv-1")
+        vm.confirmDeleteServer()
+        // 模拟真实 ServerStore.delete 落盘后 Flow 重新发射的效果——这里的 mock 不会
+        // 自己触发这一步,手动推一次来验证 ViewModel 对 servers Flow 的订阅确实驱动了空状态。
+        serversFlow.value = emptyList()
+
+        assertTrue(vm.uiState.value.servers.isEmpty())
+    }
+
+    @Test
+    fun `删除失败时给出提示_不静默_也不清活跃标记或缓存`() = runTest {
+        coEvery { serverStore.delete("srv-1") } throws IOException("disk full")
+        val vm = viewModel()
+
+        vm.requestDeleteServer("srv-1")
+        vm.confirmDeleteServer()
+
+        assertNotNull(vm.uiState.value.error)
+        assertNull(vm.uiState.value.deleteConfirmation)
+        coVerify(exactly = 0) { serverStore.clearActive() }
+        coVerify(exactly = 0) { cachedItemDao.clearServer(any()) }
     }
 }

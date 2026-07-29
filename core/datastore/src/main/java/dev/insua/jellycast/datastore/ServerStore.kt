@@ -101,6 +101,17 @@ class ServerStore(private val context: Context) {
         context.serverDataStore.edit { it[KEY_ACTIVE] = id }
     }
 
+    /**
+     * 清掉"当前激活服务器"标记,不改动服务器列表本身。
+     *
+     * Task 4(删除服务器):删掉的如果正好是当前活跃服务器,调用方必须在 [delete] 之后
+     * 显式调这个方法——否则激活标记会继续指向一台已经不存在的服务器,下次启动时
+     * [dev.insua.jellycast.model.Server] 相关的会话装配会拿着一个查无此服务器的 id 去找。
+     */
+    suspend fun clearActive() {
+        context.serverDataStore.edit { it.remove(KEY_ACTIVE) }
+    }
+
     private suspend fun write(transform: (List<Server>) -> List<Server>) {
         context.serverDataStore.edit { prefs ->
             val current = prefs[KEY_SERVERS]

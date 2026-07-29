@@ -3,6 +3,7 @@ package dev.insua.jellycast.feature.server
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dev.insua.jellycast.database.CachedItemDao
 import dev.insua.jellycast.datastore.ServerStore
 import dev.insua.jellycast.model.Endpoint
 import dev.insua.jellycast.model.EndpointHealth
@@ -65,6 +66,9 @@ data class ServerUiState(
     val error: String? = null,
     val certConfirmation: CertConfirmation? = null,
     val connectedServerId: String? = null,
+    /** 待确认删除的服务器 id——非 null 时列表页要弹出二次确认对话框。删除会丢登录态,
+     *  误删代价高,所以不允许点一下就直接删。 */
+    val deleteConfirmation: String? = null,
 )
 
 /**
@@ -78,15 +82,22 @@ class ServerViewModel @Inject constructor(
     private val serverStore: ServerStore,
     private val endpointSelector: EndpointSelector,
     private val jellyfinApiFactory: JellyfinApiFactory,
+    private val cachedItemDao: CachedItemDao,
     private val certificateFetcher: PeerCertificateFetcher = DefaultPeerCertificateFetcher,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(ServerUiState())
     val uiState: StateFlow<ServerUiState> = _uiState.asStateFlow()
 
+    /** 最近一次观察到的活跃服务器 id,删除时用来判断要不要清活跃标记 + 缓存(见 [confirmDeleteServer])。 */
+    private var activeServerId: String? = null
+
     init {
         viewModelScope.launch {
             serverStore.servers.collect { servers -> onServersChanged(servers) }
+        }
+        viewModelScope.launch {
+            serverStore.activeServerId.collect { activeServerId = it }
         }
     }
 
@@ -271,6 +282,43 @@ class ServerViewModel @Inject constructor(
 
     fun dismissCertificateConfirmation() {
         _uiState.update { it.copy(certConfirmation = null) }
+    }
+
+    // ---- 删除服务器 ----
+
+    /** 点了某一行的删除按钮:只弹二次确认,不动 [ServerStore]——误删会丢登录态,必须先确认。 */
+    fun requestDeleteServer(id: String) {
+        _uiState.update { it.copy(deleteConfirmation = id, error = null) }
+    }
+
+    fun dismissDeleteConfirmation() {
+        _uiState.update { it.copy(deleteConfirmation = null) }
+    }
+
+    /**
+     * 用户在确认弹窗里点了「删除」。真正调 [ServerStore.delete] 的唯一入口。
+     *
+     * 被删的如果正好是当前活跃服务器,还要清掉活跃标记([ServerStore.clearActive])并清空
+     * 它的缓存([CachedItemDao.clearServer])——否则激活标记会指向一台不存在的服务器,
+     * 缓存表里也会留下无主的行。三步全部包在同一个 try 里:任何一步失败都算这次删除失败,
+     * 必须给用户看得到的提示(铁律:删除失败不得静默),不能让用户以为删成功了。
+     */
+    fun confirmDeleteServer() {
+        val id = _uiState.value.deleteConfirmation ?: return
+        viewModelScope.launch {
+            try {
+                serverStore.delete(id)
+                if (activeServerId == id) {
+                    serverStore.clearActive()
+                    cachedItemDao.clearServer(id)
+                }
+                _uiState.update { it.copy(deleteConfirmation = null, error = null) }
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(deleteConfirmation = null, error = "删除服务器失败:${e.message ?: e.javaClass.simpleName}")
+                }
+            }
+        }
     }
 
     // ---- 内部辅助 ----
