@@ -5,16 +5,17 @@ import android.graphics.Bitmap
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -79,8 +80,43 @@ fun PlayerScreen(
     viewModel: PlayerViewModel = hiltViewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsState()
+    PlayerScreenContent(
+        uiState = uiState,
+        posterUrl = if (baseUrl.isBlank()) null else uiState.mediaItem?.posterUrl(baseUrl),
+        onCollapse = onCollapse,
+        onSeek = viewModel::onSeek,
+        onPlayPause = viewModel::onPlayPause,
+        onSkipBack = viewModel::onSkipBack,
+        onSkipForward = viewModel::onSkipForward,
+        onCycleSpeed = viewModel::onCycleSpeed,
+        onSetSleepTimer = viewModel::onSetSleepTimer,
+        onCycleSubtitleTrack = viewModel::onCycleSubtitleTrack,
+        onCycleAudioTrack = viewModel::onCycleAudioTrack,
+        onSkipToNext = viewModel::onSkipToNext,
+    )
+}
+
+/**
+ * 播放页的无状态本体——和 `HomeScreenContent` 同样的模式:把 ViewModel/Hilt 摘出去,布局本身
+ * 才能在 androidTest 里被真机渲染并断言"当前歌词行是不是真的看得见"。v3 的离线提示条教训
+ * (节点存在于语义树里、却被挤出视口)说明这类问题只有真机布局测试能抓到。
+ */
+@Composable
+fun PlayerScreenContent(
+    uiState: PlayerUiState,
+    posterUrl: String? = null,
+    onCollapse: () -> Unit = {},
+    onSeek: (Long) -> Unit = {},
+    onPlayPause: () -> Unit = {},
+    onSkipBack: () -> Unit = {},
+    onSkipForward: () -> Unit = {},
+    onCycleSpeed: () -> Unit = {},
+    onSetSleepTimer: (SleepTimerOption?) -> Unit = {},
+    onCycleSubtitleTrack: () -> Unit = {},
+    onCycleAudioTrack: () -> Unit = {},
+    onSkipToNext: () -> Unit = {},
+) {
     val mediaItem = uiState.mediaItem
-    val posterUrl = if (baseUrl.isBlank()) null else mediaItem?.posterUrl(baseUrl)
 
     val context = LocalContext.current
     var coverColor by remember { mutableStateOf<Color?>(null) }
@@ -103,10 +139,19 @@ fun PlayerScreen(
     ) {
         TopBar(seriesName = mediaItem?.seriesName.orEmpty(), onCollapse = onCollapse)
 
-        Spacer(Modifier.height(24.dp))
-        CoverArt(imageUrl = posterUrl, modifier = Modifier.align(Alignment.CenterHorizontally))
+        Spacer(Modifier.height(16.dp))
+        // 封面不再用"接近满宽的正方形"硬占高度,而是和歌词区一起**按权重瓜分剩余空间**:
+        // 固定控件(标题/进度/控制/工具栏)排完之后剩多少,封面拿 COVER_WEIGHT、歌词拿 LYRICS_WEIGHT。
+        // 封面边长 = min(可用高度, 宽度 * COVER_MAX_WIDTH_FRACTION),所以屏幕越高封面越大、
+        // 最大仍是原来的 0.78 满宽;屏幕矮时封面自动收缩,而不是把歌词挤到看不见。
+        Box(
+            modifier = Modifier.weight(COVER_WEIGHT).fillMaxWidth(),
+            contentAlignment = Alignment.Center,
+        ) {
+            CoverArt(imageUrl = posterUrl)
+        }
 
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(16.dp))
         TitleBlock(mediaItem)
 
         Spacer(Modifier.height(16.dp))
@@ -117,7 +162,7 @@ fun PlayerScreen(
         // 让这一格看起来像"片源没有字幕"。
         when (lyricsDisplayState(uiState.isSubtitleLoading, uiState.subtitleTimeline, uiState.lyricsEnabled)) {
             LyricsDisplayState.DISABLED -> Box(
-                modifier = Modifier.weight(1f).fillMaxWidth(),
+                modifier = Modifier.weight(LYRICS_WEIGHT).fillMaxWidth(),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
@@ -129,7 +174,7 @@ fun PlayerScreen(
                 )
             }
             LyricsDisplayState.LOADING -> Box(
-                modifier = Modifier.weight(1f).fillMaxWidth(),
+                modifier = Modifier.weight(LYRICS_WEIGHT).fillMaxWidth(),
                 contentAlignment = Alignment.Center,
             ) {
                 CircularProgressIndicator()
@@ -137,8 +182,8 @@ fun PlayerScreen(
             LyricsDisplayState.PLACEHOLDER, LyricsDisplayState.CONTENT -> LyricsView(
                 timeline = uiState.subtitleTimeline,
                 positionMs = uiState.positionMs,
-                onSeek = viewModel::onSeek,
-                modifier = Modifier.weight(1f),
+                onSeek = onSeek,
+                modifier = Modifier.weight(LYRICS_WEIGHT),
                 subtitleSkippedAsDanmaku = uiState.subtitleSkippedAsDanmaku,
             )
         }
@@ -146,7 +191,7 @@ fun PlayerScreen(
         ProgressSection(
             positionMs = uiState.positionMs,
             durationMs = uiState.durationMs,
-            onSeek = viewModel::onSeek,
+            onSeek = onSeek,
         )
 
         Spacer(Modifier.height(8.dp))
@@ -154,20 +199,20 @@ fun PlayerScreen(
             isPlaying = uiState.isPlaying,
             rewindSeconds = uiState.rewindSeconds,
             forwardSeconds = uiState.forwardSeconds,
-            onPlayPause = viewModel::onPlayPause,
-            onSkipBack = viewModel::onSkipBack,
-            onSkipForward = viewModel::onSkipForward,
+            onPlayPause = onPlayPause,
+            onSkipBack = onSkipBack,
+            onSkipForward = onSkipForward,
         )
 
         Spacer(Modifier.height(8.dp))
         ToolbarRow(
             playbackSpeed = uiState.playbackSpeed,
             sleepTimerOption = uiState.sleepTimerOption,
-            onCycleSpeed = viewModel::onCycleSpeed,
-            onSetSleepTimer = viewModel::onSetSleepTimer,
-            onCycleSubtitleTrack = viewModel::onCycleSubtitleTrack,
-            onCycleAudioTrack = viewModel::onCycleAudioTrack,
-            onSkipToNext = viewModel::onSkipToNext,
+            onCycleSpeed = onCycleSpeed,
+            onSetSleepTimer = onSetSleepTimer,
+            onCycleSubtitleTrack = onCycleSubtitleTrack,
+            onCycleAudioTrack = onCycleAudioTrack,
+            onSkipToNext = onSkipToNext,
         )
         Spacer(Modifier.height(12.dp))
     }
@@ -189,22 +234,28 @@ private fun TopBar(seriesName: String, onCollapse: () -> Unit) {
     }
 }
 
+/**
+ * 封面永远是正方形,边长取"分到的高度"和"宽度上限"里更小的那个——高度不够时收缩而不是溢出,
+ * 高度充裕时也不会超过 [COVER_MAX_WIDTH_FRACTION] 满宽(即原来的视觉尺寸)。
+ */
 @Composable
 private fun CoverArt(imageUrl: String?, modifier: Modifier = Modifier) {
-    Box(
-        modifier = modifier
-            .fillMaxWidth(0.78f)
-            .aspectRatio(1f)
-            .shadow(elevation = 16.dp, shape = RoundedCornerShape(12.dp))
-            .clip(RoundedCornerShape(12.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant),
-    ) {
-        AsyncImage(
-            model = imageUrl,
-            contentDescription = null,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxSize(),
-        )
+    BoxWithConstraints(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        val side = (maxWidth * COVER_MAX_WIDTH_FRACTION).coerceAtMost(maxHeight)
+        Box(
+            modifier = Modifier
+                .size(side)
+                .shadow(elevation = 16.dp, shape = RoundedCornerShape(12.dp))
+                .clip(RoundedCornerShape(12.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+        ) {
+            AsyncImage(
+                model = imageUrl,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
     }
 }
 
@@ -412,3 +463,13 @@ private fun Bitmap.averageColor(): Color {
 }
 
 private const val SAMPLE_GRID = 8
+
+/**
+ * 剩余空间在"封面"和"歌词"之间的分配比例。歌词略多一点——招牌功能的硬要求是"当前行任意时刻
+ * 完整可见,上下各至少一行上下文",这条优先于封面尺寸(设计文档 2026-07-29 §2.1)。
+ */
+private const val COVER_WEIGHT = 1f
+private const val LYRICS_WEIGHT = 1.1f
+
+/** 封面边长的宽度上限比例:高度充裕时保持原来的视觉尺寸。 */
+private const val COVER_MAX_WIDTH_FRACTION = 0.78f
