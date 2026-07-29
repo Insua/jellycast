@@ -29,6 +29,9 @@ import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -58,6 +61,8 @@ object HomeScreenTestTags {
     const val ACCOUNT_BUTTON = "home_top_bar_account"
     const val TAB_ROW = "home_tab_row"
     const val FAVORITES_EMPTY = "home_favorites_empty"
+    const val PULL_REFRESH_CONTAINER = "home_pull_refresh_container"
+    const val PULL_REFRESH_INDICATOR = "home_pull_refresh_indicator"
 
     fun item(id: String) = "home_item_$id"
 }
@@ -108,6 +113,7 @@ fun HomeScreen(
         baseUrl = baseUrl,
         onSelectTab = viewModel::selectTab,
         onRetry = viewModel::retry,
+        onRefresh = viewModel::refresh,
         onToggleFavorite = viewModel::toggleFavorite,
         onActionErrorShown = viewModel::consumeActionError,
     )
@@ -120,6 +126,7 @@ fun HomeScreen(
  * [onItemClick] 收到的队列确实是整个分区"这件事,单靠纯逻辑单测(见 [HomeScreenTest]的
  * `playQueueFor` 断言)测不出真正的接线是不是对的。
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreenContent(
     uiState: HomeUiState,
@@ -130,6 +137,7 @@ fun HomeScreenContent(
     baseUrl: String = "",
     onSelectTab: (HomeTab) -> Unit = {},
     onRetry: () -> Unit = {},
+    onRefresh: () -> Unit = {},
     onToggleFavorite: (MediaItem) -> Unit = {},
     onActionErrorShown: () -> Unit = {},
 ) {
@@ -173,25 +181,57 @@ fun HomeScreenContent(
             OfflineBanner(onDismiss = { offlineNoticeDismissed = true })
         }
 
-        when (uiState.tab) {
-            HomeTab.FEED -> HomeFeed(
-                uiState = uiState,
-                baseUrl = baseUrl,
-                onItemClick = onItemClick,
-                onLibraryClick = onLibraryClick,
-                onRetry = {
-                    offlineNoticeDismissed = false
-                    onRetry()
-                },
-            )
-            HomeTab.FAVORITES -> FavoritesGrid(
-                favorites = uiState.favorites,
-                baseUrl = baseUrl,
-                // 「我的最爱」不是"分区"——混排各种来源的收藏,彼此没有先后关系,不构造队列,
-                // 沿用点哪个就单独播哪个(与改动前行为一致)。
-                onItemClick = { item -> onItemClick(item, listOf(item)) },
-                onToggleFavorite = onToggleFavorite,
-            )
+        // 下拉刷新(设计文档 §2.3):只包住"当前 Tab 的内容"这一层,不含顶栏/TabRow/离线横幅——
+        // 手势应该发生在列表本身上。[HomeViewModel.refresh] 覆盖两个 Tab 共同的数据源(三个分区
+        // + 收藏 + 最近添加都在同一次并发刷新里),所以不管当前停在哪个 Tab,下拉都会让两边的
+        // 数据一起更新;`isRefreshing` 只是这一次手势的指示器状态,不是"哪个 Tab 在转"。
+        val pullRefreshState = rememberPullToRefreshState()
+        PullToRefreshBox(
+            isRefreshing = uiState.isRefreshing,
+            onRefresh = onRefresh,
+            state = pullRefreshState,
+            modifier = Modifier
+                .fillMaxSize()
+                .testTag(HomeScreenTestTags.PULL_REFRESH_CONTAINER),
+            indicator = {
+                // 只在"确实有事情正在发生"(手指正在拖 / 正在回弹动画 / 真的在刷新)时才把指示器
+                // 组合进树——而不是让它常驻树上、只靠 M3 内部的 alpha/scale 动画变透明。默认
+                // Indicator 用 graphicsLayer 做淡入淡出,不影响布局尺寸,`assertIsDisplayed()`
+                // 判定的是布局边界与视口的交集,量不出"透明但还占着位置"这种不可见——与本项目
+                // v3 离线横幅"存在但被挤出可视区"是同一类坑的另一种表现形式,所以这里干脆不让它
+                // 在空闲态进入语义树,`assertDoesNotExist()`(真的不存在)+ `assertIsDisplayed()`
+                // (真的在刷新时看得见)这一组断言才是站得住脚的。
+                if (uiState.isRefreshing || pullRefreshState.distanceFraction > 0f || pullRefreshState.isAnimating) {
+                    PullToRefreshDefaults.Indicator(
+                        state = pullRefreshState,
+                        isRefreshing = uiState.isRefreshing,
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .testTag(HomeScreenTestTags.PULL_REFRESH_INDICATOR),
+                    )
+                }
+            },
+        ) {
+            when (uiState.tab) {
+                HomeTab.FEED -> HomeFeed(
+                    uiState = uiState,
+                    baseUrl = baseUrl,
+                    onItemClick = onItemClick,
+                    onLibraryClick = onLibraryClick,
+                    onRetry = {
+                        offlineNoticeDismissed = false
+                        onRetry()
+                    },
+                )
+                HomeTab.FAVORITES -> FavoritesGrid(
+                    favorites = uiState.favorites,
+                    baseUrl = baseUrl,
+                    // 「我的最爱」不是"分区"——混排各种来源的收藏,彼此没有先后关系,不构造队列,
+                    // 沿用点哪个就单独播哪个(与改动前行为一致)。
+                    onItemClick = { item -> onItemClick(item, listOf(item)) },
+                    onToggleFavorite = onToggleFavorite,
+                )
+            }
         }
     }
 

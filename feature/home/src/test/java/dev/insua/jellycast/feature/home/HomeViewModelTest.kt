@@ -613,4 +613,116 @@ class HomeViewModelTest {
         )
         assertNotNull(viewModel.uiState.value.actionError)
     }
+
+    // ================= 下拉刷新(设计文档 §2.3)=================
+    // 下拉刷新必须走与 load() 完全相同的仓储路径(不是另起一套取数逻辑),但绝不能像
+    // load()/retry() 那样先清空内存态再重新填——那种"清空再补"的路径只在错误态(屏幕上本来
+    // 就没有内容)才被调用得到,真的用来刷新已经显示的内容会先闪成空白,是这个手势明确禁止的。
+
+    @Test
+    fun `下拉刷新走既有仓储路径_调用瞬间不清空已显示内容_成功后替换并关闭指示器`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto(items = listOf(episodeDto("resume-1")))
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
+        stubNoLibraries(api)
+
+        val repository = FakeMediaRepository()
+        val viewModel = newViewModel(api, repository)
+        advanceUntilIdle()
+        assertEquals(
+            listOf("resume-1"),
+            viewModel.uiState.value.sections.single { it.kind == HomeSectionKind.RESUME }.items.map { it.id },
+        )
+        assertFalse(viewModel.uiState.value.isRefreshing, "还没下拉之前不该显示指示器")
+
+        coEvery { api.resume(any()) } returns ItemsResponseDto(items = listOf(episodeDto("resume-2")))
+
+        viewModel.refresh()
+        // refresh() 同步置位指示器、且不触碰 sections——这一断言发生在挂起协程真正跑起来之前,
+        // 证明"清空"这一步根本不存在,而不只是"清空后又很快补回来,恰好来不及被观察到"。
+        assertTrue(viewModel.uiState.value.isRefreshing, "下拉手势应立即显示刷新指示器")
+        assertEquals(
+            listOf("resume-1"),
+            viewModel.uiState.value.sections.single { it.kind == HomeSectionKind.RESUME }.items.map { it.id },
+            "调用 refresh() 的一瞬间绝不能清空已经显示的内容",
+        )
+
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf("resume-2"),
+            viewModel.uiState.value.sections.single { it.kind == HomeSectionKind.RESUME }.items.map { it.id },
+            "后台网络到达后应该替换成新数据",
+        )
+        assertFalse(viewModel.uiState.value.isRefreshing, "刷新完成后指示器应该消失")
+    }
+
+    @Test
+    fun `下拉刷新失败时保留已加载内容并标记离线_不进错误态`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto(items = listOf(episodeDto("resume-1")))
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
+        stubNoLibraries(api)
+
+        val repository = FakeMediaRepository()
+        val viewModel = newViewModel(api, repository)
+        advanceUntilIdle()
+
+        coEvery { api.resume(any()) } throws IOException("offline")
+
+        viewModel.refresh()
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf("resume-1"),
+            viewModel.uiState.value.sections.single { it.kind == HomeSectionKind.RESUME }.items.map { it.id },
+            "刷新失败绝不能清空已加载内容",
+        )
+        assertTrue(viewModel.uiState.value.isOffline, "刷新失败复用既有的离线横幅")
+        assertNull(viewModel.uiState.value.error, "还有内容可看就不该进错误态,更不该弹窗")
+        assertFalse(viewModel.uiState.value.isRefreshing, "失败也要收起指示器")
+    }
+
+    @Test
+    fun `下拉刷新时三个分区仍并发刷新`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto()
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto()
+        stubNoLibraries(api)
+        val viewModel = newViewModel(api)
+        advanceUntilIdle()
+        val before = currentTime
+
+        coEvery { api.resume(any()) } coAnswers { delay(100); ItemsResponseDto(items = listOf(episodeDto("resume-1"))) }
+        coEvery { api.nextUp(any(), any()) } coAnswers { delay(100); ItemsResponseDto(items = listOf(episodeDto("next-1"))) }
+        coEvery { api.userViews(any()) } coAnswers { delay(100); ItemsResponseDto() }
+
+        viewModel.refresh()
+        advanceUntilIdle()
+
+        assertEquals(100L, currentTime - before, "下拉刷新的三个分区也应并发发起,不是首次加载独有的行为")
+    }
+
+    @Test
+    fun `下拉刷新时某个分区失败不影响其余分区`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto(items = listOf(episodeDto("resume-1")))
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto(items = listOf(episodeDto("next-1")))
+        stubNoLibraries(api)
+        val viewModel = newViewModel(api)
+        advanceUntilIdle()
+
+        coEvery { api.resume(any()) } throws IOException("500")
+
+        viewModel.refresh()
+        advanceUntilIdle()
+
+        val sections = viewModel.uiState.value.sections
+        assertTrue(sections.any { it.kind == HomeSectionKind.NEXT_UP }, "一个分区刷新失败不该拖累另一个")
+        assertEquals(
+            listOf("resume-1"),
+            sections.single { it.kind == HomeSectionKind.RESUME }.items.map { it.id },
+            "失败的分区保留刷新前的内容,而不是消失",
+        )
+    }
 }

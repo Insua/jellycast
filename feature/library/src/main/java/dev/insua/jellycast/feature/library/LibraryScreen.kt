@@ -23,6 +23,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -31,6 +32,9 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -72,6 +76,8 @@ object LibraryScreenTestTags {
     const val SORT_BUTTON = "library_sort_button"
     const val FILTER_UNPLAYED = "library_filter_unplayed"
     const val FILTER_FAVORITES = "library_filter_favorites"
+    const val PULL_REFRESH_CONTAINER = "library_pull_refresh_container"
+    const val PULL_REFRESH_INDICATOR = "library_pull_refresh_indicator"
 
     fun item(id: String) = "library_item_$id"
 }
@@ -101,6 +107,7 @@ fun LibraryScreen(
         onSelectTab = viewModel::selectTab,
         onLoadNextPage = viewModel::loadNextPage,
         onRetry = viewModel::retry,
+        onRefresh = viewModel::refresh,
         onSeriesClick = onSeriesClick,
         onPlay = onPlay,
         onCollectionClick = onCollectionClick,
@@ -124,6 +131,7 @@ fun LibraryScreen(
  * 3. `loadedCount == 0`:空态文案,按 `isSearching` 区分「没有匹配」/「库还没有内容」
  * 4. 都不是:只有 items,没有底部状态行
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LibraryScreenContent(
     uiState: LibraryUiState,
@@ -132,6 +140,7 @@ fun LibraryScreenContent(
     onSelectTab: (LibraryTab) -> Unit,
     onLoadNextPage: () -> Unit,
     onRetry: () -> Unit,
+    onRefresh: () -> Unit = {},
     onSeriesClick: (String) -> Unit,
     onPlay: (MediaItem) -> Unit,
     onCollectionClick: (String) -> Unit = {},
@@ -236,6 +245,33 @@ fun LibraryScreenContent(
             }
         }
 
+        // 下拉刷新(设计文档 §2.3):只包住网格本身,不含搜索框/TabRow/排序筛选行/离线横幅——
+        // 手势应该发生在列表上。[LibraryViewModel.refresh] 只刷新当前可见的浏览 Tab,搜索态下
+        // 是空操作(搜索结果不缓存,见 ViewModel 类 KDoc),指示器也就不会转起来。
+        val pullRefreshState = rememberPullToRefreshState()
+        PullToRefreshBox(
+            isRefreshing = uiState.isRefreshing,
+            onRefresh = onRefresh,
+            state = pullRefreshState,
+            modifier = Modifier
+                .fillMaxSize()
+                .testTag(LibraryScreenTestTags.PULL_REFRESH_CONTAINER),
+            indicator = {
+                // 同 [dev.insua.jellycast.feature.home.HomeScreenContent]:只在真的有事情发生时
+                // (拖拽中 / 回弹动画中 / 真的在刷新)才把指示器组合进树,不让它靠 M3 内部的
+                // alpha/scale 动画常驻树上却"看不见"——那样 `assertIsDisplayed()` 量不出区别,
+                // 与 v3 离线横幅"存在但被挤出可视区"是同一类坑。
+                if (uiState.isRefreshing || pullRefreshState.distanceFraction > 0f || pullRefreshState.isAnimating) {
+                    PullToRefreshDefaults.Indicator(
+                        state = pullRefreshState,
+                        isRefreshing = uiState.isRefreshing,
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .testTag(LibraryScreenTestTags.PULL_REFRESH_INDICATOR),
+                    )
+                }
+            },
+        ) {
         LazyVerticalGrid(
             state = gridState,
             columns = GridCells.Adaptive(minSize = 140.dp),
@@ -311,6 +347,7 @@ fun LibraryScreenContent(
                     }
                 }
             }
+        }
         }
     }
 

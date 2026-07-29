@@ -192,6 +192,11 @@ data class LibraryUiState(
      * 调 [LibraryViewModel.consumeActionError] 清空,不然重组会重复弹出同一条。
      */
     val actionError: String? = null,
+    /**
+     * 下拉刷新手势(设计文档 §2.3)是否正在进行,驱动 `PullToRefreshBox` 的指示器。只覆盖
+     * "当前可见的浏览 Tab"这一份,搜索态下恒为 false(见 [LibraryViewModel.refresh])。
+     */
+    val isRefreshing: Boolean = false,
 ) {
     val isSearching: Boolean get() = query.isNotBlank()
 
@@ -385,6 +390,49 @@ class LibraryViewModel @Inject constructor(
 
     /** 重试当前可见列表的失败页——本质就是"再要一次下一页",因为失败没有推进 loadedCount。 */
     fun retry() = loadNextPage()
+
+    /**
+     * 下拉刷新(设计文档 §2.3)。走的是与 [loadFirstPage] 完全相同的仓储路径
+     * ([repository.pagedBucket] 的"先缓存后网络"编排),**不是另起一套取数逻辑**。
+     *
+     * 与 [loadFirstPage] 唯一的区别:[loadFirstPage] 一上来把 `PageState` 整个重置为空
+     * (服务于排序/筛选切换那种"这其实是另一个 bucket"的场景,见 [reloadBrowseLists]),这里
+     * **不重置**——下拉刷新发生在同一个 bucket 已经有内容展示的时候,重置会先闪成空白再一点点
+     * 补回来,是这个手势明确要求禁止的行为。[updatePageState] 里的 `copy` 本来就是"整份覆盖",
+     * 缓存那次发射(同一个 bucket,几乎必定和屏幕上已经显示的一致)不会产生可见变化,真正的
+     * 新内容随后台网络到达时才会替换进去。
+     *
+     * 只刷新**当前可见的浏览 Tab**——首页三个分区并发是因为它们本来就同屏可见,媒体库一次只
+     * 展示一个 Tab,刷新看不见的另外两个没有意义。搜索态直接忽略:搜索结果不缓存(见类 KDoc),
+     * 没有仓储路径可复用,不为它另起一套取数逻辑,指示器也不会转起来。
+     */
+    fun refresh() {
+        if (_uiState.value.isSearching) return
+        val target = currentTarget()
+        val bucket = bucketFor(target) ?: return
+        firstPageJobs[target]?.cancel()
+        _uiState.update { it.copy(isRefreshing = true) }
+        firstPageJobs[target] = viewModelScope.launch {
+            repository.pagedBucket(bucket) {
+                val response = fetchBrowsePage(target, startIndex = 0)
+                ItemPage(response.items.mapNotNull { it.toMediaItem() }, response.total)
+            }.collect { cached ->
+                updatePageState(target) { state ->
+                    state.copy(
+                        items = cached.data.items,
+                        totalCount = cached.data.total ?: state.totalCount,
+                        isLoading = false,
+                        error = null,
+                    )
+                }
+                listRefreshFailed[target] = cached.refreshFailed
+                _uiState.update { it.copy(isOffline = listRefreshFailed.values.any { it }) }
+            }
+            // 等整条流(缓存 + 网络)都跑完再收起指示器——只等第一次(缓存)发射就收起的话,
+            // 后台网络还没回来,指示器却已经消失,"刷新完成"这个信号就撒谎了。
+            _uiState.update { it.copy(isRefreshing = false) }
+        }
+    }
 
     /** 进入某部剧的详情:加载季列表(按季号排序)并自动选中第一季。 */
     fun openSeries(seriesId: String) {

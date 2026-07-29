@@ -1129,4 +1129,73 @@ class LibraryViewModelTest {
             "剧集详情页里的这一集也要立刻反映乐观更新,不能只改浏览列表",
         )
     }
+
+    // ================= 下拉刷新(设计文档 §2.3)=================
+    // 下拉刷新走与 loadFirstPage() 相同的仓储路径,但不能像它那样先把 PageState 重置为空——
+    // 那种"清空再补"的路径服务于排序/筛选切换(这其实是切到另一个 bucket)和错误态重试
+    // (屏幕上本来就没内容),真的用来刷新已经显示的内容会先闪成空白,是这个手势明确禁止的。
+
+    @Test fun `下拉刷新走既有仓储路径_调用瞬间不清空已显示内容_成功后替换并关闭指示器`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), "Series", any(), any(), 0, 50, any(), null) } returns page("A", "B")
+        val repository = FakeMediaRepository()
+        val vm = newViewModel(api, repository = repository)
+        advanceUntilIdle()
+        assertEquals(listOf("A", "B"), vm.uiState.value.series.items.map { it.name })
+        assertFalse(vm.uiState.value.isRefreshing, "还没下拉之前不该显示指示器")
+
+        coEvery { api.items(any(), "Series", any(), any(), 0, 50, any(), null) } returns page("C", "D")
+
+        vm.refresh()
+        // refresh() 同步置位指示器、且不触碰 series——这一断言发生在挂起协程真正跑起来之前,
+        // 证明"清空"这一步根本不存在,而不只是"清空后很快补回来,恰好来不及被观察到"。
+        assertTrue(vm.uiState.value.isRefreshing, "下拉手势应立即显示刷新指示器")
+        assertEquals(
+            listOf("A", "B"),
+            vm.uiState.value.series.items.map { it.name },
+            "调用 refresh() 的一瞬间绝不能清空已经显示的内容",
+        )
+
+        advanceUntilIdle()
+
+        assertEquals(listOf("C", "D"), vm.uiState.value.series.items.map { it.name }, "后台网络到达后应该替换成新数据")
+        assertFalse(vm.uiState.value.isRefreshing, "刷新完成后指示器应该消失")
+    }
+
+    @Test fun `下拉刷新失败时保留已加载内容并标记离线_不进错误态`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), "Series", any(), any(), 0, 50, any(), null) } returns page("A", "B")
+        val repository = FakeMediaRepository()
+        val vm = newViewModel(api, repository = repository)
+        advanceUntilIdle()
+
+        coEvery { api.items(any(), "Series", any(), any(), 0, 50, any(), null) } throws
+            java.io.IOException("offline")
+
+        vm.refresh()
+        advanceUntilIdle()
+
+        assertEquals(listOf("A", "B"), vm.uiState.value.series.items.map { it.name }, "刷新失败绝不能清空已加载内容")
+        assertNull(vm.uiState.value.series.error, "还有内容可看就不该进错误态,更不该弹窗")
+        assertTrue(vm.uiState.value.isOffline, "刷新失败复用既有的离线横幅")
+        assertFalse(vm.uiState.value.isRefreshing, "失败也要收起指示器")
+    }
+
+    @Test fun `搜索态下下拉刷新不触发额外取数且指示器不转动`() = runTest {
+        val api = mockk<JellyfinApi>(relaxed = true)
+        coEvery { api.items(any(), "Series", any(), any(), 0, 50, any(), null) } returns page("A", "B")
+        val vm = newViewModel(api)
+        advanceUntilIdle()
+
+        vm.onQueryChange("query")
+        advanceUntilIdle() // 让防抖窗口过去,进入搜索态——结果内容本身不重要
+
+        vm.refresh()
+        advanceUntilIdle()
+
+        assertFalse(
+            vm.uiState.value.isRefreshing,
+            "搜索结果不缓存,没有仓储路径可复用,下拉刷新在搜索态下应该是空操作",
+        )
+    }
 }

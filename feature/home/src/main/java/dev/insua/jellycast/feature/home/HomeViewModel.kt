@@ -83,6 +83,11 @@ data class HomeUiState(
     val favorites: List<MediaItem> = emptyList(),
     /** 收藏乐观更新失败时的一次性提示,语义与 [dev.insua.jellycast.feature.library.LibraryUiState.actionError] 一致。 */
     val actionError: String? = null,
+    /**
+     * 下拉刷新手势(设计文档 §2.3)是否正在进行,驱动 `PullToRefreshBox` 的指示器。与 [isLoading]
+     * (冷启动/错误态重试)是两回事——只由用户主动下拉触发,刷新期间屏幕上已有的内容原样保留。
+     */
+    val isRefreshing: Boolean = false,
 )
 
 /**
@@ -188,6 +193,9 @@ class HomeViewModel @Inject constructor(
             _uiState.update { state ->
                 state.copy(
                     isLoading = false,
+                    // 下拉刷新在中途被 load()/retry() 抢占(loadJob?.cancel())的边缘情形下,
+                    // 新的这条流程结束时顺带把指示器收掉,不会卡在"一直转圈"。
+                    isRefreshing = false,
                     // 三个 flat 分区一个都没拿到数据 = 没缓存 + 全部失败,这才是"连不上服务器"。
                     error = if (sectionItems.isEmpty()) OFFLINE_MESSAGE else null,
                 )
@@ -197,6 +205,51 @@ class HomeViewModel @Inject constructor(
 
     /** 重试:与首次加载完全同路,失败后的重试成功同样会把结果写回缓存。 */
     fun retry() = load()
+
+    /**
+     * 下拉刷新(设计文档 §2.3)。走的是与 [load] 完全相同的仓储路径——[repository.bucket] 的
+     * "先缓存后网络"编排,三个分区 + 收藏并发发起、第二阶段"最近添加"按库并发,**不是另起一套
+     * 取数逻辑**。
+     *
+     * 与 [load] 唯一的区别:[load] 一上来先清空 [sectionItems] 等内存态(服务于"错误态点重试,
+     * 从空白开始"这个场景),这里**不清空**——下拉刷新发生在屏幕上已经有内容的时候,先清空
+     * 再一点点补回来,会先闪成空白再恢复,是这个手势明确要求禁止的行为。[applySection]/
+     * [applyFavorites]/[applyRecentlyAddedGroup] 本来就是"整份覆盖对应 key"的写法,缓存那次
+     * 发射(bucket 没变,几乎必定和屏幕上已经显示的一致)不会产生可见的变化,真正的新内容随后台
+     * 网络到达时才会替换进去。
+     *
+     * 刷新失败不弹窗——[recomputeState] 的 `isOffline` OR 语义照旧生效,复用既有的离线横幅,
+     * 不打断浏览(设计文档 §2.3)。
+     */
+    fun refresh() {
+        loadJob?.cancel()
+        _uiState.update { it.copy(isRefreshing = true) }
+        loadJob = viewModelScope.launch {
+            (
+                HomeSectionKind.entries.map { kind ->
+                    launch {
+                        repository.bucket(kind.bucket) { fetchSection(kind) }
+                            .collect { cached -> applySection(kind, cached) }
+                    }
+                } + launch {
+                    repository.bucket(CacheBuckets.HOME_FAVORITES) { fetchFavorites() }
+                        .collect { cached -> applyFavorites(cached) }
+                }
+            ).joinAll()
+
+            sectionItems[HomeSectionKind.LIBRARIES].orEmpty()
+                .map { library ->
+                    launch {
+                        repository.bucket(CacheBuckets.recentlyAddedOf(library.id)) {
+                            fetchRecentlyAdded(library.id)
+                        }.collect { cached -> applyRecentlyAddedGroup(library, cached) }
+                    }
+                }
+                .joinAll()
+
+            _uiState.update { it.copy(isRefreshing = false) }
+        }
+    }
 
     fun selectTab(tab: HomeTab) {
         _uiState.update { it.copy(tab = tab) }
