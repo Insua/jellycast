@@ -137,4 +137,59 @@ class ProgressReportDaoTest {
         val pending = dao.pending(serverId = "s", limit = 2)
         assertEquals(listOf("a", "b"), pending.map { it.itemId })
     }
+
+    /**
+     * 设计文档 §2.3 规则 2:发出 `stop` 之前要把该条目在队列里的所有旧记录清掉,
+     * 否则一条早期失败的心跳会在这一集被标记播完之后被重放回去,把进度写回服务端。
+     *
+     * 这里同时钉死两条边界:**同一服务器的其它条目**不受影响,**其它服务器的同名条目**也不受影响。
+     */
+    @Test
+    fun `deleteForItem只删除该server该条目的记录`() = runBlocking {
+        val dao = db.progressReportDao()
+        dao.enqueue(
+            ProgressReportEntity(
+                serverId = "sA", itemId = "ep1", playSessionId = null,
+                positionMs = 1000, kind = "progress", createdAt = 10
+            )
+        )
+        dao.enqueue(
+            ProgressReportEntity(
+                serverId = "sA", itemId = "ep1", playSessionId = null,
+                positionMs = 2000, kind = "start", createdAt = 20
+            )
+        )
+        dao.enqueue(
+            ProgressReportEntity(
+                serverId = "sA", itemId = "ep2", playSessionId = null,
+                positionMs = 3000, kind = "progress", createdAt = 30
+            )
+        )
+        dao.enqueue(
+            ProgressReportEntity(
+                serverId = "sB", itemId = "ep1", playSessionId = null,
+                positionMs = 4000, kind = "progress", createdAt = 40
+            )
+        )
+
+        dao.deleteForItem(serverId = "sA", itemId = "ep1")
+
+        assertEquals(listOf("ep2"), dao.pending(serverId = "sA").map { it.itemId })
+        assertEquals(listOf("ep1"), dao.pending(serverId = "sB").map { it.itemId })
+    }
+
+    @Test
+    fun `deleteForItem对不存在的条目是无操作`() = runBlocking {
+        val dao = db.progressReportDao()
+        dao.enqueue(
+            ProgressReportEntity(
+                serverId = "s", itemId = "ep1", playSessionId = null,
+                positionMs = 1000, kind = "progress", createdAt = 10
+            )
+        )
+
+        dao.deleteForItem(serverId = "s", itemId = "nobody")
+
+        assertEquals(1, dao.pending(serverId = "s").size)
+    }
 }

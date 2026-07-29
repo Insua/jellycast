@@ -2,8 +2,10 @@ package dev.insua.jellycast.player
 
 import dev.insua.jellycast.model.AudioDeliveryLevel
 import dev.insua.jellycast.model.PlaybackSource
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -300,5 +302,52 @@ class PlaybackProgressCoordinatorTest {
         c.onSourceReady(source("ep12", sessionId = null), startPositionMs = 0L)
 
         assertEquals(listOf("start ep12 null 0"), sink.calls)
+    }
+
+    /**
+     * 🔴 设计文档 §1.2 根因 C。`PlaybackService.onDestroy` 在 `Dispatchers.IO` 上调
+     * [PlaybackProgressCoordinator.onPlaybackStopped],而其余入口(源就绪、10 秒心跳)全在
+     * 主线程 —— `currentItemId` 等可变字段是普通 `var`,两者之间没有 happens-before 边。
+     *
+     * 判别办法:注意 [PlaybackProgressCoordinator.onPlaybackStopped] 清空 `currentItemId`
+     * 这一步在调用 `sink.stop` **之前**、且是同步完成的 —— 让 `sink.stop` 卡住并不能造出心跳
+     * 读到陈旧 `currentItemId` 的窗口(那一步早就跑完了)。真正的窗口在**反方向**:心跳先读到
+     * `currentItemId`、调用 `sink.progress` 时卡在网络往返里(这一步在心跳内部,清空动作还没
+     * 发生),这期间并发的 `onPlaybackStopped` 跑完并把 `stop` 发了出去。等心跳的 `progress`
+     * 终于落地,它就晚于 `stop` 到达服务端 —— 一条本该先到的心跳,把已经收尾的进度又盖了回去。
+     *
+     * 三个入口互斥的话:心跳持有锁、卡在 `sink.progress` 里的这段时间,`onPlaybackStopped` 必须
+     * 排队等锁,`sink.stop` 不可能抢在心跳的 `progress` 前面完成 —— 顺序被钉死成
+     * `start → progress → stop`。没有互斥的话,`onPlaybackStopped` 不等任何人,`stop` 会抢先
+     * 完成,顺序变成 `start → stop → progress`。
+     */
+    @Test fun `心跳的 progress 请求还在飞行时,并发的收尾请求不能抢先完成`() = runTest {
+        val progressGate = CompletableDeferred<Unit>()
+        val sink = object : ProgressSink {
+            val calls = mutableListOf<String>()
+            override suspend fun start(itemId: String, sessionId: String?, positionMs: Long) {
+                calls += "start $itemId"
+            }
+            override suspend fun progress(itemId: String, sessionId: String?, positionMs: Long) {
+                progressGate.await()
+                calls += "progress $itemId"
+            }
+            override suspend fun stop(itemId: String, sessionId: String?, positionMs: Long) {
+                calls += "stop $itemId"
+            }
+            override suspend fun flushPending() = Unit
+        }
+        val c = coordinator(sink) { 2_400_000L }
+        c.onSourceReady(source("ep1"), startPositionMs = 0L)
+
+        launch { c.onTick() }
+        runCurrent()
+        launch { c.onPlaybackStopped() }
+        runCurrent()
+
+        progressGate.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(listOf("start ep1", "progress ep1", "stop ep1"), sink.calls)
     }
 }

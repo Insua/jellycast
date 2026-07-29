@@ -38,6 +38,27 @@ class ProgressReporter(
     private val flushMutex = Mutex()
 
     /**
+     * 设计文档 §2.3 规则 3:**所有**上报(实时 + 重放)串行经过这一把锁,每次只持有
+     * **一个 HTTP 调用**的时长。
+     *
+     * 为什么必须有它:10 秒心跳的 `progress` 是挂起的网络请求,它在飞的时候如果播放正好结束,
+     * `stop` 会另起一条连接 —— 两条请求到达服务端的先后**没有任何保证**。心跳后到,服务端就把
+     * 位置写成了心跳那个值,而已播放的勾不会撤销(设计文档 §1.2 根因 B)。
+     *
+     * 和终结标记叠加之后,两种交错都被覆盖:
+     * - `progress` 先拿到锁 → 它先落地,`stop` 随后落地 → 终态正确
+     * - `stop` 先拿到锁 → `progress` 随后在锁内被终结判定丢弃 → 终态正确
+     *
+     * ⚠️ 终结判定必须**在锁内**做。放在锁外的话,一条已经通过判定、正在等锁的心跳会排到
+     * `stop` 后面发出去 —— 那正是这把锁要防的东西。
+     *
+     * **已知取舍:** 一次实时 `stop` 最多等待一个在飞请求的时长(受 OkHttp 超时上界约束)。
+     * 因此补报重放必须**逐条**获取这把锁,而不是整批持有 —— 队列上限 100 条,整批持有会把
+     * 实时 `stop` 堵在一次满队列重放的后面。
+     */
+    private val reportMutex = Mutex()
+
+    /**
      * 每一行补报记录连续失败了几次(复审 Minor)。
      *
      * 缺陷现场:[flushPending] 只删除**成功**的行,于是一条永远失败的记录(最典型的是条目已在服务端
@@ -54,40 +75,54 @@ class ProgressReporter(
      */
     private val replayFailures = mutableMapOf<Long, Int>()
 
-    override suspend fun start(itemId: String, sessionId: String?, positionMs: Long) {
-        reportOrEnqueue(KIND_START, itemId, sessionId, positionMs) {
-            api.reportStart(
-                PlaybackStartInfoDto(
-                    itemId = itemId,
-                    playSessionId = sessionId,
-                    positionTicks = positionMs * TICKS_PER_MS,
-                )
-            )
-        }
-    }
+    /**
+     * 设计文档 §2.3 规则 1:一个条目的上报生命周期以 `stop` 终结。见 [FinishedItemRegistry]
+     * 的类注释 —— 那里写着为什么服务端逼得客户端必须自己记这件事。
+     */
+    private val finishedItems = FinishedItemRegistry()
 
-    override suspend fun progress(itemId: String, sessionId: String?, positionMs: Long) {
-        reportOrEnqueue(KIND_PROGRESS, itemId, sessionId, positionMs) {
-            api.reportProgress(
-                PlaybackProgressInfoDto(
-                    itemId = itemId,
-                    playSessionId = sessionId,
-                    positionTicks = positionMs * TICKS_PER_MS,
-                )
-            )
-        }
-    }
+    override suspend fun start(itemId: String, sessionId: String?, positionMs: Long) =
+        dispatch(KIND_START, itemId, sessionId, positionMs)
 
-    override suspend fun stop(itemId: String, sessionId: String?, positionMs: Long) {
-        reportOrEnqueue(KIND_STOP, itemId, sessionId, positionMs) {
-            api.reportStop(
-                PlaybackStopInfoDto(
-                    itemId = itemId,
-                    playSessionId = sessionId,
-                    positionTicks = positionMs * TICKS_PER_MS,
-                )
-            )
+    override suspend fun progress(itemId: String, sessionId: String?, positionMs: Long) =
+        dispatch(KIND_PROGRESS, itemId, sessionId, positionMs)
+
+    override suspend fun stop(itemId: String, sessionId: String?, positionMs: Long) =
+        dispatch(KIND_STOP, itemId, sessionId, positionMs)
+
+    /**
+     * 一次实时上报:先按生命周期规则决定要不要发,再发。
+     *
+     * 三个 `when` 分支就是设计文档 §2.3 的规则 1 和规则 2:
+     * - `start` 清除终结标记(重看语义,和服务端一致)
+     * - `stop` 打上终结标记,并清空该条目在补报队列里的所有旧记录
+     * - `progress` 遇到已终结的条目直接丢弃 —— 不发、不入队
+     */
+    private suspend fun dispatch(
+        kind: String,
+        itemId: String,
+        sessionId: String?,
+        positionMs: Long,
+    ) = reportMutex.withLock {
+        when (kind) {
+            KIND_START -> finishedItems.clearFinished(itemId)
+            KIND_STOP -> {
+                finishedItems.markFinished(itemId)
+                // 铁律:上报路径上的任何失败都不得打断播放,但 CancellationException 必须重抛
+                // ——`runCatching` 会连它也吞掉,导致取消信号在这里被吸收、协程无法正常unwind。
+                // 清队列失败(数据库损坏/迁移失败)本身不例外:顶多是漏掉一条旧记录,而重放侧
+                // 还有一层同样的判断兜着。
+                try {
+                    dao.deleteForItem(serverId, itemId)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    // 静默:见上方注释。
+                }
+            }
+            KIND_PROGRESS -> if (finishedItems.isFinished(itemId)) return@withLock
         }
+        reportOrEnqueue(kind, itemId, sessionId, positionMs)
     }
 
     /**
@@ -112,10 +147,10 @@ class ProgressReporter(
             return
         }
 
-        /** 成功补报的 + 重试次数用尽被放弃的 —— 两者都要从队列里删掉。 */
+        /** 成功补报的 + 主动跳过的 + 重试次数用尽被放弃的 —— 三者都要从队列里删掉。 */
         val settledIds = mutableListOf<Long>()
         for (entry in pending) {
-            if (runCatching { replay(entry) }.isSuccess) {
+            if (runCatching { reportMutex.withLock { replay(entry) } }.isSuccess) {
                 replayFailures.remove(entry.id)
                 settledIds += entry.id
                 continue
@@ -133,19 +168,20 @@ class ProgressReporter(
         replayFailures.keys.retainAll(pending.mapTo(mutableSetOf()) { it.id })
     }
 
+    /**
+     * 重放一条补报记录。
+     *
+     * 🔴 设计文档 §1.2 根因 A:补报重放是「每次源就绪」都会跑的,而自动连播的顺序恰好是
+     * 「上一集 stop → 推进 → 下一集就绪 → flushPending」—— 队列里那条上一集的旧心跳正好在
+     * 它已经被服务端标记播完之后被重放回去,把进度写了回去。所以已终结条目的旧 `start`/
+     * `progress` 一律作废(它们必然早于那条 `stop`);唯独 `stop` 要放行,它是这一集真正的收尾。
+     *
+     * 跳过 = 正常返回 = 被 [flushPendingLocked] 当作已了结从队列里删掉,这是有意的:
+     * 这条记录已经没有任何意义,留着只会让后面每一次 seek 都白白重试一遍。
+     */
     private suspend fun replay(entry: ProgressReportEntity) {
-        when (entry.kind) {
-            KIND_START -> api.reportStart(
-                PlaybackStartInfoDto(entry.itemId, entry.playSessionId, entry.positionMs * TICKS_PER_MS)
-            )
-            KIND_PROGRESS -> api.reportProgress(
-                PlaybackProgressInfoDto(entry.itemId, entry.playSessionId, entry.positionMs * TICKS_PER_MS)
-            )
-            KIND_STOP -> api.reportStop(
-                PlaybackStopInfoDto(entry.itemId, entry.playSessionId, entry.positionMs * TICKS_PER_MS)
-            )
-            else -> Unit // 未知 kind:静默丢弃,不阻塞其余记录的补报
-        }
+        if (entry.kind != KIND_STOP && finishedItems.isFinished(entry.itemId)) return
+        send(entry.kind, entry.itemId, entry.playSessionId, entry.positionMs)
     }
 
     private suspend fun reportOrEnqueue(
@@ -153,10 +189,9 @@ class ProgressReporter(
         itemId: String,
         sessionId: String?,
         positionMs: Long,
-        call: suspend () -> Unit,
     ) {
         try {
-            call()
+            send(kind, itemId, sessionId, positionMs)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -170,6 +205,20 @@ class ProgressReporter(
                     createdAt = System.currentTimeMillis(),
                 )
             )
+        }
+    }
+
+    /**
+     * 实时上报和补报重放唯一的出口。ticks 换算(项目铁律)只在这一处发生:
+     * `PositionTicks = positionMs * 10_000`。
+     */
+    private suspend fun send(kind: String, itemId: String, sessionId: String?, positionMs: Long) {
+        val ticks = positionMs * TICKS_PER_MS
+        when (kind) {
+            KIND_START -> api.reportStart(PlaybackStartInfoDto(itemId, sessionId, ticks))
+            KIND_PROGRESS -> api.reportProgress(PlaybackProgressInfoDto(itemId, sessionId, ticks))
+            KIND_STOP -> api.reportStop(PlaybackStopInfoDto(itemId, sessionId, ticks))
+            else -> Unit // 未知 kind:静默丢弃,不阻塞其余记录的补报
         }
     }
 
