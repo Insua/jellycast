@@ -31,6 +31,10 @@ dependencies {
     implementation(project(":core:network"))
     implementation(project(":core:datastore"))
     implementation(project(":core:designsystem"))
+    // 删除服务器时要清掉该服务器的缓存条目(CachedItemDao.clearServer)——只用接口,不摸
+    // RoomDatabase 基类,所以和 :core:network 一样是 implementation,不需要额外声明
+    // room-runtime(参见 :core:network/build.gradle.kts 同一处注释)。
+    implementation(project(":core:database"))
 
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)
