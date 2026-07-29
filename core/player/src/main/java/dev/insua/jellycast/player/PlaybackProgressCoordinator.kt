@@ -3,6 +3,8 @@ package dev.insua.jellycast.player
 import dev.insua.jellycast.model.PlaybackSource
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * 进度上报的窄接口。生产实现是 [ProgressReporter](它同时负责失败入队与补报),这里抽出接口只为了
@@ -102,6 +104,21 @@ class PlaybackProgressCoordinator(
     private val sink: ProgressSink,
     private val absolutePositionMs: () -> Long,
 ) {
+    /**
+     * 设计文档 §1.2 根因 C / §2.5:三个入口互斥。
+     *
+     * 缺陷现场:`PlaybackService.onDestroy` 在 `Dispatchers.IO` 上调 [onPlaybackStopped],
+     * 其余入口(源就绪、10 秒心跳)全在主线程,而下面这三个字段是普通 `var` —— 两者之间
+     * 没有 happens-before 边,IO 线程可能读到陈旧值。更要紧的是三个入口各自的方法体里都
+     * 包含一次挂起的网络请求(`sink.start` / `progress` / `stop`),互相之间没有互斥的话,
+     * 两个入口的请求可能并发在飞行、以任意顺序落地服务端 —— 心跳的 `progress` 完全可能晚于
+     * 收尾的 `stop` 到达,把已经收尾的进度又盖了回去,这正是把进度写回已播完条目的另一条路径。
+     *
+     * 这把锁同时解决可见性和这个乱序窗口。代价:心跳可能要等一次源就绪或收尾请求的网络往返
+     * (受 OkHttp 超时上界约束)。心跳晚几秒没有任何用户可见后果,而乱序落地的那条 `progress` 有。
+     */
+    private val mutex = Mutex()
+
     private var currentItemId: String? = null
     private var currentSessionId: String? = null
     private var lastKnownPositionMs: Long = 0L
@@ -114,13 +131,13 @@ class PlaybackProgressCoordinator(
         source: PlaybackSource,
         startPositionMs: Long,
         trigger: PlaybackReadyTrigger = PlaybackReadyTrigger.NEW_PLAYBACK,
-    ) {
+    ) = mutex.withLock {
         // 复审 Finding 2 的不变量:**只有真的开始播放才上报**。状态重放背后没有任何音频在响
         // (播放器早已 stop() + clearMediaItems(),见 PlaybackReadyTrigger.STATE_REPLAY),所以这里
         // 一个字节都不发,也刻意**不**登记 currentItemId —— 否则紧接着的心跳会给一个没在播的条目
         // 发 progress,而之后用户真的点播这一集时又会退化成 progress、拿不到 start。
         // 也不调 flushPending():重放不是一次新的 resolve,它不证明服务器此刻可达。
-        if (trigger == PlaybackReadyTrigger.STATE_REPLAY) return
+        if (trigger == PlaybackReadyTrigger.STATE_REPLAY) return@withLock
 
         val previousItemId = currentItemId
         val previousSessionId = currentSessionId
@@ -159,8 +176,8 @@ class PlaybackProgressCoordinator(
         }
     }
 
-    suspend fun onTick() {
-        val itemId = currentItemId ?: return
+    suspend fun onTick() = mutex.withLock {
+        val itemId = currentItemId ?: return@withLock
         val positionMs = absolutePositionMs()
         lastKnownPositionMs = positionMs
         sink.progress(itemId, currentSessionId, positionMs)
@@ -170,9 +187,13 @@ class PlaybackProgressCoordinator(
      * [positionMs] 默认取实时绝对位置。`Service.onDestroy` 必须显式传值:那里读位置只能在主线程
      * 完成(ExoPlayer 的 application thread 限制),而 stop 请求要在一个不会被立即取消的 scope 上
      * 发出去,两件事不在同一个线程上。
+     *
+     * 默认参数 `absolutePositionMs()` 在锁外求值 —— 这是对的:读播放器位置必须发生在调用方自己的
+     * 线程上(ExoPlayer 的 application thread 约束),`PlaybackService.onDestroy` 正是先在主线程
+     * 取好值再显式传进来,不依赖这里的默认参数。
      */
-    suspend fun onPlaybackStopped(positionMs: Long = absolutePositionMs()) {
-        val itemId = currentItemId ?: return
+    suspend fun onPlaybackStopped(positionMs: Long = absolutePositionMs()) = mutex.withLock {
+        val itemId = currentItemId ?: return@withLock
         val sessionId = currentSessionId
         currentItemId = null
         currentSessionId = null
