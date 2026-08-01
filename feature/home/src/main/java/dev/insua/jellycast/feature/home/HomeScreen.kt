@@ -33,6 +33,7 @@ import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -45,6 +46,9 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import dev.insua.jellycast.designsystem.ActionMessageHost
 import dev.insua.jellycast.designsystem.OfflineBanner
 import dev.insua.jellycast.designsystem.PosterCard
@@ -52,6 +56,7 @@ import dev.insua.jellycast.designsystem.PosterCardWide
 import dev.insua.jellycast.model.MediaItem
 import dev.insua.jellycast.model.displaySubtitle
 import dev.insua.jellycast.network.mapper.posterUrl
+import kotlinx.coroutines.delay
 
 /** 定位节点用的测试标签,不依赖文案(文案会改)。 */
 object HomeScreenTestTags {
@@ -66,6 +71,9 @@ object HomeScreenTestTags {
 
     fun item(id: String) = "home_item_$id"
 }
+
+/** 见 [HomeScreen] 的 `liveRefreshIntervalMs`。 */
+internal const val LIVE_REFRESH_INTERVAL_MS = 60_000L
 
 /**
  * "在听"首页。自上而下:继续收听 / 下一集 / 我的媒体 / 最近添加(按库分组)——下一集是追剧
@@ -102,8 +110,18 @@ fun HomeScreen(
     onAccountClick: () -> Unit = {},
     baseUrl: String = "",
     viewModel: HomeViewModel = hiltViewModel(),
+    /**
+     * 静默刷新间隔(设计文档 §3.2)。60 秒的取舍:这两个接口各自最多 20 条,单次开销很小;
+     * 60 秒意味着"在别处听完一集"最迟一分钟反映到首页。更短在公网场景下是白耗流量。
+     * 做成参数只为了让 UI 测试能传一个很短的值,生产调用点一律用默认值。
+     */
+    liveRefreshIntervalMs: Long = LIVE_REFRESH_INTERVAL_MS,
 ) {
     val uiState by viewModel.uiState.collectAsState()
+
+    // 设计文档 §3:首页可见期间才刷新——见 [HomeLiveRefreshEffect] 的 KDoc。
+    HomeLiveRefreshEffect(intervalMs = liveRefreshIntervalMs, onRefresh = viewModel::refreshLive)
+
     HomeScreenContent(
         uiState = uiState,
         onItemClick = onItemClick,
@@ -117,6 +135,32 @@ fun HomeScreen(
         onToggleFavorite = viewModel::toggleFavorite,
         onActionErrorShown = viewModel::consumeActionError,
     )
+}
+
+/**
+ * 设计文档 §3:首页可见期间才刷新。
+ *
+ * - `repeatOnLifecycle(STARTED)` 让这段协程**在首页变为可见时启动、不可见时取消** ——
+ *   离开首页或退到后台连协程都不存在,而不是"存在但不发请求"。后台定时打接口是耗电耗流量
+ *   的典型反模式。
+ * - 进入循环先刷一次,再按间隔重复:第一次覆盖「切回前台 / 从播放页返回首页」,
+ *   之后的覆盖「停在首页不动,而在别的设备上继续听」。
+ *
+ * 单独抽出来(而不是内联进 [HomeScreen])是为了让 [HomeLiveRefreshTest] 能用一个只计数的假
+ * [onRefresh] 驱动来测试"什么时候该刷",不需要真的构造 [HomeViewModel] 及其 Hilt/网络依赖——
+ * "刷什么"已经由 [HomeViewModel] 自己的单测([refreshLive])覆盖了。
+ */
+@Composable
+internal fun HomeLiveRefreshEffect(intervalMs: Long, onRefresh: () -> Unit) {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(lifecycleOwner, intervalMs) {
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                onRefresh()
+                delay(intervalMs)
+            }
+        }
+    }
 }
 
 /**
