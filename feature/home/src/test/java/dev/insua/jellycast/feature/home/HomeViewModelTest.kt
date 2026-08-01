@@ -725,4 +725,207 @@ class HomeViewModelTest {
             "失败的分区保留刷新前的内容,而不是消失",
         )
     }
+
+    // ---- 设计文档 §3/§4/§5:静默定时刷新 ----
+
+    /** 「一切都会成功」的默认 api 桩,静默刷新这组用例不关心具体接口行为,只要有内容可刷。 */
+    private fun happyApi(): JellyfinApi {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto(items = listOf(episodeDto("ep1")))
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto(items = listOf(episodeDto("next-1")))
+        stubNoLibraries(api)
+        stubFavorites(api, ItemsResponseDto())
+        return api
+    }
+
+    private fun createViewModel(repository: FakeMediaRepository) = newViewModel(happyApi(), repository)
+
+    /**
+     * 只刷「继续收听」和「下一集」。库列表和「最近添加」变化极慢,而后者是**按库各发一个请求**,
+     * 每分钟重拉一遍是纯浪费流量 —— 这条用例把范围钉死。
+     */
+    @Test fun `静默刷新只请求继续收听和下一集两个 bucket`() = runTest(testDispatcher) {
+        val repository = FakeMediaRepository()
+        val viewModel = createViewModel(repository)
+        advanceUntilIdle()
+        repository.requestedBuckets.clear()
+
+        viewModel.refreshLive()
+        advanceUntilIdle()
+
+        assertEquals(
+            setOf(CacheBuckets.HOME_RESUME, CacheBuckets.HOME_NEXT_UP),
+            repository.requestedBuckets.toSet(),
+        )
+    }
+
+    /** 静默 = 不转下拉刷新的圈。 */
+    @Test fun `静默刷新不置位 isRefreshing`() = runTest(testDispatcher) {
+        val repository = FakeMediaRepository()
+        val viewModel = createViewModel(repository)
+        advanceUntilIdle()
+
+        viewModel.refreshLive()
+        advanceUntilIdle()
+
+        assertFalse(viewModel.uiState.value.isRefreshing, "静默刷新不该驱动下拉刷新指示器")
+    }
+
+    /**
+     * 静默刷新发生在屏幕上已经有内容的时候。先清空再补回来会让首页闪一下白 ——
+     * 这正是 v5 给下拉刷新定下的禁令,静默刷新更不能违反。
+     *
+     * 「继续收听」和「下一集」这次故意制造出真实的时序差(前者本地有缓存、瞬间可读;后者缓存被
+     * evict、只能等一次真正跨越协程调度点的网络请求):如果实现在两个分区各自的取数协程真正跑
+     * 起来之前就先把 [HomeViewModel] 内部的整份状态清空,「继续收听」先跑完、状态被重新拼出来的
+     * 那一刻,「下一集」还没来得及把自己的旧值放回去——这一刻的 `sections` 就会比 `before` 少一块,
+     * 断言才有机会抓到。如果两个 bucket 都读同一个立刻返回的内存缓存,清空和补回会在同一次
+     * `runCurrent()` 批次里被谁先谁后的巧合悄悄抹平,断言永远看不到"曾经缺过一块"的中间态。
+     */
+    @Test fun `静默刷新期间已有内容不被清空`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto(items = listOf(episodeDto("ep1")))
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto(items = listOf(episodeDto("next-1")))
+        stubNoLibraries(api)
+        stubFavorites(api, ItemsResponseDto())
+        val repository = FakeMediaRepository()
+        val viewModel = newViewModel(api, repository)
+        advanceUntilIdle()
+        val before = viewModel.uiState.value.sections
+        assertEquals(
+            setOf(HomeSectionKind.RESUME, HomeSectionKind.NEXT_UP),
+            before.map { it.kind }.toSet(),
+            "前提条件:两个分区这次都得先加载成功,才谈得上'已有内容'",
+        )
+
+        // 「下一集」这次没有本地缓存可读,只能等网络,而网络这次刻意调得比「继续收听」慢——
+        // 制造出两者真正交错到达的时序。
+        repository.evictCache(CacheBuckets.HOME_NEXT_UP)
+        coEvery { api.nextUp(any(), any()) } coAnswers { delay(100); ItemsResponseDto(items = listOf(episodeDto("next-1"))) }
+
+        viewModel.refreshLive()
+        runCurrent() // 「继续收听」这次没有延迟,会先跑完并重新拼一次 UI 状态;
+        // 「下一集」这次卡在网络请求上,还没来得及把自己的值放回去。
+        assertEquals(before, viewModel.uiState.value.sections, "静默刷新不得清空已有内容")
+
+        advanceUntilIdle()
+    }
+
+    /**
+     * 失败不进错误态 —— 屏幕上还有旧内容可看,不该被一整页错误盖住。
+     *
+     * ## 这条用例实际钉住的是什么
+     *
+     * 能抓住"确实会跑到"的错误写入:比如不管三七二十一就 `_uiState.update { it.copy(error = ...) }`,
+     * 或者照着 [sectionRefreshFailed] 判断"这次静默刷新自己的 bucket 失败了就算错误"——这两种都是
+     * 有人会真的这么写的疏忽,实测过(见 task-1-report.md「Finding 2」)确实会让这条用例变红。
+     *
+     * ## 这条用例钉不住什么,以及为什么
+     *
+     * 钉不住"把 [load] 收尾那句 `error = if (sectionItems.isEmpty()) OFFLINE_MESSAGE else null`
+     * 原样复制进 [HomeViewModel.refreshLive]"这一种具体写法——**不是用例本身设计得不够狠**,是这行
+     * 条件在这里天生判不成真:[refreshLive] 只可能在 [HomeViewModel.load] 已经成功过一次之后才有
+     * 意义地被调用(这正是它存在的理由——已经有内容在屏幕上,才谈得上"静默"刷新),
+     * 而只要 [load] 成功过一次,`sectionItems` 就至少留着「我的媒体」那个 key(哪怕值是空列表),
+     * `sectionItems.isEmpty()` 永远评不出 `true`。想让这一行代码真的写错东西,得先有另一处 bug
+     * 把 `sectionItems` 清空——那正是"静默刷新期间已有内容不被清空"这条用例的职责,不该也不需要
+     * 在这里重复设防。所以这条用例对这一种具体的错误写法没有判别力,是已知的、有意接受的盲区,
+     * 不是没测出来。
+     */
+    @Test fun `静默刷新失败不产生错误态`() = runTest(testDispatcher) {
+        val repository = FakeMediaRepository()
+        val viewModel = createViewModel(repository)
+        advanceUntilIdle()
+        repository.failBucket(CacheBuckets.HOME_RESUME)
+
+        viewModel.refreshLive()
+        advanceUntilIdle()
+
+        assertNull(viewModel.uiState.value.error, "静默刷新失败不该把首页打成错误态")
+    }
+
+    /**
+     * 设计文档 §5:用户主动发起的刷新优先级更高。同一个 bucket 被两条流程同时写,
+     * 只会产生无意义的重复请求。
+     */
+    @Test fun `有下拉刷新在飞时静默刷新跳过且不取消它`() = runTest(testDispatcher) {
+        val repository = FakeMediaRepository()
+        val viewModel = createViewModel(repository)
+        advanceUntilIdle()
+        repository.requestedBuckets.clear()
+
+        viewModel.refresh()          // 用户下拉,请求在飞
+        viewModel.refreshLive()      // 同一时刻的定时器
+        advanceUntilIdle()
+
+        // 下拉刷新自己要刷的 bucket 一个都不能少 —— 说明它没被取消。
+        assertTrue(
+            repository.requestedBuckets.containsAll(
+                listOf(CacheBuckets.HOME_RESUME, CacheBuckets.HOME_NEXT_UP, CacheBuckets.HOME_LIBRARIES)
+            ),
+            "静默刷新不得取消正在进行的下拉刷新",
+        )
+        // 两个 live bucket 各自只被请求一次 —— 说明静默刷新确实跳过了,没有叠加。
+        assertEquals(
+            1,
+            repository.requestedBuckets.count { it == CacheBuckets.HOME_RESUME },
+            "静默刷新应当在下拉刷新在飞时跳过,不重复请求",
+        )
+    }
+
+    /**
+     * 设计文档 §5:反过来的方向——[有下拉刷新在飞时静默刷新跳过且不取消它] 已经钉住了
+     * "静默刷新不能打断用户主动发起的刷新",这条钉住对称的另一半:静默刷新的定时 tick 和用户
+     * 下拉前后脚发生时,用户主动发起的这次应该反过来取消掉还在飞的静默刷新,而不是任其和自己
+     * 一起跑——同一个 bucket 被两条流程各发一遍,较旧的那次响应还可能后到、把用户刚拉到的新
+     * 内容盖回去。
+     *
+     * 用 `nextUpCompletions` 而不是 `requestedBuckets` 计数:[refresh] 自己那一轮必然会请求
+     * 一次「下一集」,所以请求次数天然是 2,请求次数测不出"是不是被取消了"。真正有判别力的是
+     * "请求有没有跑完"——静默刷新那次的「下一集」请求卡在 100ms 的网络延迟上,如果 [refresh]
+     * 取消了 [HomeViewModel] 内部的静默刷新 job,这次挂起中的请求会被 [kotlinx.coroutines.CancellationException]
+     * 打断,永远不会执行到 `nextUpCompletions++` 那一行;没取消的话,两次调用最终都会跑完。
+     */
+    @Test fun `静默刷新在飞时下拉刷新会取消它`() = runTest(testDispatcher) {
+        var nextUpCompletions = 0
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto(items = listOf(episodeDto("ep1")))
+        coEvery { api.nextUp(any(), any()) } coAnswers {
+            delay(100)
+            nextUpCompletions++
+            ItemsResponseDto(items = listOf(episodeDto("next-1")))
+        }
+        stubNoLibraries(api)
+        stubFavorites(api, ItemsResponseDto())
+        val repository = FakeMediaRepository()
+        val viewModel = newViewModel(api, repository)
+        advanceUntilIdle()
+        nextUpCompletions = 0 // 只关心接下来这一轮,清掉冷启动 load() 那次的计数
+
+        viewModel.refreshLive() // 静默刷新起飞,「下一集」这次卡在 100ms 的网络延迟上还没跑完
+        runCurrent() // 推进到「下一集」进入 delay(100) 挂起为止,不把虚拟时钟往前拨
+
+        viewModel.refresh() // 用户此时下拉刷新——应当让还在飞的静默刷新让路
+        advanceUntilIdle()
+
+        assertEquals(
+            1,
+            nextUpCompletions,
+            "静默刷新在飞时下拉刷新应当取消它,不能让两条请求都跑完",
+        )
+    }
+
+    /** 这条是需求本身:在别处听过之后回到首页,位置要变成新的。 */
+    @Test fun `静默刷新把服务端的新位置反映到界面`() = runTest(testDispatcher) {
+        val repository = FakeMediaRepository()
+        val viewModel = createViewModel(repository)
+        advanceUntilIdle()
+
+        repository.setResumePositionMs(itemId = "ep1", positionMs = 1_800_000L)
+        viewModel.refreshLive()
+        advanceUntilIdle()
+
+        val resume = viewModel.uiState.value.sections.first { it.kind == HomeSectionKind.RESUME }
+        assertEquals(1_800_000L, resume.items.first { it.id == "ep1" }.resumePositionMs)
+    }
 }

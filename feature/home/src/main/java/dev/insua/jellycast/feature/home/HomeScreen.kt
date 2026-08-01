@@ -33,6 +33,7 @@ import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -45,6 +46,9 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import dev.insua.jellycast.designsystem.ActionMessageHost
 import dev.insua.jellycast.designsystem.OfflineBanner
 import dev.insua.jellycast.designsystem.PosterCard
@@ -52,6 +56,7 @@ import dev.insua.jellycast.designsystem.PosterCardWide
 import dev.insua.jellycast.model.MediaItem
 import dev.insua.jellycast.model.displaySubtitle
 import dev.insua.jellycast.network.mapper.posterUrl
+import kotlinx.coroutines.delay
 
 /** 定位节点用的测试标签,不依赖文案(文案会改)。 */
 object HomeScreenTestTags {
@@ -66,6 +71,9 @@ object HomeScreenTestTags {
 
     fun item(id: String) = "home_item_$id"
 }
+
+/** 见 [HomeScreen] 的 `liveRefreshIntervalMs`。 */
+internal const val LIVE_REFRESH_INTERVAL_MS = 60_000L
 
 /**
  * "在听"首页。自上而下:继续收听 / 下一集 / 我的媒体 / 最近添加(按库分组)——下一集是追剧
@@ -102,8 +110,36 @@ fun HomeScreen(
     onAccountClick: () -> Unit = {},
     baseUrl: String = "",
     viewModel: HomeViewModel = hiltViewModel(),
+    /**
+     * 静默刷新间隔(设计文档 §3.2)。60 秒的取舍:这两个接口各自最多 20 条,单次开销很小;
+     * 60 秒意味着"在别处听完一集"最迟一分钟反映到首页。更短在公网场景下是白耗流量。
+     * 做成参数只为了让 UI 测试能传一个很短的值,生产调用点一律用默认值。
+     */
+    liveRefreshIntervalMs: Long = LIVE_REFRESH_INTERVAL_MS,
+    /**
+     * 全屏播放页(`JellyCastNavHost` 里的 `ModalBottomSheet`,见其 KDoc)是否正展开、盖住首页。
+     *
+     * 播放页**不是**一个 `NavHost` 目的地,是浮在 `Scaffold` 之上的 bottom sheet——展开/收起
+     * 完全不产生任何 [androidx.lifecycle.Lifecycle] 转换,首页所在的 `NavBackStackEntry` 全程
+     * 停在 STARTED。单靠 [HomeLiveRefreshEffect] 原来那套"生命周期驱动"因此会两头出错:
+     * 用户从播放页收起回到首页时不会补一次刷新(明明是"切回首页"这个场景本身),
+     * 而全屏听着播放页的这几个小时里定时器完全停不下来(明明首页一个像素都看不见)。
+     * 这个参数就是补上那条生命周期看不见的"可见性"信号——调用方(导航层)按
+     * `playerExpanded` 原样传进来即可。默认 `false`:不传时行为与"播放页从不遮挡首页"
+     * 完全一致,保持旧调用点不变。
+     */
+    isPlayerExpanded: Boolean = false,
 ) {
     val uiState by viewModel.uiState.collectAsState()
+
+    // 设计文档 §3:首页可见期间才刷新——见 [HomeLiveRefreshEffect] 的 KDoc。播放页展开时
+    // 首页被完全盖住,同样算"不可见"。
+    HomeLiveRefreshEffect(
+        intervalMs = liveRefreshIntervalMs,
+        onRefresh = viewModel::refreshLive,
+        isHomeVisible = !isPlayerExpanded,
+    )
+
     HomeScreenContent(
         uiState = uiState,
         onItemClick = onItemClick,
@@ -117,6 +153,42 @@ fun HomeScreen(
         onToggleFavorite = viewModel::toggleFavorite,
         onActionErrorShown = viewModel::consumeActionError,
     )
+}
+
+/**
+ * 设计文档 §3:首页可见期间才刷新。
+ *
+ * - `repeatOnLifecycle(STARTED)` 让这段协程**在首页变为可见时启动、不可见时取消** ——
+ *   离开首页或退到后台连协程都不存在,而不是"存在但不发请求"。后台定时打接口是耗电耗流量
+ *   的典型反模式。
+ * - 进入循环先刷一次,再按间隔重复:第一次覆盖「切回前台 / 从播放页返回首页」,
+ *   之后的覆盖「停在首页不动,而在别的设备上继续听」。
+ *
+ * [isHomeVisible] 补上 [Lifecycle] 看不见的那一层可见性:全屏播放页是浮在 `Scaffold` 之上的
+ * `ModalBottomSheet`,不是 `NavHost` 目的地,展开/收起完全不产生 Lifecycle 转换——首页
+ * 所在的 `NavBackStackEntry` 全程停在 STARTED。单靠上面这套生命周期驱动会两头出错:播放页
+ * 收起回首页时不会补一次刷新,播放页整段展开期间定时器也停不下来。[isHomeVisible] 变为
+ * `false` 时整段效果(连同 `repeatOnLifecycle` 里的循环)随 `LaunchedEffect` 的 key 变化一起
+ * 取消,变回 `true` 时重新进入 `repeatOnLifecycle` 块、立刻先刷一次——与"首页从不可见变为
+ * 可见"是同一段代码路径,不需要另外维护一次"收起后补刷"的逻辑。默认 `true`:不传时与旧行为
+ * (完全由 Lifecycle 决定)一致。
+ *
+ * 单独抽出来(而不是内联进 [HomeScreen])是为了让 [HomeLiveRefreshTest] 能用一个只计数的假
+ * [onRefresh] 驱动来测试"什么时候该刷",不需要真的构造 [HomeViewModel] 及其 Hilt/网络依赖——
+ * "刷什么"已经由 [HomeViewModel] 自己的单测([refreshLive])覆盖了。
+ */
+@Composable
+internal fun HomeLiveRefreshEffect(intervalMs: Long, onRefresh: () -> Unit, isHomeVisible: Boolean = true) {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(lifecycleOwner, intervalMs, isHomeVisible) {
+        if (!isHomeVisible) return@LaunchedEffect
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                onRefresh()
+                delay(intervalMs)
+            }
+        }
+    }
 }
 
 /**

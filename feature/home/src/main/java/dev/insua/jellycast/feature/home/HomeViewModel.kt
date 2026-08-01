@@ -29,6 +29,12 @@ private const val RECENTLY_ADDED_LIMIT = 20
  *  不能对着 8744 集的库无限拉全量(同 [RECENTLY_ADDED_LIMIT] 的取舍)。 */
 private const val FAVORITES_LIMIT = 200
 
+/**
+ * 参与静默刷新的分区(设计文档 §2)。刻意**不含** [HomeSectionKind.LIBRARIES] ——
+ * 库列表几乎不变,而它还会带出"最近添加"的按库 N 个请求。
+ */
+private val LIVE_REFRESH_SECTIONS = listOf(HomeSectionKind.RESUME, HomeSectionKind.NEXT_UP)
+
 enum class HomeSectionKind { RESUME, NEXT_UP, LIBRARIES }
 
 /**
@@ -148,6 +154,13 @@ class HomeViewModel @Inject constructor(
 
     private var loadJob: Job? = null
 
+    /**
+     * 静默刷新用自己的 job,和 [loadJob](冷启动 / 重试 / 下拉刷新共用)分开(设计文档 §5)。
+     *
+     * 合用一个 job 会让定时器把用户主动发起的刷新取消掉 —— 那是优先级完全反了。
+     */
+    private var liveRefreshJob: Job? = null
+
     init {
         load()
     }
@@ -220,9 +233,16 @@ class HomeViewModel @Inject constructor(
      *
      * 刷新失败不弹窗——[recomputeState] 的 `isOffline` OR 语义照旧生效,复用既有的离线横幅,
      * 不打断浏览(设计文档 §2.3)。
+     *
+     * 也顺带取消 [liveRefreshJob]:[refreshLive] 一侧已经有"冷启动/下拉刷新在飞时跳过"这条
+     * 让路规则(见其 KDoc),但反过来的方向此前没有对称地设防——静默刷新的定时 tick 和用户
+     * 主动下拉可能前后脚发生,两条协程会一起把同一个 bucket 各发一遍请求,较旧的那次响应还可能
+     * 后到、把用户刚拉到的新内容覆盖回去。用户主动发起的刷新优先级更高,取消掉静默刷新那条,
+     * 而不是任其与自己并跑。
      */
     fun refresh() {
         loadJob?.cancel()
+        liveRefreshJob?.cancel()
         _uiState.update { it.copy(isRefreshing = true) }
         loadJob = viewModelScope.launch {
             (
@@ -248,6 +268,47 @@ class HomeViewModel @Inject constructor(
                 .joinAll()
 
             _uiState.update { it.copy(isRefreshing = false) }
+        }
+    }
+
+    /**
+     * 静默刷新「继续收听 / 下一集」(设计文档 §3)。
+     *
+     * ## 它解决的问题
+     *
+     * [HomeViewModel] 是 `@HiltViewModel`,**只要首页还在返回栈上就一直活着** —— [init] 里那次
+     * [load] 之后,从播放页返回首页、从后台切回前台都不会再取一次数,屏幕上是几十分钟前的位置。
+     * 用户在别处听过(或本机被系统杀掉)之后重开 App,点「继续收听」会从旧位置开始播。
+     *
+     * ## 为什么只有这两个分区
+     *
+     * 它们是唯一会因为"在别处听了一会儿"而改变的分区,也是点播主入口。库列表几乎不变;
+     * 「最近添加」是**按库各发一个请求**,每分钟重拉一遍纯属浪费,出门走公网时尤其。
+     *
+     * ## 「静默」的边界
+     *
+     * 不置位 [HomeUiState.isRefreshing](那是下拉刷新手势的指示器)、不清空已有内容、失败不进
+     * [HomeUiState.error]。失败只沿用 [recomputeState] 既有的 [HomeUiState.isOffline] 语义 ——
+     * 屏幕上确实是旧数据,横幅是诚实的。
+     *
+     * ## 让路
+     *
+     * 冷启动 / 重试 / 下拉刷新在飞时直接跳过:同一个 bucket 被两条流程同时写只会产生无意义的
+     * 重复请求,而用户主动发起的那条优先级更高。**绝不取消 [loadJob]。**
+     * 冷启动时 [init] 的 [load] 通常仍在进行中,所以首页刚可见时的这一次会被这条规则跳过,
+     * 不会重复请求。
+     */
+    fun refreshLive() {
+        if (loadJob?.isActive == true || liveRefreshJob?.isActive == true) return
+        liveRefreshJob = viewModelScope.launch {
+            LIVE_REFRESH_SECTIONS
+                .map { kind ->
+                    launch {
+                        repository.bucket(kind.bucket) { fetchSection(kind) }
+                            .collect { cached -> applySection(kind, cached) }
+                    }
+                }
+                .joinAll()
         }
     }
 

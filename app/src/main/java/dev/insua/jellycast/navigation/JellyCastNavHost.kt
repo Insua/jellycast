@@ -178,6 +178,11 @@ fun JellyCastNavHost(
                     // 账户入口跳进设置页——服务器管理(登录态/账号切换)本来就在那里。
                     onAccountClick = { navController.navigate(Routes.SETTINGS) },
                     baseUrl = baseUrl,
+                    // 播放页是 bottom sheet、不是 NavHost 目的地(见本文件顶部 KDoc)——展开/
+                    // 收起不产生任何 Lifecycle 转换,首页的静默刷新单靠 Lifecycle 感知不到"被
+                    // 播放页盖住"。这里把 playerExpanded 原样喂给 HomeScreen,由它自己的
+                    // HomeLiveRefreshEffect 决定要不要把这算作"首页不可见"。
+                    isPlayerExpanded = playerExpanded,
                 )
             }
             composable(Routes.LIBRARY) {
