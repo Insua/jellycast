@@ -233,9 +233,16 @@ class HomeViewModel @Inject constructor(
      *
      * 刷新失败不弹窗——[recomputeState] 的 `isOffline` OR 语义照旧生效,复用既有的离线横幅,
      * 不打断浏览(设计文档 §2.3)。
+     *
+     * 也顺带取消 [liveRefreshJob]:[refreshLive] 一侧已经有"冷启动/下拉刷新在飞时跳过"这条
+     * 让路规则(见其 KDoc),但反过来的方向此前没有对称地设防——静默刷新的定时 tick 和用户
+     * 主动下拉可能前后脚发生,两条协程会一起把同一个 bucket 各发一遍请求,较旧的那次响应还可能
+     * 后到、把用户刚拉到的新内容覆盖回去。用户主动发起的刷新优先级更高,取消掉静默刷新那条,
+     * 而不是任其与自己并跑。
      */
     fun refresh() {
         loadJob?.cancel()
+        liveRefreshJob?.cancel()
         _uiState.update { it.copy(isRefreshing = true) }
         loadJob = viewModelScope.launch {
             (

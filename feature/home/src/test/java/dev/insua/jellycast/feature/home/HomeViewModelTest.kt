@@ -873,6 +873,48 @@ class HomeViewModelTest {
         )
     }
 
+    /**
+     * 设计文档 §5:反过来的方向——[有下拉刷新在飞时静默刷新跳过且不取消它] 已经钉住了
+     * "静默刷新不能打断用户主动发起的刷新",这条钉住对称的另一半:静默刷新的定时 tick 和用户
+     * 下拉前后脚发生时,用户主动发起的这次应该反过来取消掉还在飞的静默刷新,而不是任其和自己
+     * 一起跑——同一个 bucket 被两条流程各发一遍,较旧的那次响应还可能后到、把用户刚拉到的新
+     * 内容盖回去。
+     *
+     * 用 `nextUpCompletions` 而不是 `requestedBuckets` 计数:[refresh] 自己那一轮必然会请求
+     * 一次「下一集」,所以请求次数天然是 2,请求次数测不出"是不是被取消了"。真正有判别力的是
+     * "请求有没有跑完"——静默刷新那次的「下一集」请求卡在 100ms 的网络延迟上,如果 [refresh]
+     * 取消了 [HomeViewModel] 内部的静默刷新 job,这次挂起中的请求会被 [kotlinx.coroutines.CancellationException]
+     * 打断,永远不会执行到 `nextUpCompletions++` 那一行;没取消的话,两次调用最终都会跑完。
+     */
+    @Test fun `静默刷新在飞时下拉刷新会取消它`() = runTest(testDispatcher) {
+        var nextUpCompletions = 0
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto(items = listOf(episodeDto("ep1")))
+        coEvery { api.nextUp(any(), any()) } coAnswers {
+            delay(100)
+            nextUpCompletions++
+            ItemsResponseDto(items = listOf(episodeDto("next-1")))
+        }
+        stubNoLibraries(api)
+        stubFavorites(api, ItemsResponseDto())
+        val repository = FakeMediaRepository()
+        val viewModel = newViewModel(api, repository)
+        advanceUntilIdle()
+        nextUpCompletions = 0 // 只关心接下来这一轮,清掉冷启动 load() 那次的计数
+
+        viewModel.refreshLive() // 静默刷新起飞,「下一集」这次卡在 100ms 的网络延迟上还没跑完
+        runCurrent() // 推进到「下一集」进入 delay(100) 挂起为止,不把虚拟时钟往前拨
+
+        viewModel.refresh() // 用户此时下拉刷新——应当让还在飞的静默刷新让路
+        advanceUntilIdle()
+
+        assertEquals(
+            1,
+            nextUpCompletions,
+            "静默刷新在飞时下拉刷新应当取消它,不能让两条请求都跑完",
+        )
+    }
+
     /** 这条是需求本身:在别处听过之后回到首页,位置要变成新的。 */
     @Test fun `静默刷新把服务端的新位置反映到界面`() = runTest(testDispatcher) {
         val repository = FakeMediaRepository()
