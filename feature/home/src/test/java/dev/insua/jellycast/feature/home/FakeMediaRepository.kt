@@ -52,6 +52,18 @@ class FakeMediaRepository : MediaRepository {
         resumePositionOverrides[itemId] = positionMs
     }
 
+    /**
+     * 清掉指定 bucket 已经写入的本地缓存,模拟"这个分区这次没有本地缓存可读,只能等网络"的边界情形。
+     *
+     * 用来在测试里制造两个 bucket 之间真实存在的时序差:没被 evict 的 bucket 缓存读取是同步的,
+     * 立刻就有旧数据可发;被 evict 的这个只能等（通常还带了 delay 的)网络请求,期间必须真的经过一次
+     * 协程调度点——不像"两个 bucket 都读同一个立刻返回的内存 map"那样,会在同一个 `runCurrent()`
+     * 批次里被谁先谁后的巧合悄悄抹平。
+     */
+    fun evictCache(bucket: String) {
+        cache.remove(bucket)
+    }
+
     override fun bucket(bucket: String, fetch: suspend () -> List<MediaItem>): Flow<Cached<List<MediaItem>>> {
         requestedBuckets += bucket
         return staleWhileRevalidate(

@@ -774,21 +774,64 @@ class HomeViewModelTest {
     /**
      * 静默刷新发生在屏幕上已经有内容的时候。先清空再补回来会让首页闪一下白 ——
      * 这正是 v5 给下拉刷新定下的禁令,静默刷新更不能违反。
+     *
+     * 「继续收听」和「下一集」这次故意制造出真实的时序差(前者本地有缓存、瞬间可读;后者缓存被
+     * evict、只能等一次真正跨越协程调度点的网络请求):如果实现在两个分区各自的取数协程真正跑
+     * 起来之前就先把 [HomeViewModel] 内部的整份状态清空,「继续收听」先跑完、状态被重新拼出来的
+     * 那一刻,「下一集」还没来得及把自己的旧值放回去——这一刻的 `sections` 就会比 `before` 少一块,
+     * 断言才有机会抓到。如果两个 bucket 都读同一个立刻返回的内存缓存,清空和补回会在同一次
+     * `runCurrent()` 批次里被谁先谁后的巧合悄悄抹平,断言永远看不到"曾经缺过一块"的中间态。
      */
     @Test fun `静默刷新期间已有内容不被清空`() = runTest(testDispatcher) {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto(items = listOf(episodeDto("ep1")))
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto(items = listOf(episodeDto("next-1")))
+        stubNoLibraries(api)
+        stubFavorites(api, ItemsResponseDto())
         val repository = FakeMediaRepository()
-        val viewModel = createViewModel(repository)
+        val viewModel = newViewModel(api, repository)
         advanceUntilIdle()
         val before = viewModel.uiState.value.sections
+        assertEquals(
+            setOf(HomeSectionKind.RESUME, HomeSectionKind.NEXT_UP),
+            before.map { it.kind }.toSet(),
+            "前提条件:两个分区这次都得先加载成功,才谈得上'已有内容'",
+        )
+
+        // 「下一集」这次没有本地缓存可读,只能等网络,而网络这次刻意调得比「继续收听」慢——
+        // 制造出两者真正交错到达的时序。
+        repository.evictCache(CacheBuckets.HOME_NEXT_UP)
+        coEvery { api.nextUp(any(), any()) } coAnswers { delay(100); ItemsResponseDto(items = listOf(episodeDto("next-1"))) }
 
         viewModel.refreshLive()
-        // 还没 advance,请求都在飞 —— 此刻内容必须原样还在。
+        runCurrent() // 「继续收听」这次没有延迟,会先跑完并重新拼一次 UI 状态;
+        // 「下一集」这次卡在网络请求上,还没来得及把自己的值放回去。
         assertEquals(before, viewModel.uiState.value.sections, "静默刷新不得清空已有内容")
 
         advanceUntilIdle()
     }
 
-    /** 失败不进错误态 —— 屏幕上还有旧内容可看,不该被一整页错误盖住。 */
+    /**
+     * 失败不进错误态 —— 屏幕上还有旧内容可看,不该被一整页错误盖住。
+     *
+     * ## 这条用例实际钉住的是什么
+     *
+     * 能抓住"确实会跑到"的错误写入:比如不管三七二十一就 `_uiState.update { it.copy(error = ...) }`,
+     * 或者照着 [sectionRefreshFailed] 判断"这次静默刷新自己的 bucket 失败了就算错误"——这两种都是
+     * 有人会真的这么写的疏忽,实测过(见 task-1-report.md「Finding 2」)确实会让这条用例变红。
+     *
+     * ## 这条用例钉不住什么,以及为什么
+     *
+     * 钉不住"把 [load] 收尾那句 `error = if (sectionItems.isEmpty()) OFFLINE_MESSAGE else null`
+     * 原样复制进 [HomeViewModel.refreshLive]"这一种具体写法——**不是用例本身设计得不够狠**,是这行
+     * 条件在这里天生判不成真:[refreshLive] 只可能在 [HomeViewModel.load] 已经成功过一次之后才有
+     * 意义地被调用(这正是它存在的理由——已经有内容在屏幕上,才谈得上"静默"刷新),
+     * 而只要 [load] 成功过一次,`sectionItems` 就至少留着「我的媒体」那个 key(哪怕值是空列表),
+     * `sectionItems.isEmpty()` 永远评不出 `true`。想让这一行代码真的写错东西,得先有另一处 bug
+     * 把 `sectionItems` 清空——那正是"静默刷新期间已有内容不被清空"这条用例的职责,不该也不需要
+     * 在这里重复设防。所以这条用例对这一种具体的错误写法没有判别力,是已知的、有意接受的盲区,
+     * 不是没测出来。
+     */
     @Test fun `静默刷新失败不产生错误态`() = runTest(testDispatcher) {
         val repository = FakeMediaRepository()
         val viewModel = createViewModel(repository)
