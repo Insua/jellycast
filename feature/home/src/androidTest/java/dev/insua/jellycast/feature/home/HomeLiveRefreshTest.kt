@@ -1,6 +1,7 @@
 package dev.insua.jellycast.feature.home
 
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.ComposeTimeoutException
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.lifecycle.Lifecycle
@@ -105,5 +106,62 @@ class HomeLiveRefreshTest {
             "离开可见状态之后不应该再刷新(离开时是 $countAfterLeaving,等待窗口内变成了 $refreshCount)",
             !keptRefreshingAfterLeaving,
         )
+    }
+
+    /**
+     * 直接钉住 `isHomeVisible` 这个新增的门:全屏播放页是 `JellyCastNavHost` 里的
+     * `ModalBottomSheet`,不是 `NavHost` 目的地——展开/收起完全不产生 [Lifecycle] 转换,
+     * 上面两条用例用的 [FakeLifecycleOwner] 天生看不出这个 bug(它们只能证明"效果会响应生命周期
+     * 转换",证明不了"真实路径真的会产生一次生命周期转换")。
+     *
+     * 这里固定 `owner` 全程停在 STARTED(真实场景中首页在返回栈上、播放页盖在它上面时正是这个
+     * 状态),只翻动 [isHomeVisible] ——对应"点开一集展开播放页"到"收起播放页回到首页"这一段
+     * 真实交互。展开期间(`isHomeVisible = false`)一次刷新都不该有(Finding 2:定时器不该
+     * 在播放页盖住首页时继续跑),收起那一刻(`isHomeVisible` 变回 `true`)应该立刻补一次
+     * (Finding 1:回到首页必须看见最新的继续收听/下一集)。
+     */
+    @Test
+    fun 播放页展开时不刷新_收起后立刻刷新一次() {
+        var refreshCount = 0
+        val owner = FakeLifecycleOwner()
+        val isHomeVisible = mutableStateOf(false) // 起始态:播放页展开,盖住首页
+
+        composeTestRule.setContent {
+            CompositionLocalProvider(LocalLifecycleOwner provides owner) {
+                // 间隔给得很短,好在测试时限内证明"展开期间确实一直没有在刷",而不只是巧合
+                // 还没等到第一下。
+                HomeLiveRefreshEffect(
+                    intervalMs = 50L,
+                    onRefresh = { refreshCount++ },
+                    isHomeVisible = isHomeVisible.value,
+                )
+            }
+        }
+
+        // 生命周期从始至终停在 STARTED——真实的 ModalBottomSheet 展开/收起就是这样,
+        // 唯一变化的信号只有 isHomeVisible。
+        composeTestRule.runOnUiThread { owner.registry.currentState = Lifecycle.State.STARTED }
+        composeTestRule.waitForIdle()
+
+        // 主动等一个"不该发生的事件":等待窗口(500ms)远大于刷新间隔(50ms),如果
+        // isHomeVisible = false 没有真正拦住定时器,这里会等到 refreshCount 变化;
+        // 真的拦住了才会超时。
+        val refreshedWhileExpanded = try {
+            composeTestRule.waitUntil(timeoutMillis = 500) { refreshCount > 0 }
+            true
+        } catch (timeout: ComposeTimeoutException) {
+            false
+        }
+        assertTrue(
+            "播放页展开、首页被盖住期间不应该刷新(实际 refreshCount=$refreshCount)",
+            !refreshedWhileExpanded,
+        )
+
+        // 收起播放页——对应用户点了一下收起手柄。这一步不产生任何 Lifecycle 转换,
+        // 能让效果重新跑起来的只有这个参数本身。
+        composeTestRule.runOnUiThread { isHomeVisible.value = true }
+        composeTestRule.waitUntil(timeoutMillis = 3_000) { refreshCount == 1 }
+
+        assertEquals("收起播放页、回到首页后应该立刻刷新恰好一次", 1, refreshCount)
     }
 }
