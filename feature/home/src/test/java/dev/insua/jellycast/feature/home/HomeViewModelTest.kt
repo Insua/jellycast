@@ -725,4 +725,122 @@ class HomeViewModelTest {
             "失败的分区保留刷新前的内容,而不是消失",
         )
     }
+
+    // ---- 设计文档 §3/§4/§5:静默定时刷新 ----
+
+    /** 「一切都会成功」的默认 api 桩,静默刷新这组用例不关心具体接口行为,只要有内容可刷。 */
+    private fun happyApi(): JellyfinApi {
+        val api = mockk<JellyfinApi>()
+        coEvery { api.resume(any()) } returns ItemsResponseDto(items = listOf(episodeDto("ep1")))
+        coEvery { api.nextUp(any(), any()) } returns ItemsResponseDto(items = listOf(episodeDto("next-1")))
+        stubNoLibraries(api)
+        stubFavorites(api, ItemsResponseDto())
+        return api
+    }
+
+    private fun createViewModel(repository: FakeMediaRepository) = newViewModel(happyApi(), repository)
+
+    /**
+     * 只刷「继续收听」和「下一集」。库列表和「最近添加」变化极慢,而后者是**按库各发一个请求**,
+     * 每分钟重拉一遍是纯浪费流量 —— 这条用例把范围钉死。
+     */
+    @Test fun `静默刷新只请求继续收听和下一集两个 bucket`() = runTest(testDispatcher) {
+        val repository = FakeMediaRepository()
+        val viewModel = createViewModel(repository)
+        advanceUntilIdle()
+        repository.requestedBuckets.clear()
+
+        viewModel.refreshLive()
+        advanceUntilIdle()
+
+        assertEquals(
+            setOf(CacheBuckets.HOME_RESUME, CacheBuckets.HOME_NEXT_UP),
+            repository.requestedBuckets.toSet(),
+        )
+    }
+
+    /** 静默 = 不转下拉刷新的圈。 */
+    @Test fun `静默刷新不置位 isRefreshing`() = runTest(testDispatcher) {
+        val repository = FakeMediaRepository()
+        val viewModel = createViewModel(repository)
+        advanceUntilIdle()
+
+        viewModel.refreshLive()
+        advanceUntilIdle()
+
+        assertFalse(viewModel.uiState.value.isRefreshing, "静默刷新不该驱动下拉刷新指示器")
+    }
+
+    /**
+     * 静默刷新发生在屏幕上已经有内容的时候。先清空再补回来会让首页闪一下白 ——
+     * 这正是 v5 给下拉刷新定下的禁令,静默刷新更不能违反。
+     */
+    @Test fun `静默刷新期间已有内容不被清空`() = runTest(testDispatcher) {
+        val repository = FakeMediaRepository()
+        val viewModel = createViewModel(repository)
+        advanceUntilIdle()
+        val before = viewModel.uiState.value.sections
+
+        viewModel.refreshLive()
+        // 还没 advance,请求都在飞 —— 此刻内容必须原样还在。
+        assertEquals(before, viewModel.uiState.value.sections, "静默刷新不得清空已有内容")
+
+        advanceUntilIdle()
+    }
+
+    /** 失败不进错误态 —— 屏幕上还有旧内容可看,不该被一整页错误盖住。 */
+    @Test fun `静默刷新失败不产生错误态`() = runTest(testDispatcher) {
+        val repository = FakeMediaRepository()
+        val viewModel = createViewModel(repository)
+        advanceUntilIdle()
+        repository.failBucket(CacheBuckets.HOME_RESUME)
+
+        viewModel.refreshLive()
+        advanceUntilIdle()
+
+        assertNull(viewModel.uiState.value.error, "静默刷新失败不该把首页打成错误态")
+    }
+
+    /**
+     * 设计文档 §5:用户主动发起的刷新优先级更高。同一个 bucket 被两条流程同时写,
+     * 只会产生无意义的重复请求。
+     */
+    @Test fun `有下拉刷新在飞时静默刷新跳过且不取消它`() = runTest(testDispatcher) {
+        val repository = FakeMediaRepository()
+        val viewModel = createViewModel(repository)
+        advanceUntilIdle()
+        repository.requestedBuckets.clear()
+
+        viewModel.refresh()          // 用户下拉,请求在飞
+        viewModel.refreshLive()      // 同一时刻的定时器
+        advanceUntilIdle()
+
+        // 下拉刷新自己要刷的 bucket 一个都不能少 —— 说明它没被取消。
+        assertTrue(
+            repository.requestedBuckets.containsAll(
+                listOf(CacheBuckets.HOME_RESUME, CacheBuckets.HOME_NEXT_UP, CacheBuckets.HOME_LIBRARIES)
+            ),
+            "静默刷新不得取消正在进行的下拉刷新",
+        )
+        // 两个 live bucket 各自只被请求一次 —— 说明静默刷新确实跳过了,没有叠加。
+        assertEquals(
+            1,
+            repository.requestedBuckets.count { it == CacheBuckets.HOME_RESUME },
+            "静默刷新应当在下拉刷新在飞时跳过,不重复请求",
+        )
+    }
+
+    /** 这条是需求本身:在别处听过之后回到首页,位置要变成新的。 */
+    @Test fun `静默刷新把服务端的新位置反映到界面`() = runTest(testDispatcher) {
+        val repository = FakeMediaRepository()
+        val viewModel = createViewModel(repository)
+        advanceUntilIdle()
+
+        repository.setResumePositionMs(itemId = "ep1", positionMs = 1_800_000L)
+        viewModel.refreshLive()
+        advanceUntilIdle()
+
+        val resume = viewModel.uiState.value.sections.first { it.kind == HomeSectionKind.RESUME }
+        assertEquals(1_800_000L, resume.items.first { it.id == "ep1" }.resumePositionMs)
+    }
 }
