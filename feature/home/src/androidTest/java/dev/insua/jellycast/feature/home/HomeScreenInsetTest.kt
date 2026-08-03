@@ -45,10 +45,17 @@ import org.junit.runner.RunWith
  *
  * ⚠️ 原本这里量的是 `HomeTopBar`(独立的 Material3 `TopAppBar`)——它默认自带
  * `TopAppBarDefaults.windowInsets`(含状态栏),会和 `Scaffold` 的内容内边距叠加、把状态栏
- * inset 算两次。Task 2 把 `HomeTopBar` 整个删掉、图标并进了 `TabRow` 所在的那一行(见
- * `HomeScreen.kt`),`TabRow` 本身不应用任何 window inset,不存在"自己再垫一次"的风险,
- * 所以这里改为量首页现在的第一行([HomeScreenTestTags.TAB_ROW]):顶边应当紧贴 `Scaffold`
- * 已经让出来的状态栏 inset,高度不该比 `TabRow` 的标准容器高度(48dp)多出状态栏那一截。
+ * inset 算两次,靠"顶栏自身高度超过 TopAppBar 标准高度"抓到这个 bug。Task 2 把 `HomeTopBar`
+ * 整个删掉、图标并进了 `TabRow` 所在的那一行(见 `HomeScreen.kt`)——但**这不代表双重计算这
+ * 类 bug 不会再发生**:`Column` 内、`TabRow` 之上的任何地方(哪怕是以后不小心加的一行
+ * `Modifier.statusBarsPadding()`)都可能再垫一次状态栏 inset,`TabRow` 自己不应用 window
+ * inset 这件事只保证"它不会自己犯错",挡不住"它上面有人犯错"。
+ *
+ * 所以这里改为**双向**卡住首页第一行([HomeScreenTestTags.TAB_ROW])的顶边位置:既要
+ * `>= statusBarPx`(`Scaffold` 必须已经让出状态栏 inset),也要`<= statusBarPx + 容差`
+ * (`TabRow` 上面不能再有任何东西二次消费/叠加 inset)——只测下界测不出"content 内部又多垫了
+ * 一次"这类 bug,只有双向夹住才能像原来测 `TopAppBar` 高度那样,抓住"内容根到 TabRow 之间的
+ * 距离比状态栏 inset 本身更长"这件事。`TabRow` 自身高度不超标准高度作为次要断言保留。
  *
  * 外壳刻意照抄 `JellyCastNavHost`:`Scaffold` + `bottomBar`(迷你播放条 + 底部 tab 栏)+
  * `padding(padding)` 的内容区。顶部改动不能把底部搞坏,所以底部也一并断言。
@@ -128,16 +135,24 @@ class HomeScreenInsetTest {
             statusBarPx > 0,
         )
         // Scaffold 已经把状态栏高度作为内容内边距推下来了——首页第一行(TabRow 所在的那一行)
-        // 顶边就该在状态栏下面。
+        // 顶边就该紧贴在状态栏下面,下界原来就有。
         assertTrue(
             "Scaffold 应当已经消费了状态栏 inset:第一行顶边 ${tabRowTop}px,状态栏 ${statusBarPx}px",
             tabRowTop >= statusBarPx - 1f,
         )
-        // TabRow 不应用任何 window inset,不该再垫一次:它的高度就该是标准高度。
+        // ⚠️ 双向夹住才是原来那条测试真正守住的东西:下界只能抓到"Scaffold 没让出 inset",
+        // 抓不到"content 内部(Column/TabRow 之上任何位置)又二次消费/叠加了一次 inset"——
+        // 后者正是 v5 的 bug 形状,也是这里加上界的唯一理由。任何人在 TabRow 之上加一行
+        // `Modifier.statusBarsPadding()`(或任何吃 window inset 的东西),第一行顶边就会比
+        // 状态栏高度本身还靠下,这条上界必须能抓到。
         assertTrue(
-            "状态栏 inset 被算了两次:第一行顶边已在 ${tabRowTop}px(= 状态栏 ${statusBarPx}px)," +
-                "自身高度却是 ${tabRowHeight}px,比标准高度 ${tabRowStandardPx}px 多出 " +
-                "${tabRowHeight - tabRowStandardPx}px —— 和状态栏高度 ${statusBarPx}px 吻合",
+            "状态栏 inset 被算了两次(或 TabRow 之上多了别的内边距):第一行顶边 ${tabRowTop}px," +
+                "比状态栏高度 ${statusBarPx}px 多出 ${tabRowTop - statusBarPx}px,超过容差 ${TOLERANCE_PX}px",
+            tabRowTop <= statusBarPx + TOLERANCE_PX,
+        )
+        // 次要断言:TabRow 不应用任何 window inset,它自身高度也不该超过标准高度。
+        assertTrue(
+            "TabRow 自身高度 ${tabRowHeight}px 超过标准高度 ${tabRowStandardPx}px + 容差",
             tabRowHeight <= tabRowStandardPx + TOLERANCE_PX,
         )
     }
