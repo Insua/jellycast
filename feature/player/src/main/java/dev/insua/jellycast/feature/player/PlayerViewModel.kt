@@ -303,6 +303,14 @@ class PlayerViewModel @Inject constructor(
      * 循环切换),[danmakuCandidates] 会与它重合,`alreadyKnownDanmaku` 命中后直接跳过密度判定
      * 直接接受——否则会出现"弹幕轨因为密度判定被踢出候选池,又在回退分支被加回来"的空转,还会在
      * [SubtitleResolution.tracks] 里产生重复项。
+     *
+     * **密度信号回退时不重新下载**(评审 Important):被密度判定淘汰的轨道在主循环里已经拉取、
+     * 解析过一次——那次解析结果本身就是判定"是不是弹幕"的依据。回退分支选中同一条轨道时必须
+     * 复用 [densityFetched] 里存的那份结果,而不是对同一个 index 再发一次请求——这条回退路径
+     * 服务的恰好是"唯一候选就是弹幕"的场景,弹幕文件正是体积最大的那种(实测 3676 行 vs 真字幕
+     * 774 行),重复下载在按需播放/移动网络场景下不是可以忽略的开销。只有 [danmakuCandidates]
+     * 里那些从未进入过主循环(因为一开始就被标题信号排除、从未被 [pick] 选中过)的轨道,才需要
+     * 在回退分支发起它们的第一次也是唯一一次请求。
      */
     private suspend fun resolveSubtitle(
         itemId: String,
@@ -314,6 +322,7 @@ class PlayerViewModel @Inject constructor(
     ): SubtitleResolution {
         var candidates = initialCandidates
         val densityRejected = mutableListOf<SubtitleTrackRef>()
+        val densityFetched = mutableMapOf<Int, SubtitleTimeline>()
         while (true) {
             val track = pick(candidates) ?: break
             val alreadyKnownDanmaku = danmakuCandidates.any { it.index == track.index }
@@ -321,6 +330,7 @@ class PlayerViewModel @Inject constructor(
             if (!alreadyKnownDanmaku && timeline.isSuspiciouslyDense(runTimeMs)) {
                 candidates = candidates.filterNot { it.index == track.index }
                 densityRejected += track
+                densityFetched[track.index] = timeline
                 continue
             }
             return SubtitleResolution(candidates, timeline, track.index, usedDanmakuFallback = alreadyKnownDanmaku)
@@ -330,7 +340,10 @@ class PlayerViewModel @Inject constructor(
         val fallbackPool = (danmakuCandidates + densityRejected).distinctBy { it.index }
         val fallbackTrack = pick(fallbackPool)
             ?: return SubtitleResolution(fallbackPool, SubtitleTimeline(emptyList()), null)
-        val fallbackTimeline = fetchSubtitleTimeline(itemId, mediaSourceId, fallbackTrack)
+        // 密度信号淘汰的轨道已经拉过一次,直接复用;只有纯标题信号候选(从未进过主循环)才需要
+        // 现在才发起它的第一次请求。
+        val fallbackTimeline = densityFetched[fallbackTrack.index]
+            ?: fetchSubtitleTimeline(itemId, mediaSourceId, fallbackTrack)
         return SubtitleResolution(fallbackPool, fallbackTimeline, fallbackTrack.index, usedDanmakuFallback = true)
     }
 

@@ -10,6 +10,7 @@ import dev.insua.jellycast.model.SubtitleTimeline
 import dev.insua.jellycast.model.SubtitleTrackRef
 import dev.insua.jellycast.subtitle.SubtitleRepository
 import io.mockk.coEvery
+import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.Dispatchers
@@ -220,6 +221,22 @@ class PlayerViewModelSubtitleSelectionTest {
         assertEquals(3676, vm.uiState.value.subtitleTimeline.lines.size)
         assertEquals(listOf(danmakuNoKeyword), vm.uiState.value.subtitleTracks)
         assertTrue(vm.uiState.value.subtitleIsDanmakuFallback)
+    }
+
+    @Test fun `密度信号触发弹幕回退时只拉取一次字幕文件`() = runTest(testDispatcher) {
+        // 评审 Important:密度信号淘汰某条候选(判定它是弹幕)靠的就是这次拉取解析的结果——
+        // 回退分支选中同一条轨道展示时,必须复用这份已经拿到手的结果,不能对同一个 index
+        // 再发第二次请求。这条回退路径服务的正是"唯一候选就是弹幕"的场景,弹幕文件恰好是体积
+        // 最大的那种(实测 3676 行 vs 真字幕 774 行),重复下载的代价不能忽略。
+        val repo = mockk<SubtitleRepository>().also { repo ->
+            coEvery { repo.load(any(), any(), 0) } returns denseTimeline()
+        }
+        val vm = buildViewModel(listOf(danmakuNoKeyword), repo = repo, mediaItem = episodeWithRuntime)
+
+        runCurrent()
+
+        assertEquals(0, vm.uiState.value.selectedSubtitleTrackIndex)
+        coVerify(exactly = 1) { repo.load(any(), any(), 0) }
     }
 
     @Test fun `手动切换到密度异常的轨道时自动跳到下一个候选`() = runTest(testDispatcher) {
