@@ -1,8 +1,19 @@
 <resources>
-    <!-- Compose-only app: no AppCompat / Material Components XML theme dependency.
-         This theme only exists to satisfy the Android manifest requirement
-         (a launch/splash background) before Compose content is set. -->
-    <style name="Theme.JellyCast" parent="android:Theme.Material.NoActionBar">
-        <item name="android:windowBackground">@android:color/black</item>
+    <!--
+      Compose-only app: no AppCompat / Material Components XML theme dependency.
+      这个主题只为满足 manifest 的要求(Compose 内容设置之前的启动/闪屏背景)而存在。
+
+      父主题选 Light,理由和系统栏图标颜色**无关**,只是为了让 `onCreate` 之前系统绘制的
+      启动窗(`android:windowBackground` 那块底色)和框架默认装饰跟应用其余部分一样是浅色的,
+      避免风格不一致。
+
+      ⚠️ 变异测试测过:系统栏图标是深是浅完全由 `MainActivity.onCreate` 里
+      `WindowCompat.getInsetsController(...).isAppearanceLight*Bars` 那次显式调用决定 ——
+      把父主题改回深色、保留那次调用,`SystemBarsAppearanceTest` 照样 2/2 通过;反过来,
+      父主题留着 Light、删掉那次调用,测试变红。父主题在这件事上**不是**安全网,单独改它
+      不会影响图标颜色,别指望它兜底。
+    -->
+    <style name="Theme.JellyCast" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/launch_background</item>
     </style>
 </resources>

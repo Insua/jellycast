@@ -16,8 +16,11 @@ import android.os.Handler
 import android.os.Looper
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import dev.insua.jellycast.datastore.LastPlayedStore
 import dev.insua.jellycast.datastore.PreferencesStore
+import dev.insua.jellycast.model.MediaItem
 import dev.insua.jellycast.network.session.JellyfinSession
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -87,6 +90,14 @@ class PlaybackService : MediaSessionService() {
 
     @Inject
     lateinit var preferencesStore: PreferencesStore
+
+    /**
+     * Task 4:「这台设备上次在听什么」的写入方——冷启动时迷你播放条靠它装填(见 [LastPlayedStore]
+     * 类注释)。「从当前条目 + 位置构造记录」这段决策抽在纯函数 [buildLastPlayedRecord] 里单测,
+     * 这里只负责在心跳里调用它并 [LastPlayedStore.save]。
+     */
+    @Inject
+    lateinit var lastPlayedStore: LastPlayedStore
 
     private var mediaSession: MediaSession? = null
 
@@ -333,8 +344,28 @@ class PlaybackService : MediaSessionService() {
         serviceScope.launch {
             while (isActive) {
                 delay(PROGRESS_TICK_INTERVAL_MS)
-                if (exoPlayer.isPlaying) progressCoordinator.onTick()
+                if (exoPlayer.isPlaying) {
+                    progressCoordinator.onTick()
+                    playQueue.current.value?.let { item ->
+                        persistLastPlayed(item, playbackEngine.absolutePositionMs)
+                    }
+                }
             }
+        }
+    }
+
+    /**
+     * 铁律:写入失败绝不打断播放。和 [ProgressReporter] 里的写法同形——`runCatching` 会连
+     * [CancellationException] 一起吞掉,导致取消信号在这里被吸收、协程无法正常 unwind,所以
+     * 这里显式重抛它,只吞掉其余异常(存储写坏 / 磁盘满等)。
+     */
+    private suspend fun persistLastPlayed(item: MediaItem, positionMs: Long) {
+        try {
+            lastPlayedStore.save(buildLastPlayedRecord(item, positionMs))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // 静默:见上方注释,这条记录只是冷启动时的便利功能,丢一次不影响播放。
         }
     }
 
@@ -378,8 +409,11 @@ class PlaybackService : MediaSessionService() {
         // 位置只能在主线程读(ExoPlayer 的 application thread 限制),所以先取好值再交给
         // shutdownScope 去发请求——serviceScope 马上就要被取消了,在它上面 launch 会被立刻丢弃。
         val finalPositionMs = playbackEngine.absolutePositionMs
+        val finalItem = playQueue.current.value
         val coordinator = progressCoordinator
         shutdownScope.launch { coordinator.onPlaybackStopped(finalPositionMs) }
+        // Task 4:收尾时再写一次最终位置,和心跳同一条纯函数、同一套"写入失败不打断"的处理。
+        finalItem?.let { item -> shutdownScope.launch { persistLastPlayed(item, finalPositionMs) } }
 
         playbackStateListener?.let(exoPlayer::removeListener)
         bandwidthListener?.let(exoPlayer::removeAnalyticsListener)

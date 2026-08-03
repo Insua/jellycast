@@ -217,6 +217,11 @@ dependencies {
 
     testImplementation(libs.junit.jupiter)
     testRuntimeOnly(libs.junit.platform.launcher)
+    // AppSessionViewModelTest(Task 5:冷启动恢复迷你播放条)第一次在 :app 的 JVM 单测里需要
+    // 造假 ServerStore/JellyfinSession/AudioPlaybackEngine/PlayerConnection/LastPlayedStore,
+    // 沿用其余模块(:feature:home 等)已经在用的同一套 MockK + kotlinx-coroutines-test 组合。
+    testImplementation(libs.mockk)
+    testImplementation(libs.kotlinx.coroutines.test)
 
     // ⚠️ 源码集纪律:src/test 是 JUnit5 + MockK,src/androidTest 是 JUnit4 + AndroidJUnit4。
     // 两套框架不混用 —— instrumentation 侧只有 JUnit4 能被 AndroidJUnitRunner 驱动。
@@ -228,6 +233,9 @@ dependencies {
     androidTestImplementation(libs.compose.ui.test.junit4)
     debugImplementation(libs.compose.ui.test.manifest)
     androidTestImplementation(libs.androidx.test.runner)
+    // SystemBarsAppearanceTest 直接读 WindowCompat.getInsetsController —— :app 只把 core-ktx
+    // 声明成 implementation,androidTest 的编译期 classpath 不会传递拿到,需要单独声明一次。
+    androidTestImplementation(libs.androidx.core.ktx)
     androidTestUtil(libs.androidx.test.orchestrator)
     androidTestUtil(libs.androidx.test.services)
     androidTestImplementation(libs.androidx.test.ext.junit)

@@ -18,6 +18,7 @@ import dagger.hilt.android.testing.HiltAndroidRule
 import dagger.hilt.android.testing.HiltAndroidTest
 import dev.insua.jellycast.MainActivity
 import dev.insua.jellycast.database.JellyCastDatabase
+import dev.insua.jellycast.datastore.LastPlayedStore
 import dev.insua.jellycast.datastore.ServerStore
 import dev.insua.jellycast.designsystem.OfflineBannerTestTags
 import dev.insua.jellycast.feature.home.HomeUiState
@@ -110,6 +111,7 @@ class OfflineE2eTest {
     @Inject lateinit var engine: AudioPlaybackEngine
     @Inject lateinit var autoPlayNextController: AutoPlayNextController
     @Inject lateinit var playerConnection: PlayerConnection
+    @Inject lateinit var lastPlayedStore: LastPlayedStore
 
     private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
     private val context: Context get() = instrumentation.targetContext
@@ -358,7 +360,8 @@ class OfflineE2eTest {
 
     private fun appSessionViewModel(): AppSessionViewModel =
         AppSessionViewModel(
-            serverStore, session, playQueue, engine, autoPlayNextController, playerConnection, context,
+            serverStore, session, playQueue, engine, autoPlayNextController, playerConnection,
+            lastPlayedStore, context,
         ).track()
 
     /** 交给 [viewModelStore] 保管,`@After` 时统一取消它们的 `viewModelScope`(见字段 KDoc)。 */

@@ -1,6 +1,7 @@
 package dev.insua.jellycast.feature.server
 
 import dev.insua.jellycast.database.CachedItemDao
+import dev.insua.jellycast.datastore.LastPlayedStore
 import dev.insua.jellycast.datastore.ServerStore
 import dev.insua.jellycast.model.Endpoint
 import dev.insua.jellycast.model.EndpointHealth
@@ -46,6 +47,7 @@ class ServerViewModelTest {
     private val endpointSelector = mockk<EndpointSelector>()
     private val jellyfinApiFactory = mockk<JellyfinApiFactory>()
     private val cachedItemDao = mockk<CachedItemDao>(relaxed = true)
+    private val lastPlayedStore = mockk<LastPlayedStore>(relaxed = true)
 
     @BeforeEach
     fun setUp() {
@@ -60,7 +62,9 @@ class ServerViewModelTest {
     }
 
     private fun viewModel(certificateFetcher: PeerCertificateFetcher = mockk(relaxed = true)) =
-        ServerViewModel(serverStore, endpointSelector, jellyfinApiFactory, cachedItemDao, certificateFetcher)
+        ServerViewModel(
+            serverStore, endpointSelector, jellyfinApiFactory, cachedItemDao, lastPlayedStore, certificateFetcher,
+        )
 
     private fun server(id: String, name: String = "server-$id") =
         Server(id = id, name = name, endpoints = listOf(lan()))
@@ -482,8 +486,24 @@ class ServerViewModelTest {
         coVerify(exactly = 1) { cachedItemDao.clearServer("srv-1") }
     }
 
+    // ---- 复审 Task 5 Important 1:删除活跃服务器必须清掉「上次播放」记录 ----
+    // 之前只有 AppSessionViewModel.onServerConnected()(连接新服务器成功之后)才会清这份记录,
+    // 删除活跃服务器这一步本身完全不碰 LastPlayedStore——如果用户删完不再连任何服务器,
+    // 这条属于已删服务器的记录会一直留在磁盘上,下次冷启动迷你条恢复出来的条目连服务器都不存在了。
+
     @Test
-    fun `删除非活跃服务器不清活跃标记也不清缓存`() = runTest {
+    fun `删除当前活跃服务器时清掉上次播放记录`() = runTest {
+        every { serverStore.activeServerId } returns MutableStateFlow("srv-1")
+        val vm = viewModel()
+
+        vm.requestDeleteServer("srv-1")
+        vm.confirmDeleteServer()
+
+        coVerify(exactly = 1) { lastPlayedStore.clear() }
+    }
+
+    @Test
+    fun `删除非活跃服务器不清活跃标记_不清缓存_也不清上次播放记录`() = runTest {
         every { serverStore.activeServerId } returns MutableStateFlow("srv-other")
         val vm = viewModel()
 
@@ -493,6 +513,7 @@ class ServerViewModelTest {
         coVerify(exactly = 1) { serverStore.delete("srv-1") }
         coVerify(exactly = 0) { serverStore.clearActive() }
         coVerify(exactly = 0) { cachedItemDao.clearServer(any()) }
+        coVerify(exactly = 0) { lastPlayedStore.clear() }
     }
 
     @Test
@@ -514,7 +535,7 @@ class ServerViewModelTest {
     }
 
     @Test
-    fun `删除失败时给出提示_不静默_也不清活跃标记或缓存`() = runTest {
+    fun `删除失败时给出提示_不静默_也不清活跃标记或缓存或上次播放记录`() = runTest {
         coEvery { serverStore.delete("srv-1") } throws IOException("disk full")
         val vm = viewModel()
 
@@ -525,5 +546,6 @@ class ServerViewModelTest {
         assertNull(vm.uiState.value.deleteConfirmation)
         coVerify(exactly = 0) { serverStore.clearActive() }
         coVerify(exactly = 0) { cachedItemDao.clearServer(any()) }
+        coVerify(exactly = 0) { lastPlayedStore.clear() }
     }
 }
