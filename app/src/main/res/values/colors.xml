@@ -3,5 +3,5 @@
       启动窗口背景。必须和 Compose 浅色主题的 surface 一致 ——
       原先是纯黑,而应用是浅色的,冷启动时 Compose 内容渲染出来之前会黑闪一下。
     -->
-    <color name="launch_background">#FFFBFE</color>
+    <color name="launch_background">#FFFBFF</color>
 </resources>

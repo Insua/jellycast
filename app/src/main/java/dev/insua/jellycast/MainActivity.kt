@@ -29,9 +29,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         // 设计文档 §1:这个应用只有浅色主题(深色主题已被明确否决),所以系统栏图标固定为深色。
         //
-        // 为什么不能只靠 XML 主题:主题只是给系统的一个"猜测依据",而真正决定图标颜色的是
-        // WindowInsetsController 上的这两个标志。显式声明一次,行为就不再依赖父主题选得对不对,
-        // 也不受后续主题改动影响。
+        // 这次调用是系统栏图标颜色的**唯一**决定因素,不是"双保险"里的一层。变异测试测过:
+        // 把 themes.xml 的父主题改回深色、留着这次调用,SystemBarsAppearanceTest 照样 2/2 通过;
+        // 父主题留 Light、删掉这次调用,测试变红。也就是说 themes.xml 里父主题选 Light 跟图标
+        // 颜色无关(它只管 onCreate 之前的启动窗底色),不要指望它在这次调用被重构掉之后兜底。
         WindowCompat.getInsetsController(window, window.decorView).apply {
             isAppearanceLightStatusBars = true
             isAppearanceLightNavigationBars = true
