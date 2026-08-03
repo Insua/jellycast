@@ -67,9 +67,10 @@ class PlayerViewModelSubtitleSelectionTest {
 
     /**
      * 全支线复审 Important 的另一半:合法字幕标题恰好包含弹幕关键字(例如片头/片尾特效滚动字幕
-     * 标注了"弹幕"字样)。标题信号会把它误判成弹幕轨丢弃——这是已知的、有意接受的窄口径假阳性
-     * (design spec 明确写的信号就是标题关键字),这里验证的是"丢弃后至少让用户知道发生了什么"
-     * ([PlayerUiState.subtitleSkippedAsDanmaku]),而不是试图让标题信号变得更聪明。
+     * 标注了"弹幕"字样)。标题信号会把它误判成弹幕轨——这是已知的、有意接受的窄口径假阳性
+     * (design spec 明确写的信号就是标题关键字),这里验证的是设计文档 §3.5 的弹幕回退:没有其他
+     * 候选时,这条被误判的轨道会经由弹幕回退池被展示出来,并且 [PlayerUiState.subtitleIsDanmakuFallback]
+     * 要如实反映"这是弹幕回退,不是普通选轨"——而不是试图让标题信号变得更聪明。
      */
     private val karaokeFalsePositive = SubtitleTrackRef(
         index = 6, language = "chi", displayName = "特效弹幕滚动字幕", isTextBased = true, isExternal = true,
@@ -128,6 +129,9 @@ class PlayerViewModelSubtitleSelectionTest {
 
         assertEquals(4, vm.uiState.value.selectedSubtitleTrackIndex)
         assertEquals("真字幕内容", vm.uiState.value.subtitleTimeline.lines.first().text)
+        // 设计文档 §3.5 的核心不变式:有真字幕时绝不退回弹幕——这是本任务最容易做反的地方,
+        // 弹幕回退只应该在"一条非弹幕轨都没有"时才触发。
+        assertFalse(vm.uiState.value.subtitleIsDanmakuFallback)
     }
 
     @Test fun `弹幕轨不出现在可选字幕列表里`() = runTest(testDispatcher) {
@@ -139,29 +143,50 @@ class PlayerViewModelSubtitleSelectionTest {
         assertEquals(listOf(realSubtitleZh), vm.uiState.value.subtitleTracks)
     }
 
-    @Test fun `只有弹幕轨可选时不显示字幕也不退回弹幕`() = runTest(testDispatcher) {
-        val vm = buildViewModel(listOf(danmaku))
+    @Test fun `只有弹幕轨可选时回退展示弹幕内容`() = runTest(testDispatcher) {
+        // 设计文档 §3.5:候选里一条非弹幕轨都没有(标题信号判定)时,不再像 v4 那样什么都不
+        // 展示——回退使用弹幕轨,「有总比没有强」。
+        val repo = mockk<SubtitleRepository>().also { repo ->
+            coEvery { repo.load(any(), any(), 0) } returns SubtitleTimeline(listOf(SubtitleLine(0, 1000, "弹幕内容")))
+        }
+        val vm = buildViewModel(listOf(danmaku), repo = repo)
+
+        runCurrent()
+
+        assertEquals(0, vm.uiState.value.selectedSubtitleTrackIndex)
+        assertEquals("弹幕内容", vm.uiState.value.subtitleTimeline.lines.first().text)
+        assertEquals(listOf(danmaku), vm.uiState.value.subtitleTracks)
+        assertTrue(vm.uiState.value.subtitleIsDanmakuFallback)
+    }
+
+    @Test fun `合法字幕标题误含弹幕关键字且无其他候选时经弹幕回退展示`() = runTest(testDispatcher) {
+        // 已知的窄口径假阳性(见 karaokeFalsePositive 的类注释):标题信号会把它当弹幕处理。
+        // §3.5 之前这意味着这段真实字幕被彻底藏起来;§3.5 之后,非弹幕候选耗尽后落回弹幕回退池,
+        // 这条被误判的轨道照样会被展示——这不是本测试要验证的重点(标题信号本身不变聪明),
+        // 但断言必须跟上语义变化,不能继续期待"什么都不显示"。
+        val repo = mockk<SubtitleRepository>().also { repo ->
+            coEvery { repo.load(any(), any(), 6) } returns SubtitleTimeline(listOf(SubtitleLine(0, 1000, "特效滚动字幕内容")))
+        }
+        val vm = buildViewModel(listOf(karaokeFalsePositive), repo = repo)
+
+        runCurrent()
+
+        assertEquals(6, vm.uiState.value.selectedSubtitleTrackIndex)
+        assertEquals("特效滚动字幕内容", vm.uiState.value.subtitleTimeline.lines.first().text)
+        assertTrue(vm.uiState.value.subtitleIsDanmakuFallback)
+    }
+
+    @Test fun `完全没有字幕轨时仍然只是无字幕不触发弹幕回退`() = runTest(testDispatcher) {
+        // 设计文档 §3.5 的边界:弹幕回退只在"存在弹幕轨,但没有真字幕轨"时触发;一条字幕轨都
+        // 没有(既没有真字幕也没有弹幕)不应该因为新增的回退逻辑而多出任何分支或状态。
+        val vm = buildViewModel(emptyList())
 
         runCurrent()
 
         assertNull(vm.uiState.value.selectedSubtitleTrackIndex)
         assertTrue(vm.uiState.value.subtitleTimeline.lines.isEmpty())
         assertTrue(vm.uiState.value.subtitleTracks.isEmpty())
-        // 全支线复审 Important:候选被弹幕信号吃光了这件事现在要能被 UI 感知到,而不是悄无声息
-        // 地什么都不显示——用户没法区分"这一集真的没有字幕"和"有字幕但被误判丢弃了"。
-        assertTrue(vm.uiState.value.subtitleSkippedAsDanmaku)
-    }
-
-    @Test fun `合法字幕标题误含弹幕关键字被丢弃时也标记已跳过`() = runTest(testDispatcher) {
-        // 已知的窄口径假阳性(见 karaokeFalsePositive 的类注释):标题信号会把它当弹幕丢弃,
-        // 这里只验证"丢弃"这件事被暴露给了 UI,不改变标题信号本身的判定结果。
-        val vm = buildViewModel(listOf(karaokeFalsePositive))
-
-        runCurrent()
-
-        assertNull(vm.uiState.value.selectedSubtitleTrackIndex)
-        assertTrue(vm.uiState.value.subtitleTracks.isEmpty())
-        assertTrue(vm.uiState.value.subtitleSkippedAsDanmaku)
+        assertFalse(vm.uiState.value.subtitleIsDanmakuFallback)
     }
 
     @Test fun `标题不含弹幕关键字但解析后密度异常的轨道被降级选中真字幕`() = runTest(testDispatcher) {
@@ -177,10 +202,13 @@ class PlayerViewModelSubtitleSelectionTest {
         assertEquals("真字幕内容", vm.uiState.value.subtitleTimeline.lines.first().text)
         // 被密度判定降级的轨道要从可选列表里永久剔除——否则用户手动切换字幕时又会点回同一个坑。
         assertTrue(vm.uiState.value.subtitleTracks.none { it.index == 0 })
-        assertFalse(vm.uiState.value.subtitleSkippedAsDanmaku)
+        assertFalse(vm.uiState.value.subtitleIsDanmakuFallback)
     }
 
-    @Test fun `唯一候选标题不含关键字但密度异常时不显示字幕且标记已跳过`() = runTest(testDispatcher) {
+    @Test fun `唯一候选标题不含关键字但密度异常时经弹幕回退展示`() = runTest(testDispatcher) {
+        // 设计文档 §3.5 明确要求:密度信号(信号 2)识别出的"只有弹幕"要和标题信号(信号 1)
+        // 走同一条弹幕回退路径——唯一候选被密度判定淘汰后,应该回退展示它,而不是像 v4 那样
+        // 悄无声息地不显示任何字幕。
         val repo = mockk<SubtitleRepository>().also { repo ->
             coEvery { repo.load(any(), any(), 0) } returns denseTimeline()
         }
@@ -188,10 +216,10 @@ class PlayerViewModelSubtitleSelectionTest {
 
         runCurrent()
 
-        assertNull(vm.uiState.value.selectedSubtitleTrackIndex)
-        assertTrue(vm.uiState.value.subtitleTimeline.lines.isEmpty())
-        assertTrue(vm.uiState.value.subtitleTracks.isEmpty())
-        assertTrue(vm.uiState.value.subtitleSkippedAsDanmaku)
+        assertEquals(0, vm.uiState.value.selectedSubtitleTrackIndex)
+        assertEquals(3676, vm.uiState.value.subtitleTimeline.lines.size)
+        assertEquals(listOf(danmakuNoKeyword), vm.uiState.value.subtitleTracks)
+        assertTrue(vm.uiState.value.subtitleIsDanmakuFallback)
     }
 
     @Test fun `手动切换到密度异常的轨道时自动跳到下一个候选`() = runTest(testDispatcher) {
@@ -216,7 +244,7 @@ class PlayerViewModelSubtitleSelectionTest {
 
         assertEquals(5, vm.uiState.value.selectedSubtitleTrackIndex)
         assertTrue(vm.uiState.value.subtitleTracks.none { it.index == 0 })
-        assertFalse(vm.uiState.value.subtitleSkippedAsDanmaku)
+        assertFalse(vm.uiState.value.subtitleIsDanmakuFallback)
     }
 
     @Test fun `偏好语言只在非弹幕候选里匹配`() = runTest(testDispatcher) {

@@ -139,16 +139,17 @@ fun LyricsView(
     positionMs: Long,
     onSeek: (Long) -> Unit,
     modifier: Modifier = Modifier,
-    // 全支线复审 Important:候选字幕轨存在但全被弹幕信号(标题关键字或解析后密度异常)排除时,
-    // [PlayerUiState.subtitleSkippedAsDanmaku] 为 true——占位文案要能区分"这一集真的没有字幕"
-    // 和"有字幕但被判定为弹幕丢弃了",后者不该悄无声息。
-    subtitleSkippedAsDanmaku: Boolean = false,
+    // 设计文档 §3.5:候选里没有非弹幕轨,只能回退到弹幕轨时 [PlayerUiState.subtitleIsDanmakuFallback]
+    // 为 true。绝大多数情况下这条弹幕轨本身能正常拉到内容,走的是下面的 CONTENT 分支,根本不会
+    // 命中这个占位态;这里只覆盖"连弹幕轨也没拉到内容"(拉取失败/为空)这一种边界情况——文案要如实
+    // 说明"尝试过弹幕但没有内容",不能再用 v4 的"已跳过"措辞,那个语义在 §3.5 之后已经不成立了。
+    subtitleIsDanmakuFallback: Boolean = false,
 ) {
     if (lyricsDisplayState(isLoading = false, timeline = timeline) == LyricsDisplayState.PLACEHOLDER) {
         Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Text(
-                text = if (subtitleSkippedAsDanmaku) {
-                    "识别到疑似弹幕的字幕轨,已跳过——本集暂不显示字幕"
+                text = if (subtitleIsDanmakuFallback) {
+                    "本集没有对白字幕,弹幕轨也未能加载——暂不显示字幕"
                 } else {
                     "此内容无文本字幕"
                 },

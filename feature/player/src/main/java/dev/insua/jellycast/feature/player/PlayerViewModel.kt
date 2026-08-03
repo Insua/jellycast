@@ -167,11 +167,15 @@ data class PlayerUiState(
     /** 设置里的「歌词式字幕」开关(复审 Minor 6:此前这个开关是死的,播放页从不查它)。 */
     val lyricsEnabled: Boolean = true,
     /**
-     * 全支线复审 Important:候选字幕轨存在,但全部被弹幕信号(标题关键字或解析后密度异常)
-     * 排除,最终没有任何轨道能被选中。true 时 UI 应该告诉用户"跳过了一条疑似弹幕的字幕",
-     * 而不是让"这一集真的没有字幕"和"有字幕但被误判丢弃了"这两种情况看起来一模一样。
+     * 设计文档 §3.5:当前被选中并展示的字幕轨来自**弹幕回退**——候选里没有任何非弹幕轨(标题
+     * 关键字或解析后密度信号判定),只能退回弹幕轨。true 时 UI 应该让用户知道"这不是对白字幕,
+     * 是弹幕",而不是让弹幕内容和真字幕看起来一模一样;这个字段本身不代表"没有字幕显示"——
+     * 弹幕内容通常照常渲染,只有弹幕轨本身也拉取失败时才会同时出现"此字段为 true 且歌词区为空"。
+     *
+     * v4 曾经用这个字段表示"候选全被弹幕信号排除、什么都不显示"——§3.5 把"剔除弹幕"改成
+     * "降权弹幕"之后,这个语义已经不成立了(参见 [PlayerViewModel.resolveSubtitle] 的回退分支)。
      */
-    val subtitleSkippedAsDanmaku: Boolean = false,
+    val subtitleIsDanmakuFallback: Boolean = false,
 )
 
 /**
@@ -205,12 +209,13 @@ class PlayerViewModel @Inject constructor(
         viewModelScope.launch {
             connection.nowPlaying.collectLatest { info ->
                 val rawTracks = info?.subtitleTracks.orEmpty()
-                // 缺陷 1(设计文档 §3.3):弹幕类外挂轨永远不当"字幕"处理——不进入可选列表,
-                // 默认选轨、手动循环切换([onCycleSubtitleTrack])都看不到它。这样"选不出真字幕
-                // 就不显示字幕"这条规则只用写一处,不会有第二条路径又把弹幕漏进来。这是信号 1
-                // (标题关键字,[SubtitleTrackRef.isLikelyDanmaku]);信号 2(密度)在
-                // [resolveSubtitle] 里解析完文件之后才二次判定,见该方法 KDoc。
+                // 设计文档 §3.5:弹幕类外挂轨不再被整个剔除,而是**降权**——默认选轨、手动循环
+                // 切换([onCycleSubtitleTrack])优先只看非弹幕轨;非弹幕轨一条都没有时才回退到
+                // 弹幕轨(见 [resolveSubtitle] 的回退分支)。这是信号 1(标题关键字,
+                // [SubtitleTrackRef.isLikelyDanmaku]);信号 2(密度)在 [resolveSubtitle] 里解析完
+                // 文件之后才二次判定,同样的回退规则也适用于它,见该方法 KDoc。
                 val realTracks = rawTracks.filterNot { it.isLikelyDanmaku }
+                val danmakuTracks = rawTracks.filter { it.isLikelyDanmaku }
                 _uiState.update {
                     it.copy(
                         mediaItem = info?.mediaItem,
@@ -227,13 +232,19 @@ class PlayerViewModel @Inject constructor(
                             subtitleTimeline = SubtitleTimeline(emptyList()),
                             isSubtitleLoading = false,
                             selectedSubtitleTrackIndex = null,
-                            subtitleSkippedAsDanmaku = false,
+                            subtitleIsDanmakuFallback = false,
                         )
                     }
                 } else {
                     val preferredLanguage = preferencesStore.preferredSubtitleLanguage.first()
                     val runTimeMs = info.mediaItem.runTimeMs ?: 0L
-                    val resolution = resolveSubtitle(info.mediaItem.id, info.mediaSourceId, runTimeMs, realTracks) { candidates ->
+                    val resolution = resolveSubtitle(
+                        info.mediaItem.id,
+                        info.mediaSourceId,
+                        runTimeMs,
+                        realTracks,
+                        danmakuTracks,
+                    ) { candidates ->
                         selectDefaultSubtitleTrack(candidates, preferredLanguage)
                     }
                     _uiState.update {
@@ -242,9 +253,7 @@ class PlayerViewModel @Inject constructor(
                             subtitleTimeline = resolution.timeline,
                             isSubtitleLoading = false,
                             selectedSubtitleTrackIndex = resolution.selectedIndex,
-                            // 候选本来就不空,但最终没选出任何一条——全被弹幕信号排除了,这件事
-                            // 要暴露给 UI,而不是和"这一集压根没有字幕轨"表现得一模一样。
-                            subtitleSkippedAsDanmaku = rawTracks.isNotEmpty() && resolution.selectedIndex == null,
+                            subtitleIsDanmakuFallback = resolution.usedDanmakuFallback,
                         )
                     }
                 }
@@ -256,13 +265,15 @@ class PlayerViewModel @Inject constructor(
         val tracks: List<SubtitleTrackRef>,
         val timeline: SubtitleTimeline,
         val selectedIndex: Int?,
+        /** 设计文档 §3.5:最终选中的这一条来自弹幕回退池,不是非弹幕候选。 */
+        val usedDanmakuFallback: Boolean = false,
     )
 
     /**
-     * 选轨 + 拉取 + 密度二次判定(设计文档 §3.3 信号 2)的共享循环。默认选轨
+     * 选轨 + 拉取 + 密度二次判定(设计文档 §3.3 信号 2)+ 弹幕回退(§3.5)的共享循环。默认选轨
      * ([observeNowPlaying])和手动循环切换([onCycleSubtitleTrack])都走这一个方法——两者只有
-     * "怎么从候选里挑一个"([pick])不同,"挑完发现是弹幕就从候选池永久剔除、换下一个"这套降级
-     * 逻辑只写一遍。
+     * "怎么从候选里挑一个"([pick])不同,"挑完发现是弹幕就从候选池永久剔除、换下一个;非弹幕候选
+     * 耗尽就回退到弹幕轨"这套降级逻辑只写一遍。
      *
      * ## 排序问题:选轨发生在拉取字幕文件之前,密度这时候还不知道
      *
@@ -279,24 +290,48 @@ class PlayerViewModel @Inject constructor(
      * [fetchSubtitleTimeline] 已经把 [SubtitleRepository.load] 的失败(网络异常/非 2xx/解析异常)
      * 兜到空 timeline;空 timeline 的 `isSuspiciouslyDense` 恒为 false,不会被误判成"密度异常"
      * 从而错误地剔除一个只是暂时请求失败的正常轨道。
+     *
+     * ## 弹幕回退(设计文档 §3.5)
+     *
+     * [initialCandidates] 只装非弹幕轨(标题信号已经排除过);[danmakuCandidates] 装标题信号判定为
+     * 弹幕的轨道,只在 [initialCandidates] 耗尽——一开始就是空,或者密度信号把它一条条挑光——时
+     * 才会被用到。两个信号共用同一条回退路径:密度信号淘汰的轨道([densityRejected])和标题信号
+     * 判定的弹幕轨([danmakuCandidates])合并成回退池,任选一条展示,**不再对它二次做密度判定**
+     * ——回退池里的轨道本来就预期是弹幕,行密度高是意料之中,不是应该继续降级的信号。
+     *
+     * 如果调用方传入的 [initialCandidates] 本身已经是弹幕回退池(例如在已经处于回退状态下手动
+     * 循环切换),[danmakuCandidates] 会与它重合,`alreadyKnownDanmaku` 命中后直接跳过密度判定
+     * 直接接受——否则会出现"弹幕轨因为密度判定被踢出候选池,又在回退分支被加回来"的空转,还会在
+     * [SubtitleResolution.tracks] 里产生重复项。
      */
     private suspend fun resolveSubtitle(
         itemId: String,
         mediaSourceId: String,
         runTimeMs: Long,
         initialCandidates: List<SubtitleTrackRef>,
+        danmakuCandidates: List<SubtitleTrackRef>,
         pick: (List<SubtitleTrackRef>) -> SubtitleTrackRef?,
     ): SubtitleResolution {
         var candidates = initialCandidates
+        val densityRejected = mutableListOf<SubtitleTrackRef>()
         while (true) {
-            val track = pick(candidates)
+            val track = pick(candidates) ?: break
+            val alreadyKnownDanmaku = danmakuCandidates.any { it.index == track.index }
             val timeline = fetchSubtitleTimeline(itemId, mediaSourceId, track)
-            if (track != null && timeline.isSuspiciouslyDense(runTimeMs)) {
+            if (!alreadyKnownDanmaku && timeline.isSuspiciouslyDense(runTimeMs)) {
                 candidates = candidates.filterNot { it.index == track.index }
+                densityRejected += track
                 continue
             }
-            return SubtitleResolution(candidates, timeline, track?.index)
+            return SubtitleResolution(candidates, timeline, track.index, usedDanmakuFallback = alreadyKnownDanmaku)
         }
+
+        // 非弹幕候选(标题信号 + 密度信号)已经耗尽:回退到弹幕轨,两个信号共用这一条回退路径。
+        val fallbackPool = (danmakuCandidates + densityRejected).distinctBy { it.index }
+        val fallbackTrack = pick(fallbackPool)
+            ?: return SubtitleResolution(fallbackPool, SubtitleTimeline(emptyList()), null)
+        val fallbackTimeline = fetchSubtitleTimeline(itemId, mediaSourceId, fallbackTrack)
+        return SubtitleResolution(fallbackPool, fallbackTimeline, fallbackTrack.index, usedDanmakuFallback = true)
     }
 
     /**
@@ -466,13 +501,17 @@ class PlayerViewModel @Inject constructor(
         val tracks = state.subtitleTracks
         if (tracks.isEmpty()) return
         val mediaItem = state.mediaItem ?: return
-        val mediaSourceId = connection.nowPlaying.value?.mediaSourceId ?: return
+        val nowPlaying = connection.nowPlaying.value ?: return
+        val mediaSourceId = nowPlaying.mediaSourceId
+        // 设计文档 §3.5:手动循环切换也要能回退到弹幕轨——用 nowPlaying 的原始轨道列表(不是
+        // 已经过滤/回退过的 `tracks`)重新按标题信号分出弹幕候选,和默认选轨走同一条回退规则。
+        val danmakuCandidates = nowPlaying.subtitleTracks.filter { it.isLikelyDanmaku }
         val runTimeMs = mediaItem.runTimeMs ?: 0L
         val startIndex = state.selectedSubtitleTrackIndex
 
         viewModelScope.launch {
             _uiState.update { it.copy(isSubtitleLoading = true) }
-            val resolution = resolveSubtitle(mediaItem.id, mediaSourceId, runTimeMs, tracks) { candidates ->
+            val resolution = resolveSubtitle(mediaItem.id, mediaSourceId, runTimeMs, tracks, danmakuCandidates) { candidates ->
                 if (candidates.isEmpty()) {
                     null
                 } else {
@@ -490,7 +529,7 @@ class PlayerViewModel @Inject constructor(
                     subtitleTimeline = resolution.timeline,
                     isSubtitleLoading = false,
                     selectedSubtitleTrackIndex = resolution.selectedIndex,
-                    subtitleSkippedAsDanmaku = tracks.isNotEmpty() && resolution.selectedIndex == null,
+                    subtitleIsDanmakuFallback = resolution.usedDanmakuFallback,
                 )
             }
         }

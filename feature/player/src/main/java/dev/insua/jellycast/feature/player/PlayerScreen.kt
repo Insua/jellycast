@@ -209,7 +209,7 @@ fun PlayerScreenContent(
                         positionMs = uiState.positionMs,
                         onSeek = onSeek,
                         modifier = Modifier.weight(1f),
-                        subtitleSkippedAsDanmaku = uiState.subtitleSkippedAsDanmaku,
+                        subtitleIsDanmakuFallback = uiState.subtitleIsDanmakuFallback,
                     )
                 }
             }
