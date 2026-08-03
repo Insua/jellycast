@@ -6,6 +6,7 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import dev.insua.jellycast.model.MediaKind
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.Serializable
@@ -35,6 +36,18 @@ data class LastPlayed(
     val imageTag: String?,
     val runTimeMs: Long?,
     val updatedAt: Long,
+    /**
+     * [MediaItem.kind] 的字符串形式(存 [MediaKind.name],不是枚举本身)——`:core:model` 没有应用
+     * kotlinx.serialization 编译插件(同 `ServerStore` 里 `ServerListSurrogate` 类注释的取舍:
+     * 领域模型所在的模块不依赖 kotlinx.serialization),`MediaKind` 因此不能直接标 `@Serializable`
+     * 被这个 `data class` 拿去用。
+     *
+     * **必须带默认值。** 这是复审(Task 5 Important 2)之后追加的字段:没有默认值的话,追加字段
+     * 之前写盘的旧记录(JSON 里没有这个 key)会在 [lastPlayed] 的 `runCatching` 里直接解析失败、
+     * 整条记录被静默丢弃——用户升级 App 后冷启动的迷你条会凭空消失一次。默认给
+     * [MediaKind.EPISODE] 的名字,和这个字段引入前代码里硬编码的行为完全一致,老记录能照常解出来。
+     */
+    val kind: String = MediaKind.EPISODE.name,
 )
 
 private val KEY_LAST_PLAYED = stringPreferencesKey("last_played")

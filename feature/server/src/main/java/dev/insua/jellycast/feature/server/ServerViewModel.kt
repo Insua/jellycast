@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dev.insua.jellycast.database.CachedItemDao
+import dev.insua.jellycast.datastore.LastPlayedStore
 import dev.insua.jellycast.datastore.ServerStore
 import dev.insua.jellycast.model.Endpoint
 import dev.insua.jellycast.model.EndpointHealth
@@ -83,6 +84,7 @@ class ServerViewModel @Inject constructor(
     private val endpointSelector: EndpointSelector,
     private val jellyfinApiFactory: JellyfinApiFactory,
     private val cachedItemDao: CachedItemDao,
+    private val lastPlayedStore: LastPlayedStore,
     private val certificateFetcher: PeerCertificateFetcher = DefaultPeerCertificateFetcher,
 ) : ViewModel() {
 
@@ -298,10 +300,17 @@ class ServerViewModel @Inject constructor(
     /**
      * 用户在确认弹窗里点了「删除」。真正调 [ServerStore.delete] 的唯一入口。
      *
-     * 被删的如果正好是当前活跃服务器,还要清掉活跃标记([ServerStore.clearActive])并清空
-     * 它的缓存([CachedItemDao.clearServer])——否则激活标记会指向一台不存在的服务器,
-     * 缓存表里也会留下无主的行。三步全部包在同一个 try 里:任何一步失败都算这次删除失败,
-     * 必须给用户看得到的提示(铁律:删除失败不得静默),不能让用户以为删成功了。
+     * 被删的如果正好是当前活跃服务器,还要清掉活跃标记([ServerStore.clearActive])、清空
+     * 它的缓存([CachedItemDao.clearServer]),并清掉「上次播放」记录([LastPlayedStore.clear],
+     * 复审 Task 5 Important 1)——否则激活标记会指向一台不存在的服务器,缓存表里会留下无主的行,
+     * 「上次播放」记录也会继续指着一台已经被删掉的服务器,下次冷启动迷你条恢复出来的条目连
+     * 服务器都不存在了。四步全部包在同一个 try 里:任何一步失败都算这次删除失败,必须给用户
+     * 看得到的提示(铁律:删除失败不得静默),不能让用户以为删成功了。
+     *
+     * 这一步只清磁盘上的记录。若用户删完立刻连一台新服务器,导航层随后会调
+     * [AppSessionViewModel.onServerConnected][dev.insua.jellycast.navigation.AppSessionViewModel]
+     * 把进程内已经装填好的迷你条/播放队列一并清掉——那是另一半状态,这里管不到也不该管
+     * (`:feature:server` 不认识 `AppSessionViewModel`)。
      */
     fun confirmDeleteServer() {
         val id = _uiState.value.deleteConfirmation ?: return
@@ -311,6 +320,7 @@ class ServerViewModel @Inject constructor(
                 if (activeServerId == id) {
                     serverStore.clearActive()
                     cachedItemDao.clearServer(id)
+                    lastPlayedStore.clear()
                 }
                 _uiState.update { it.copy(deleteConfirmation = null, error = null) }
             } catch (e: Exception) {

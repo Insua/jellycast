@@ -16,6 +16,11 @@ import dev.insua.jellycast.model.displaySubtitle
  *
  * [positionMs] 为 0(用户刚点开还没走)也照常产出记录:这次打开本身就值得被记住,不该因为
  * "还没有进度"就被当成没有意义而漏记。
+ *
+ * [kind][LastPlayed.kind] 原样透传 `item.kind.name`(复审 Task 5 Important 2):不记这个字段的话,
+ * 冷启动恢复出来的条目在导航层就只能硬编码成 `EPISODE`——电影播完之后
+ * [AutoPlayNextController.onPlaybackEnded] 会把它误判成"未完结的剧集"去找下一集,
+ * 连播结束该有的"回首页"永远不会触发。
  */
 fun buildLastPlayedRecord(
     item: MediaItem,
@@ -29,4 +34,5 @@ fun buildLastPlayedRecord(
     imageTag = item.imageTag,
     runTimeMs = item.runTimeMs,
     updatedAt = now,
+    kind = item.kind.name,
 )

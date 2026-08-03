@@ -5,6 +5,7 @@ import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
+import dev.insua.jellycast.model.MediaKind
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -32,7 +33,7 @@ class LastPlayedStoreTest {
         store = LastPlayedStore(dataStore)
     }
 
-    private fun sample(itemId: String = "item-1") = LastPlayed(
+    private fun sample(itemId: String = "item-1", kind: String = MediaKind.MOVIE.name) = LastPlayed(
         itemId = itemId,
         positionMs = 12_345L,
         title = "第 3 集:测试用例",
@@ -40,6 +41,7 @@ class LastPlayedStoreTest {
         imageTag = "tag-abc",
         runTimeMs = 1_800_000L,
         updatedAt = 1_700_000_000_000L,
+        kind = kind,
     )
 
     @Test
@@ -62,6 +64,27 @@ class LastPlayedStoreTest {
         assertEquals(record.imageTag, loaded.imageTag)
         assertEquals(record.runTimeMs, loaded.runTimeMs)
         assertEquals(record.updatedAt, loaded.updatedAt)
+        assertEquals(record.kind, loaded.kind)
+    }
+
+    // ---- 复审 Task 5 Important 2:kind 字段必须带默认值,老记录才不会被 runCatching 整条吞掉 ----
+
+    @Test
+    fun `字段引入前写盘的旧记录_JSON里没有kind字段_仍能正常解出来,kind落到EPISODE默认值`() = runTest {
+        // 手写这个字段引入之前的 JSON 形状(没有 "kind" key),模拟"用户升级 App 前就存在的记录"。
+        val key = stringPreferencesKey("last_played")
+        dataStore.edit {
+            it[key] = """
+                {"itemId":"old-item","positionMs":5000,"title":"旧记录","subtitle":"旧副标题",
+                "imageTag":"tag-x","runTimeMs":1000000,"updatedAt":123}
+            """.trimIndent()
+        }
+
+        val loaded = store.lastPlayed.first()
+
+        assertNotNull(loaded, "缺 kind 字段的旧记录不该被 runCatching 整条丢弃")
+        assertEquals("old-item", loaded!!.itemId, "旧记录的其它字段应该照常解出来")
+        assertEquals(MediaKind.EPISODE.name, loaded.kind, "kind 缺省应落到字段引入前的硬编码行为——EPISODE")
     }
 
     @Test

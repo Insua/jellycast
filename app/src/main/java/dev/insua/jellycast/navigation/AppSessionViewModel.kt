@@ -175,16 +175,20 @@ class AppSessionViewModel @Inject constructor(
      * [MediaItem.resumePositionMs] 设成记录里的位置(关键复用,见类注释):点迷你条播放时走的是
      * 和首页点条目完全相同的 [play] 路径,那条路已经用这个字段当播放起点,不需要另开一条特殊逻辑。
      *
-     * `kind` 固定给 [MediaKind.EPISODE]:[LastPlayed] 按 Task 3 的设计不存条目类型(只存渲染迷你条
-     * 与续播所需的最少字段),这是已知的、有意接受的简化——真实类型会在用户点开播放、
-     * `:core:player` 侧的元数据/连播逻辑接管之后被正确的数据覆盖。
+     * `kind` 解析自 [LastPlayed.kind](复审 Task 5 Important 2 之前这里固定给过 [MediaKind.EPISODE]、
+     * 并声称"真实类型会在播放开始后被覆盖"——**这句话是假的**:`AudioPlaybackEngineImpl.play()`
+     * 根本不碰 [PlayQueue],没有任何地方会在播放开始后回填这个字段。电影是一等公民,恢复出来的
+     * 电影如果被当成剧集,播完时 [dev.insua.jellycast.player.AutoPlayNextController.onPlaybackEnded]
+     * 会去找"下一集"而不是判定为整部片子播完,"播完回首页"永远不会触发。`valueOf` 失败(未来
+     * 新增枚举值、记录被手工改坏等边缘情况)时退化成 [MediaKind.EPISODE]——这条路径本来就是
+     * "尽力而为的本地缓存",容错值随手挑一个不会崩的即可,不值得为它另设一种更精确的降级。
      */
     private fun restoreLastPlayed() {
         viewModelScope.launch {
             val record = lastPlayedStore.lastPlayed.first() ?: return@launch
             val item = MediaItem(
                 id = record.itemId,
-                kind = MediaKind.EPISODE,
+                kind = runCatching { MediaKind.valueOf(record.kind) }.getOrDefault(MediaKind.EPISODE),
                 name = record.title,
                 runTimeMs = record.runTimeMs,
                 resumePositionMs = record.positionMs,
@@ -250,12 +254,25 @@ class AppSessionViewModel @Inject constructor(
     /**
      * 登录/添加服务器成功后由导航层调用,让首页/媒体库尽快拿到正确的封面 baseUrl。
      *
-     * 顺带清掉本地的「上次播放」记录(设计文档 §3「记录失效」):这条记录属于**上一次**登录的
-     * 服务器,连上一台新的(或换一台)服务器之后继续把它摆在迷你条上没有意义——轻则条目对不上
-     * 这台服务器,重则续播时拿着别的服务器的 itemId 去发请求。
+     * 顺带清掉本地的「上次播放」记录并重置进程内已经装填好的迷你条/播放队列(设计文档 §3
+     * 「记录失效」+ 复审 Task 5 Important 1):这条记录属于**上一次**登录的服务器,连上一台
+     * 新的(或换一台)服务器之后继续把它摆在迷你条上没有意义——轻则条目对不上这台服务器,
+     * 重则续播时拿着别的服务器的 itemId 去发请求。
+     *
+     * **只清 [lastPlayedStore] 这一份磁盘记录不够。** [restoreLastPlayed] 在 `init` 里已经把
+     * 上一台服务器的记录灌进了 [_miniPlayer] 和 [playQueue]——这两个是这次进程存活期间的
+     * 内存状态,`lastPlayedStore.clear()` 清的是磁盘上的下一次冷启动,两者互不相干、互不覆盖。
+     * 复审发现的可复现路径:设置 → 管理服务器 → 删除当前活跃服务器 → 连一台新服务器 → 回首页——
+     * 迷你条会继续显示旧服务器那一集,点播放会把旧服务器的 itemId 发给刚连上的新服务器。
+     * 同时把 [restoredWithoutSession] 置回 `false`:否则 [observeMiniPlayer] 收到的下一次
+     * `nowPlaying == null`(真实会话此刻确实不存在)会被误判成"还没来得及覆盖恢复状态"而放过
+     * 这次本该执行的清空。
      */
     fun onServerConnected() {
         refreshBaseUrl()
+        _miniPlayer.value = null
+        playQueue.setQueue(emptyList(), 0)
+        restoredWithoutSession = false
         viewModelScope.launch { lastPlayedStore.clear() }
     }
 

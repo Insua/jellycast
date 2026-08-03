@@ -6,6 +6,7 @@ import dev.insua.jellycast.datastore.LastPlayed
 import dev.insua.jellycast.datastore.LastPlayedStore
 import dev.insua.jellycast.datastore.ServerStore
 import dev.insua.jellycast.feature.player.PlayerConnection
+import dev.insua.jellycast.model.MediaKind
 import dev.insua.jellycast.network.JellyfinApi
 import dev.insua.jellycast.network.session.JellyfinSession
 import dev.insua.jellycast.player.AudioPlaybackEngine
@@ -73,6 +74,7 @@ class AppSessionViewModelTest {
         subtitle: String = "第 3 集",
         imageTag: String? = "tag-1",
         runTimeMs: Long? = 1_800_000L,
+        kind: String = MediaKind.EPISODE.name,
     ) = LastPlayed(
         itemId = itemId,
         positionMs = positionMs,
@@ -81,6 +83,7 @@ class AppSessionViewModelTest {
         imageTag = imageTag,
         runTimeMs = runTimeMs,
         updatedAt = 0L,
+        kind = kind,
     )
 
     /** 默认没有激活服务器(相当于"退出登录"/冷启动还没连过):[refreshBaseUrl] 不会被触发,
@@ -240,5 +243,67 @@ class AppSessionViewModelTest {
 
         verify { pausedPlayer.play() }
         coVerify(exactly = 0) { engine.play(any(), any(), any()) }
+    }
+
+    // ---- 复审 Task 5 Important 2:kind 必须按记录还原,不能固定成 EPISODE ----
+    // 之前这里硬编码 MediaKind.EPISODE,并声称"播放开始后会被真实数据覆盖"——这句话是假的,
+    // AudioPlaybackEngineImpl.play() 根本不碰 PlayQueue。电影是一等公民,恢复出来的电影如果
+    // 被误判成剧集,播完时 AutoPlayNextController 会去找"下一集"而不是判定为整部片子播完。
+
+    @Test
+    fun `恢复出来的条目,kind 按记录里的值还原成MOVIE,不再固定成EPISODE`() = runTest(testDispatcher) {
+        val queue = PlayQueue()
+        val r = record(kind = MediaKind.MOVIE.name)
+        newViewModel(lastPlayed = r, playQueue = queue)
+
+        advanceUntilIdle()
+
+        assertEquals(MediaKind.MOVIE, queue.current.value?.kind, "恢复出来的电影不能被误判成剧集")
+    }
+
+    @Test
+    fun `记录里kind是无法识别的值时降级成EPISODE而不是崩溃`() = runTest(testDispatcher) {
+        val queue = PlayQueue()
+        val r = record(kind = "这不是一个合法的MediaKind")
+        newViewModel(lastPlayed = r, playQueue = queue)
+
+        advanceUntilIdle()
+
+        assertEquals(MediaKind.EPISODE, queue.current.value?.kind, "无法识别的 kind 应该静默降级,不影响冷启动")
+    }
+
+    // ---- 复审 Task 5 Important 1:换服务器必须重置进程内已经装填好的迷你条/播放队列 ----
+    // 复现路径:设置 → 管理服务器 → 删除当前活跃服务器 → 连一台新服务器 → 回首页。之前
+    // onServerConnected() 只清了 LastPlayedStore 这一份磁盘记录,init 里 restoreLastPlayed()
+    // 已经灌进 _miniPlayer / playQueue 的内存状态完全没被碰——迷你条会继续显示旧服务器那一集,
+    // 点播放会把旧服务器的 itemId 发给刚连上的新服务器。
+
+    @Test
+    fun `onServerConnected清空进程内迷你条与播放队列,不让旧服务器的恢复状态survive`() = runTest(testDispatcher) {
+        val queue = PlayQueue()
+        // relaxed:onServerConnected() 顺带调用的 refreshBaseUrl() 会摸 session.cachedBaseUrlOrNull()
+        // (没有包 runCatching),跟这条用例要断言的东西无关,只是要让它走得通。
+        val viewModel = newViewModel(playQueue = queue, session = mockk(relaxed = true))
+        advanceUntilIdle()
+        assertNotNull(viewModel.miniPlayer.value, "前提:确实发生过一次恢复")
+        assertNotNull(queue.current.value, "前提:队列里确实有恢复出来的条目")
+
+        viewModel.onServerConnected()
+        advanceUntilIdle()
+
+        assertNull(viewModel.miniPlayer.value, "换了服务器之后,旧服务器的迷你条不能继续显示")
+        assertNull(queue.current.value, "换了服务器之后,旧条目不能继续留在队列里,否则点播放会把新服务器的请求发给旧 itemId")
+    }
+
+    @Test
+    fun `onServerConnected清掉持久化的上次播放记录`() = runTest(testDispatcher) {
+        val lastPlayedStore = fakeLastPlayedStore(record())
+        val viewModel = newViewModel(lastPlayedStore = lastPlayedStore, session = mockk(relaxed = true))
+        advanceUntilIdle()
+
+        viewModel.onServerConnected()
+        advanceUntilIdle()
+
+        coVerify { lastPlayedStore.clear() }
     }
 }
