@@ -38,11 +38,17 @@ import org.junit.runner.RunWith
  * Task 2 的真机证据:**首页顶部的状态栏 inset 只能被消费一次,而且底部导航栏 inset 不受牵连。**
  *
  * 复现条件说明:App 的 `targetSdk` 是 36,在 Android 15(API 35)及以上的真机上系统**强制**
- * edge-to-edge —— 那时 `WindowInsets.statusBars` 才是非零,外层 `Scaffold`(把系统栏 inset
- * 计入内容内边距)和 Material3 `TopAppBar`(默认应用 `TopAppBarDefaults.windowInsets`,含状态栏)
- * 就会各加一次,顶部凭空多出一个状态栏的高度。手上的模拟器是 API 34,默认**不是** edge-to-edge、
- * inset 恒为 0,直接跑复现不出来 —— 所以这里显式 `setDecorFitsSystemWindows(false)`,
- * 把用户真机上的那个条件搬进测试,再逐像素量。
+ * edge-to-edge —— 那时 `WindowInsets.statusBars` 才是非零,外层 `Scaffold` 会把系统栏 inset
+ * 计入内容内边距。手上的模拟器是 API 34,默认**不是** edge-to-edge、inset 恒为 0,直接跑复现
+ * 不出来 —— 所以这里显式 `setDecorFitsSystemWindows(false)`,把用户真机上的那个条件搬进测试,
+ * 再逐像素量。
+ *
+ * ⚠️ 原本这里量的是 `HomeTopBar`(独立的 Material3 `TopAppBar`)——它默认自带
+ * `TopAppBarDefaults.windowInsets`(含状态栏),会和 `Scaffold` 的内容内边距叠加、把状态栏
+ * inset 算两次。Task 2 把 `HomeTopBar` 整个删掉、图标并进了 `TabRow` 所在的那一行(见
+ * `HomeScreen.kt`),`TabRow` 本身不应用任何 window inset,不存在"自己再垫一次"的风险,
+ * 所以这里改为量首页现在的第一行([HomeScreenTestTags.TAB_ROW]):顶边应当紧贴 `Scaffold`
+ * 已经让出来的状态栏 inset,高度不该比 `TabRow` 的标准容器高度(48dp)多出状态栏那一截。
  *
  * 外壳刻意照抄 `JellyCastNavHost`:`Scaffold` + `bottomBar`(迷你播放条 + 底部 tab 栏)+
  * `padding(padding)` 的内容区。顶部改动不能把底部搞坏,所以底部也一并断言。
@@ -68,7 +74,7 @@ class HomeScreenInsetTest {
 
     private var statusBarPx = 0
     private var navBarPx = 0
-    private var topBarStandardPx = 0
+    private var tabRowStandardPx = 0
     private var bottomBarStandardPx = 0
 
     /** 打开 edge-to-edge 并摆出和 `JellyCastNavHost` 同构的外壳。 */
@@ -80,7 +86,7 @@ class HomeScreenInsetTest {
             val density = LocalDensity.current
             statusBarPx = WindowInsets.statusBars.getTop(density)
             navBarPx = WindowInsets.navigationBars.getBottom(density)
-            topBarStandardPx = with(density) { STANDARD_TOP_BAR_HEIGHT.roundToPx() }
+            tabRowStandardPx = with(density) { STANDARD_TAB_ROW_HEIGHT.roundToPx() }
             bottomBarStandardPx = with(density) { STANDARD_BOTTOM_BAR_HEIGHT.roundToPx() }
             JellyCastTheme(darkTheme = false) {
                 Scaffold(bottomBar = { AppShellBottomBar() }) { padding ->
@@ -108,31 +114,31 @@ class HomeScreenInsetTest {
     }
 
     @Test
-    fun 首页顶栏只消费一次状态栏inset() {
+    fun 首页顶部只消费一次状态栏inset() {
         setEdgeToEdgeContent()
 
-        composeTestRule.onNodeWithTag(HomeScreenTestTags.TOP_BAR).assertIsDisplayed()
         composeTestRule.onNodeWithTag(HomeScreenTestTags.TAB_ROW).assertIsDisplayed()
 
-        val topBar = composeTestRule.onNodeWithTag(HomeScreenTestTags.TOP_BAR).fetchSemanticsNode()
-        val topBarTop = topBar.boundsInRoot.top
-        val topBarHeight = topBar.size.height
+        val tabRow = composeTestRule.onNodeWithTag(HomeScreenTestTags.TAB_ROW).fetchSemanticsNode()
+        val tabRowTop = tabRow.boundsInRoot.top
+        val tabRowHeight = tabRow.size.height
 
         assertTrue(
             "测试前提没成立:状态栏 inset 是 0,说明窗口不是 edge-to-edge,量不出重复计算",
             statusBarPx > 0,
         )
-        // Scaffold 已经把状态栏高度作为内容内边距推下来了——顶栏顶边就该在状态栏下面。
+        // Scaffold 已经把状态栏高度作为内容内边距推下来了——首页第一行(TabRow 所在的那一行)
+        // 顶边就该在状态栏下面。
         assertTrue(
-            "Scaffold 应当已经消费了状态栏 inset:顶栏顶边 ${topBarTop}px,状态栏 ${statusBarPx}px",
-            topBarTop >= statusBarPx - 1f,
+            "Scaffold 应当已经消费了状态栏 inset:第一行顶边 ${tabRowTop}px,状态栏 ${statusBarPx}px",
+            tabRowTop >= statusBarPx - 1f,
         )
-        // 顶栏**自己**不该再垫一次:它的高度就该是 TopAppBar 的标准高度。
+        // TabRow 不应用任何 window inset,不该再垫一次:它的高度就该是标准高度。
         assertTrue(
-            "状态栏 inset 被算了两次:顶栏顶边已在 ${topBarTop}px(= 状态栏 ${statusBarPx}px)," +
-                "顶栏自身高度却是 ${topBarHeight}px,比标准高度 ${topBarStandardPx}px 多出 " +
-                "${topBarHeight - topBarStandardPx}px —— 和状态栏高度 ${statusBarPx}px 吻合",
-            topBarHeight <= topBarStandardPx + TOLERANCE_PX,
+            "状态栏 inset 被算了两次:第一行顶边已在 ${tabRowTop}px(= 状态栏 ${statusBarPx}px)," +
+                "自身高度却是 ${tabRowHeight}px,比标准高度 ${tabRowStandardPx}px 多出 " +
+                "${tabRowHeight - tabRowStandardPx}px —— 和状态栏高度 ${statusBarPx}px 吻合",
+            tabRowHeight <= tabRowStandardPx + TOLERANCE_PX,
         )
     }
 
@@ -177,8 +183,8 @@ class HomeScreenInsetTest {
     }
 }
 
-/** Material3 `TopAppBar` 的标准容器高度(不含任何 window inset)。 */
-private val STANDARD_TOP_BAR_HEIGHT = 64.dp
+/** Material3 `TabRow`(纯文本 Tab)的标准容器高度(不含任何 window inset)。 */
+private val STANDARD_TAB_ROW_HEIGHT = 48.dp
 
 /** Material3 `NavigationBar` 的标准容器高度(不含任何 window inset)。 */
 private val STANDARD_BOTTOM_BAR_HEIGHT = 80.dp

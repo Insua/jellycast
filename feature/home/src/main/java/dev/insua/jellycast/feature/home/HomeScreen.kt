@@ -7,7 +7,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -28,7 +27,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
@@ -61,7 +59,6 @@ import kotlinx.coroutines.delay
 /** 定位节点用的测试标签,不依赖文案(文案会改)。 */
 object HomeScreenTestTags {
     const val ERROR_RETRY = "home_error_retry"
-    const val TOP_BAR = "home_top_bar"
     const val SEARCH_BUTTON = "home_top_bar_search"
     const val ACCOUNT_BUTTON = "home_top_bar_account"
     const val TAB_ROW = "home_tab_row"
@@ -218,25 +215,45 @@ fun HomeScreenContent(
     var offlineNoticeDismissed by rememberSaveable { mutableStateOf(false) }
 
     Box {
-    Column(modifier = Modifier.padding(vertical = 8.dp)) {
-        HomeTopBar(onSearchClick = onSearchClick, onAccountClick = onAccountClick)
-
+    Column {
+        // 设计文档 §2:顶部只留一行。
+        //
+        // 原先是「TopAppBar(静态应用名 + 两个图标)」压在「TabRow」上面,两行加起来 112dp,
+        // 而其中 64dp 那一行只装了一个用户早就知道的应用名 —— 他清楚自己打开的是哪个 App。
+        // 把图标并进标签行,顶部 chrome 减半。
+        //
         // 顶部标签(设计文档 §3.6):首页信息流 / 我的最爱。切标签不触发新请求——两份数据
         // 已经在 [HomeViewModel.load] 里并发取好,这里只是本地状态切换。
-        TabRow(
-            selectedTabIndex = uiState.tab.ordinal,
-            modifier = Modifier.testTag(HomeScreenTestTags.TAB_ROW),
-        ) {
-            Tab(
-                selected = uiState.tab == HomeTab.FEED,
-                onClick = { onSelectTab(HomeTab.FEED) },
-                text = { Text("首页") },
-            )
-            Tab(
-                selected = uiState.tab == HomeTab.FAVORITES,
-                onClick = { onSelectTab(HomeTab.FAVORITES) },
-                text = { Text("我的最爱") },
-            )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            TabRow(
+                selectedTabIndex = uiState.tab.ordinal,
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag(HomeScreenTestTags.TAB_ROW),
+            ) {
+                Tab(
+                    selected = uiState.tab == HomeTab.FEED,
+                    onClick = { onSelectTab(HomeTab.FEED) },
+                    text = { Text("首页") },
+                )
+                Tab(
+                    selected = uiState.tab == HomeTab.FAVORITES,
+                    onClick = { onSelectTab(HomeTab.FAVORITES) },
+                    text = { Text("我的最爱") },
+                )
+            }
+            IconButton(
+                onClick = onSearchClick,
+                modifier = Modifier.testTag(HomeScreenTestTags.SEARCH_BUTTON),
+            ) {
+                Icon(Icons.Filled.Search, contentDescription = "搜索")
+            }
+            IconButton(
+                onClick = onAccountClick,
+                modifier = Modifier.testTag(HomeScreenTestTags.ACCOUNT_BUTTON),
+            ) {
+                Icon(Icons.Filled.AccountCircle, contentDescription = "账户")
+            }
         }
 
         // 显示的是上次的内容:提示一句,但绝不挡住内容本身,也允许用户关掉。这条横幅覆盖两个
@@ -309,45 +326,6 @@ fun HomeScreenContent(
 
     ActionMessageHost(message = uiState.actionError, onMessageShown = onActionErrorShown)
     }
-}
-
-/**
- * 顶部栏(设计文档 §3.6):App 身份(名称)+ 搜索入口 + 账户入口。参照的是 Jellyfin Web mobile
- * 的结构——一行放"你在哪个 App"和两个跳转口子,不是它的深色配色,JellyCast 全程保持浅色。
- *
- * ⚠️ **[windowInsets] 显式清零,状态栏 inset 由外层 `Scaffold` 统一消费一次。**
- * Material3 的 `TopAppBar` 默认带 `TopAppBarDefaults.windowInsets`(含状态栏),而
- * `JellyCastNavHost` 的 `Scaffold` 也把系统栏 inset 计入内容内边距、通过 `padding(padding)`
- * 传给 NavHost —— 两者叠加,首页顶部就凭空多出一个状态栏的高度(真机实测 66px @440dpi,
- * 见 `HomeScreenInsetTest`)。
- *
- * 为什么让顶栏让路、而不是让 Scaffold 让路:Scaffold 是**全 App 唯一**的那层外壳,它同时
- * 负责底部——迷你播放条和底部 tab 栏就长在它的 `bottomBar` 里,导航栏 inset 靠它。把它改成
- * `contentWindowInsets = WindowInsets(0)` 就得让**每一个**页面各自处理系统栏,是更大的改动、
- * 更多的出错面。顶栏这一处清零只影响首页,底部完全不受牵连。
- */
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun HomeTopBar(onSearchClick: () -> Unit, onAccountClick: () -> Unit) {
-    TopAppBar(
-        title = { Text("JellyCast") },
-        windowInsets = WindowInsets(0, 0, 0, 0),
-        actions = {
-            IconButton(
-                onClick = onSearchClick,
-                modifier = Modifier.testTag(HomeScreenTestTags.SEARCH_BUTTON),
-            ) {
-                Icon(Icons.Filled.Search, contentDescription = "搜索")
-            }
-            IconButton(
-                onClick = onAccountClick,
-                modifier = Modifier.testTag(HomeScreenTestTags.ACCOUNT_BUTTON),
-            ) {
-                Icon(Icons.Filled.AccountCircle, contentDescription = "账户")
-            }
-        },
-        modifier = Modifier.testTag(HomeScreenTestTags.TOP_BAR),
-    )
 }
 
 @Composable
