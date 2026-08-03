@@ -1,9 +1,11 @@
 package dev.insua.jellycast.datastore
 
+import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.Serializable
@@ -37,7 +39,20 @@ data class LastPlayed(
 
 private val KEY_LAST_PLAYED = stringPreferencesKey("last_played")
 
+/**
+ * 专用的 preferences 文件 —— **不得**和 [ServerStore] 的 `"servers"` 或 [PreferencesStore] 的
+ * `"preferences"` 同名。DataStore 对同一份文件在进程内只允许存在一个活跃实例,撞名会在运行时抛
+ * "There are multiple DataStores active for the same file" —— 而这类问题任何测试都发现不了,
+ * 只能在真机/DI 装配时炸。见类 KDoc:构造函数刻意只接 [DataStore],不内部持有文件名,是为了
+ * 让 [LastPlayedStoreTest] 能直接喂一个临时文件驱动的实例;这个 [Context] 版构造函数把文件名
+ * 收拢回类内部,和 [ServerStore] / [PreferencesStore] 的既有约定(调用方只传 `Context`,
+ * 不用知道文件名)保持一致,DI 装配处不会有机会手滑指到别的文件。
+ */
+private val Context.lastPlayedDataStore by preferencesDataStore("last_played")
+
 class LastPlayedStore(private val dataStore: DataStore<Preferences>) {
+    constructor(context: Context) : this(context.lastPlayedDataStore)
+
     private val json = Json { ignoreUnknownKeys = true }
 
     val lastPlayed: Flow<LastPlayed?> = dataStore.data.map { prefs ->

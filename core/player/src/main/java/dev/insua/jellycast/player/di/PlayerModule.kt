@@ -10,6 +10,7 @@ import dagger.hilt.components.SingletonComponent
 import dev.insua.jellycast.database.JellyCastDatabase
 import dev.insua.jellycast.database.ProgressReportDao
 import dev.insua.jellycast.database.buildJellyCastDatabase
+import dev.insua.jellycast.datastore.LastPlayedStore
 import dev.insua.jellycast.datastore.PreferencesStore
 import dev.insua.jellycast.datastore.ServerStore
 import dev.insua.jellycast.network.JellyfinApi
@@ -152,6 +153,16 @@ object PlayerModule {
     @Provides
     @Singleton
     fun providePreferencesStore(@ApplicationContext context: Context): PreferencesStore = PreferencesStore(context)
+
+    /**
+     * 复审(Task 3):[LastPlayedStore] 的 `Context` 构造函数把 preferences 文件名收拢在类内部
+     * (`"last_played"`,和 [ServerStore]/[PreferencesStore] 各自的文件互不相同)——这里不能像
+     * [ProgressReporter] 那样自己拼一个 `DataStore<Preferences>` 出来,否则文件名会和某个既有
+     * store 撞在一起,运行时抛 "multiple DataStores active for the same file"。
+     */
+    @Provides
+    @Singleton
+    fun provideLastPlayedStore(@ApplicationContext context: Context): LastPlayedStore = LastPlayedStore(context)
 
     @Provides
     @Singleton
