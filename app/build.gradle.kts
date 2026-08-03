@@ -228,6 +228,9 @@ dependencies {
     androidTestImplementation(libs.compose.ui.test.junit4)
     debugImplementation(libs.compose.ui.test.manifest)
     androidTestImplementation(libs.androidx.test.runner)
+    // SystemBarsAppearanceTest 直接读 WindowCompat.getInsetsController —— :app 只把 core-ktx
+    // 声明成 implementation,androidTest 的编译期 classpath 不会传递拿到,需要单独声明一次。
+    androidTestImplementation(libs.androidx.core.ktx)
     androidTestUtil(libs.androidx.test.orchestrator)
     androidTestUtil(libs.androidx.test.services)
     androidTestImplementation(libs.androidx.test.ext.junit)

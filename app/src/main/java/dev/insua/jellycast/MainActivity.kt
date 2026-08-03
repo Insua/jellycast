@@ -3,6 +3,7 @@ package dev.insua.jellycast
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.core.view.WindowCompat
 import dagger.hilt.android.AndroidEntryPoint
 import dev.insua.jellycast.designsystem.JellyCastTheme
 import dev.insua.jellycast.navigation.JellyCastNavHost
@@ -26,6 +27,15 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 设计文档 §1:这个应用只有浅色主题(深色主题已被明确否决),所以系统栏图标固定为深色。
+        //
+        // 为什么不能只靠 XML 主题:主题只是给系统的一个"猜测依据",而真正决定图标颜色的是
+        // WindowInsetsController 上的这两个标志。显式声明一次,行为就不再依赖父主题选得对不对,
+        // 也不受后续主题改动影响。
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            isAppearanceLightStatusBars = true
+            isAppearanceLightNavigationBars = true
+        }
         setContent {
             JellyCastTheme {
                 JellyCastNavHost()

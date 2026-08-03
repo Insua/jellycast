@@ -1,8 +1,13 @@
 <resources>
-    <!-- Compose-only app: no AppCompat / Material Components XML theme dependency.
-         This theme only exists to satisfy the Android manifest requirement
-         (a launch/splash background) before Compose content is set. -->
-    <style name="Theme.JellyCast" parent="android:Theme.Material.NoActionBar">
-        <item name="android:windowBackground">@android:color/black</item>
+    <!--
+      Compose-only app: no AppCompat / Material Components XML theme dependency.
+      这个主题只为满足 manifest 的要求(Compose 内容设置之前的启动/闪屏背景)而存在。
+
+      ⚠️ 父主题必须是 **Light**。系统会按父主题判定"应用背景是深是浅",据此决定系统栏
+      图标的颜色。继承深色主题会让系统画浅色(白色)图标,落在本应用的浅色界面上几乎看不清。
+      MainActivity 里还会再显式声明一次(见那里的注释)——两处一致,不依赖任何一处单独生效。
+    -->
+    <style name="Theme.JellyCast" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/launch_background</item>
     </style>
 </resources>
