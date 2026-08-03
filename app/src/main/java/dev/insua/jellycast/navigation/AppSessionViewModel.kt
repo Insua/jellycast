@@ -7,9 +7,11 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import dev.insua.jellycast.datastore.LastPlayedStore
 import dev.insua.jellycast.datastore.ServerStore
 import dev.insua.jellycast.feature.player.PlayerConnection
 import dev.insua.jellycast.model.MediaItem
+import dev.insua.jellycast.model.MediaKind
 import dev.insua.jellycast.model.displaySubtitle
 import dev.insua.jellycast.network.mapper.posterUrl
 import dev.insua.jellycast.network.session.JellyfinSession
@@ -104,6 +106,7 @@ class AppSessionViewModel @Inject constructor(
     private val audioPlaybackEngine: AudioPlaybackEngine,
     private val autoPlayNextController: AutoPlayNextController,
     private val playerConnection: PlayerConnection,
+    private val lastPlayedStore: LastPlayedStore,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
 
@@ -136,15 +139,68 @@ class AppSessionViewModel @Inject constructor(
     private val _returnToHome = MutableStateFlow(false)
     val returnToHome: StateFlow<Boolean> = _returnToHome.asStateFlow()
 
+    /**
+     * 见 [restoreLastPlayed] / [observeMiniPlayer]:恢复出来的迷你条还没有对应的真实播放会话时为
+     * `true` —— 这是两者之间的握手位,防止 [observeMiniPlayer] 在 [PlayerConnection.nowPlaying]
+     * 还是 `null`(冷启动、真播放从未发生过)这个必然会先收到一次的初始值上,把刚恢复出来的状态
+     * 冲成 `null`。一旦真实播放开始([observeMiniPlayer] 收到非 null 的 `info`)就永久置回 `false`,
+     * 之后再收到 `null`(真会话断开)就照旧清空迷你条,和改动前的行为一致。
+     */
+    private var restoredWithoutSession = false
+
     init {
         viewModelScope.launch {
             val activeId = serverStore.activeServerId.first()
             _startDestination.value = if (activeId != null) Routes.HOME else Routes.SERVERS
             if (activeId != null) refreshBaseUrl()
         }
+        restoreLastPlayed()
         observeMiniPlayer()
         observePlaybackFailure()
         observePlaybackSequenceEnd()
+    }
+
+    /**
+     * 冷启动恢复迷你播放条(设计文档 §3):不用先进首页找到"继续收听"再点进去,迷你条直接就是
+     * 上次那一集、停在离开时的位置。
+     *
+     * 🔴 三条硬约束(任务报告有变异验证):
+     * 1. **绝不自动开始播放** —— 这里只读 [LastPlayedStore],不调 [AudioPlaybackEngine.play],
+     *    `isPlaying` 恒为 `false`。真正开始播放只发生在用户点了迷你条播放按钮之后([onMiniPlayerPlayPause])。
+     * 2. **绝不启动前台服务、绝不发通知** —— 同样因为这里不碰 [audioPlaybackEngine] / [context]
+     *    里任何会拉起 `PlaybackService` 的调用。
+     * 3. **绝不发网络请求** —— [LastPlayedStore] 是纯本地 DataStore,不碰 [session]/[JellyfinApi]。
+     *    断网、退出登录、服务器不可达,这条路都能工作。
+     *
+     * [MediaItem.resumePositionMs] 设成记录里的位置(关键复用,见类注释):点迷你条播放时走的是
+     * 和首页点条目完全相同的 [play] 路径,那条路已经用这个字段当播放起点,不需要另开一条特殊逻辑。
+     *
+     * `kind` 固定给 [MediaKind.EPISODE]:[LastPlayed] 按 Task 3 的设计不存条目类型(只存渲染迷你条
+     * 与续播所需的最少字段),这是已知的、有意接受的简化——真实类型会在用户点开播放、
+     * `:core:player` 侧的元数据/连播逻辑接管之后被正确的数据覆盖。
+     */
+    private fun restoreLastPlayed() {
+        viewModelScope.launch {
+            val record = lastPlayedStore.lastPlayed.first() ?: return@launch
+            val item = MediaItem(
+                id = record.itemId,
+                kind = MediaKind.EPISODE,
+                name = record.title,
+                runTimeMs = record.runTimeMs,
+                resumePositionMs = record.positionMs,
+                imageTag = record.imageTag,
+            )
+            playQueue.setQueue(listOf(item), 0)
+            restoredWithoutSession = true
+            _miniPlayer.value = MiniPlayerUiState(
+                title = record.title,
+                subtitle = record.subtitle,
+                posterUrl = baseUrl.value.takeIf { it.isNotBlank() }?.let { item.posterUrl(it) },
+                isPlaying = false,
+                progress = miniPlayerProgress(record.positionMs, record.runTimeMs),
+                hasNext = false,
+            )
+        }
     }
 
     /** 提示已经展示过了,清空,免得下一次重组又弹一遍。 */
@@ -191,9 +247,16 @@ class AppSessionViewModel @Inject constructor(
         }
     }
 
-    /** 登录/添加服务器成功后由导航层调用,让首页/媒体库尽快拿到正确的封面 baseUrl。 */
+    /**
+     * 登录/添加服务器成功后由导航层调用,让首页/媒体库尽快拿到正确的封面 baseUrl。
+     *
+     * 顺带清掉本地的「上次播放」记录(设计文档 §3「记录失效」):这条记录属于**上一次**登录的
+     * 服务器,连上一台新的(或换一台)服务器之后继续把它摆在迷你条上没有意义——轻则条目对不上
+     * 这台服务器,重则续播时拿着别的服务器的 itemId 去发请求。
+     */
     fun onServerConnected() {
         refreshBaseUrl()
+        viewModelScope.launch { lastPlayedStore.clear() }
     }
 
     /**
@@ -240,9 +303,11 @@ class AppSessionViewModel @Inject constructor(
         viewModelScope.launch {
             playerConnection.nowPlaying.collectLatest { info ->
                 if (info == null) {
-                    _miniPlayer.value = null
+                    // 见 [restoredWithoutSession]:恢复出来但还没真正开始播的迷你条不能被这里冲掉。
+                    if (!restoredWithoutSession) _miniPlayer.value = null
                     return@collectLatest
                 }
+                restoredWithoutSession = false
                 val posterUrl = baseUrl.value.takeIf { it.isNotBlank() }?.let { info.mediaItem.posterUrl(it) }
                 while (currentCoroutineContext().isActive) {
                     val player = playerConnection.player.value
@@ -264,7 +329,24 @@ class AppSessionViewModel @Inject constructor(
         }
     }
 
+    /**
+     * 迷你条播放/暂停按钮。
+     *
+     * 「恢复出来但还没真正开始播」是 [restoreLastPlayed] 引入的新状态:此时根本没有 MediaController
+     * 会话可以切换([playerConnection.player] 仍是 `null`),必须改为发起一次真正的播放——复用和
+     * 首页点条目完全相同的 [play] 路径,起点是 [restoreLastPlayed] 里塞进 [MediaItem.resumePositionMs]
+     * 的记录位置。
+     *
+     * 判据用 [AudioPlaybackEngine.currentItemId] 是否为空,**不用** `player?.isPlaying`:一个被用户
+     * 手动暂停的真实会话同样 `isPlaying == false`,那种情况必须走下面的切换分支,不能被误判成
+     * "还没开始播"而重新起播,把用户暂停的位置弄丢。
+     */
     fun onMiniPlayerPlayPause() {
+        val restoredItem = playQueue.current.value
+        if (audioPlaybackEngine.currentItemId == null && restoredItem != null) {
+            play(restoredItem, listOf(restoredItem))
+            return
+        }
         playerConnection.player.value?.let { player -> if (player.isPlaying) player.pause() else player.play() }
     }
 
