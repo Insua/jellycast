@@ -128,6 +128,25 @@ class SettingsViewModelTest {
         assertEquals(AudioDeliveryLevel.SERVER_AUDIO_ONLY, viewModel.uiState.value.currentDeliveryLevel)
     }
 
+    /**
+     * 复审 Task 5 Finding 1:命中缓存的 PlaybackSource.level 仍是 SERVER_AUDIO_ONLY(实现细节),
+     * ViewModel 必须把 isLocalFile 原样透传出去,显示层(SettingsScreen 的
+     * deliveryLevelDisplayLabel)才有依据在播本地文件时不显示「L1 · 服务端纯音频」这种假话。
+     */
+    @Test fun `播放本地缓存文件时开发者信息标记为本地文件`() = runTest(testDispatcher) {
+        val source = PlaybackSource(
+            itemId = "ep1", mediaSourceId = "ep1", streamUrl = "file:///cache/ep1.m4a",
+            level = AudioDeliveryLevel.SERVER_AUDIO_ONLY, isHls = false, playSessionId = null,
+            audioTracks = emptyList(), textSubtitles = emptyList(), isLocalFile = true,
+        )
+        val viewModel = SettingsViewModel(
+            preferencesStore(), session(), engine(PlaybackEngineState.Ready(source)), byteCounter(), exporter(),
+        )
+        advanceUntilIdle()
+
+        assertEquals(true, viewModel.uiState.value.currentSourceIsLocalFile)
+    }
+
     @Test fun `修改快退秒数会写回 PreferencesStore`() = runTest(testDispatcher) {
         val store = preferencesStore()
         val viewModel = SettingsViewModel(store, session(), engine(), byteCounter(), exporter())

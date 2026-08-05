@@ -28,6 +28,20 @@ data class SettingsUiState(
     val audioBitRateKbps: Int = 128,
     val currentEndpoint: String? = null,
     val currentDeliveryLevel: AudioDeliveryLevel? = null,
+    /**
+     * 当前播放源是否来自本地音频缓存([dev.insua.jellycast.model.PlaybackSource.isLocalFile])。
+     *
+     * 复审发现:命中缓存的 `PlaybackSource.level` 仍然是 [AudioDeliveryLevel.SERVER_AUDIO_ONLY]
+     * (`CacheAwareSourceProvider` 的实现细节,见其 KDoc),但那条流其实**一次请求都没发给服务端**。
+     * `currentDeliveryLevel` 单独暴露会让「开发者信息」面板在播缓存文件时显示「L1 · 服务端纯音频」
+     * ——这是假话,而且会和旁边几乎是 0 的「本次会话已传输字节数」自相矛盾。这个面板存在的唯一
+     * 目的就是让人能看清"这次到底走的是哪条网络路径",报错比什么都不报更糟。
+     *
+     * 这里单独暴露 [isLocalFile],由显示层([SettingsScreen] 的 `deliveryLevelDisplayLabel`)在
+     * `isLocalFile` 为真时整体覆盖显示文案——而不是往 [AudioDeliveryLevel] 里加一个新枚举值:
+     * `SettingsScreen` 对该枚举有一处穷尽 `when`,加值会牵连到那处无关代码。
+     */
+    val currentSourceIsLocalFile: Boolean = false,
     val sessionBytesTransferred: Long = 0L,
     val diagnosticsEnabled: Boolean = true,
 )
@@ -88,8 +102,13 @@ class SettingsViewModel @Inject constructor(
         }
         viewModelScope.launch {
             playbackEngine.state.collect { state ->
-                val level = (state as? PlaybackEngineState.Ready)?.source?.level
-                _uiState.update { it.copy(currentDeliveryLevel = level) }
+                val source = (state as? PlaybackEngineState.Ready)?.source
+                _uiState.update {
+                    it.copy(
+                        currentDeliveryLevel = source?.level,
+                        currentSourceIsLocalFile = source?.isLocalFile ?: false,
+                    )
+                }
             }
         }
         viewModelScope.launch {

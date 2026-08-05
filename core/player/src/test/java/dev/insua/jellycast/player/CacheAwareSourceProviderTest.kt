@@ -168,5 +168,11 @@ class CacheAwareSourceProviderTest {
         assertTrue(source.audioTracks.isEmpty(), "元数据查询失败,音轨信息缺失是可接受的降级")
         assertTrue(source.textSubtitles.isEmpty(), "元数据查询失败,字幕信息缺失是可接受的降级——不是不能播")
         assertTrue(calls.isEmpty(), "元数据走轻量 api.playbackInfo,不该退回到会起转码探测的底层解析器")
+        // 复审 Finding 2:touch 目前写在元数据 try/catch 之前、对所有命中路径无条件执行,但唯一
+        // 覆盖 touch 的用例(「命中缓存更新最后访问时间」)走的是元数据查询成功的分支——如果以后
+        // 有人把 touch 挪进元数据成功之后的分支,不会有任何用例发现。一集如果只在断网时听过,
+        // 没有 touch 就永远刷新不了 lastAccessAt,驱逐策略会把它当"很久没碰过"优先删掉,
+        // 比真正很久没听的集更早被清掉。
+        coVerify(exactly = 1) { cacheStore.touch(SERVER_ID, ITEM_ID) }
     }
 }

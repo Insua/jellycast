@@ -156,6 +156,7 @@ fun SettingsScreen(
                 DeveloperInfoSection(
                     endpoint = uiState.currentEndpoint,
                     deliveryLevel = uiState.currentDeliveryLevel,
+                    isLocalFile = uiState.currentSourceIsLocalFile,
                     bytesTransferred = uiState.sessionBytesTransferred,
                 )
             }
@@ -164,18 +165,33 @@ fun SettingsScreen(
 }
 
 @Composable
-private fun DeveloperInfoSection(endpoint: String?, deliveryLevel: AudioDeliveryLevel?, bytesTransferred: Long) {
+private fun DeveloperInfoSection(
+    endpoint: String?,
+    deliveryLevel: AudioDeliveryLevel?,
+    isLocalFile: Boolean,
+    bytesTransferred: Long,
+) {
     Column(modifier = Modifier.padding(horizontal = 16.dp)) {
         DevInfoLine("当前 endpoint", endpoint ?: "未连接")
-        DevInfoLine("当前音频降级级别", deliveryLevel.toDisplayLabel())
+        DevInfoLine("当前音频降级级别", deliveryLevelDisplayLabel(deliveryLevel, isLocalFile))
         DevInfoLine("本次会话已传输", formatBytes(bytesTransferred))
     }
 }
 
-private fun AudioDeliveryLevel?.toDisplayLabel(): String = when (this) {
-    AudioDeliveryLevel.SERVER_AUDIO_ONLY -> "L1 · 服务端纯音频"
-    AudioDeliveryLevel.CLIENT_VIDEO_DISABLED -> "L3 · 客户端禁用视频轨(兜底)"
-    null -> "未在播放"
+/**
+ * 复审发现:命中音频缓存的 `PlaybackSource.level` 仍然是 `AudioDeliveryLevel.SERVER_AUDIO_ONLY`
+ * (`CacheAwareSourceProvider` 的实现细节),但那条流其实一次请求都没发给服务端——如果这里只看
+ * [level] 不看 [isLocalFile],面板会在播本地缓存文件时显示「L1 · 服务端纯音频」,和几乎为 0 的
+ * 「本次会话已传输字节数」自相矛盾。[isLocalFile] 因此在这里优先于 [level] 判断,整体覆盖显示文案
+ * ——不新增 [AudioDeliveryLevel] 枚举值(会牵连到别处对它的穷尽 `when`),纯粹是显示层的判断。
+ *
+ * 纯函数,不接触 Compose/Android——可离线单测,和 [formatBytes] 同一种做法。
+ */
+internal fun deliveryLevelDisplayLabel(level: AudioDeliveryLevel?, isLocalFile: Boolean): String = when {
+    isLocalFile -> "本地缓存 · 未发起网络请求"
+    level == AudioDeliveryLevel.SERVER_AUDIO_ONLY -> "L1 · 服务端纯音频"
+    level == AudioDeliveryLevel.CLIENT_VIDEO_DISABLED -> "L3 · 客户端禁用视频轨(兜底)"
+    else -> "未在播放"
 }
 
 /** 纯换算,不接触 Android——可离线单测。 */
