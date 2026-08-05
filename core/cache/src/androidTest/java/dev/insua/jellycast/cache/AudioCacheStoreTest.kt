@@ -236,4 +236,37 @@ class AudioCacheStoreTest {
         assertFalse("索引之外的文件应该被清掉", orphanFile.exists())
         assertFalse(".part 文件应该被无条件清掉", strayPart.exists())
     }
+
+    /**
+     * 复审 Important:[AudioCacheStore.sweepOrphans] 原来只信"文档写了只在启动时调用",没有任何
+     * 代码层面的保护。这条用例钉死"和正在进行的 [AudioCacheStore.store] 撞在同一个 serverId 上
+     * 也必须安全"——下载中途被并发调用的 sweepOrphans 不能把它正在写的 `.part` 文件删掉,
+     * 否则 `renameTo` 之后按路径找不到源文件,下载会莫名其妙失败。
+     */
+    @Test
+    fun `sweepOrphans与进行中的下载并发_不影响下载完成_文件保留`() = runBlocking {
+        val body = ByteArray(300_000) { it.toByte() }
+        server.enqueue(
+            MockResponse()
+                .setBody(Buffer().write(body))
+                .throttleBody(20_000, 200, TimeUnit.MILLISECONDS)
+        )
+
+        val scope = CoroutineScope(Dispatchers.Default)
+        val job = scope.launch {
+            store.store(SERVER_ID, ITEM_ID, meta(), server.url("/audio").toString())
+        }
+        kotlinx.coroutines.delay(300)
+
+        // 下载还没完成的时候扫一次孤儿——不该把正在写的 .part 文件当成孤儿删掉。
+        store.sweepOrphans(SERVER_ID)
+
+        job.join()
+
+        val entity = dao.findByItemId(SERVER_ID, ITEM_ID)
+        assertNotNull("in-flight 期间跑一次 sweepOrphans 不该打断这次下载", entity)
+        val file = File(entity!!.filePath)
+        assertTrue("下载完成后文件应该还在", file.exists())
+        assertEquals("文件应该完整——没有被 unlink 后又在半路断掉", body.size.toLong(), file.length())
+    }
 }

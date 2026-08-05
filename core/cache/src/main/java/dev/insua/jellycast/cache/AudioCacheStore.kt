@@ -3,8 +3,9 @@ package dev.insua.jellycast.cache
 import android.content.Context
 import dev.insua.jellycast.database.CachedAudioDao
 import dev.insua.jellycast.database.CachedAudioEntity
-import kotlinx.coroutines.CancellationException
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.CancellationException
 
 /**
  * [AudioCacheStore.store] 需要的、DAO 之外的最小元数据。排序信息([seasonNumber]/[episodeNumber])
@@ -57,6 +58,23 @@ class AudioCacheStore(
             .apply { mkdirs() }
 
     /**
+     * 复审 Important:[sweepOrphans] 只信"索引里有没有"，对它自己没有任何"这个文件是不是正在
+     * 下载"的概念——它的正确性原本完全靠一条没有代码强制的约定"只在启动时调用"。但 Task 6
+     * 马上就会真的接一个调用方,以后"清除缓存"这种用户触发的操作也会调它,这条约定迟早会被
+     * 违反:[sweepOrphans] 如果和 [store] 并发跑在同一个 serverId 上,会把正在写的 `.part`
+     * 文件从文件系统里 unlink 掉——写入 fd 仍然有效、能继续写完,但后续 `renameTo` 按路径找不到
+     * 源文件,下载会莫名其妙地失败。
+     *
+     * 用一个内存态的"正在下载中"登记表堵住这个口子:只有 [store] 知道哪些下载正在飞,所以这个
+     * 登记表就放在 [store] 里维护,而不是指望调用方自己排队/加锁。[ConcurrentHashMap] 的 key set
+     * 是线程安全的——下载本身跑在 `Dispatchers.IO`,`sweepOrphans` 可能从任意调度器被调用,
+     * 不能假设两者在同一个线程上。
+     */
+    private val inFlight = ConcurrentHashMap.newKeySet<String>()
+
+    private fun inFlightKey(serverId: String, itemId: String) = "$serverId/$itemId"
+
+    /**
      * 索引里有记录只是"曾经缓存完成过"的声明,这里额外校验文件真的还在——文件可能被用户手动
      * 清了 app 私有目录、或者别的什么方式被外部删掉了。校验失败时顺手把这条脏记录也从索引里
      * 清掉,不让它继续骗后续的容量统计([totalBytes])和驱逐决策([dao.findByServer] 的调用方)。
@@ -87,48 +105,58 @@ class AudioCacheStore(
         val finalFile = File(dir, itemId)
         val partFile = File(dir, "$itemId$PART_SUFFIX")
 
-        val downloaded = try {
-            downloader.download(sourceUrl, partFile)
-        } catch (e: CancellationException) {
-            partFile.delete()
-            throw e
-        } catch (e: Exception) {
-            partFile.delete()
-            false
-        }
-        if (!downloaded) {
-            partFile.delete()
-            return false
-        }
+        // 登记"这个 itemId 正在下载",让并发跑的 sweepOrphans 别把 .part 文件当孤儿删掉。
+        // finally 保证无论走哪条退出路径(成功/失败/取消)都会摘牌——finally 里只是同步的
+        // 集合操作,不会挂起,协程被取消时照样会执行,不用担心这里漏掉摘牌导致这个 itemId
+        // 从此再也扫不到。
+        val key = inFlightKey(serverId, itemId)
+        inFlight += key
+        try {
+            val downloaded = try {
+                downloader.download(sourceUrl, partFile)
+            } catch (e: CancellationException) {
+                partFile.delete()
+                throw e
+            } catch (e: Exception) {
+                partFile.delete()
+                false
+            }
+            if (!downloaded) {
+                partFile.delete()
+                return false
+            }
 
-        if (!partFile.renameTo(finalFile)) {
-            partFile.delete()
-            return false
-        }
+            if (!partFile.renameTo(finalFile)) {
+                partFile.delete()
+                return false
+            }
 
-        val now = clock()
-        return try {
-            dao.insert(
-                CachedAudioEntity(
-                    serverId = serverId,
-                    itemId = itemId,
-                    seriesId = meta.seriesId,
-                    seasonNumber = meta.seasonNumber,
-                    episodeNumber = meta.episodeNumber,
-                    filePath = finalFile.absolutePath,
-                    sizeBytes = finalFile.length(),
-                    completedAt = now,
-                    lastAccessAt = now,
+            val now = clock()
+            return try {
+                dao.insert(
+                    CachedAudioEntity(
+                        serverId = serverId,
+                        itemId = itemId,
+                        seriesId = meta.seriesId,
+                        seasonNumber = meta.seasonNumber,
+                        episodeNumber = meta.episodeNumber,
+                        filePath = finalFile.absolutePath,
+                        sizeBytes = finalFile.length(),
+                        completedAt = now,
+                        lastAccessAt = now,
+                    )
                 )
-            )
-            true
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            // 文件已经落地成正式名,但索引没写进去——是个孤儿,但不在这里删文件:这次 DAO 调用
-            // 可能只是偶发失败(比如数据库正在迁移),真正的兜底交给 sweepOrphans,这里删了反而
-            // 白白扔掉一次本来已经成功的下载。
-            false
+                true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // 文件已经落地成正式名,但索引没写进去——是个孤儿,但不在这里删文件:这次 DAO 调用
+                // 可能只是偶发失败(比如数据库正在迁移),真正的兜底交给 sweepOrphans,这里删了反而
+                // 白白扔掉一次本来已经成功的下载。
+                false
+            }
+        } finally {
+            inFlight -= key
         }
     }
 
@@ -165,11 +193,16 @@ class AudioCacheStore(
 
     /**
      * 启动时的孤儿清扫:某个服务器目录下,索引里查不到对应记录的文件,以及任何 `.part` 临时
-     * 文件,一律删掉。
+     * 文件,一律删掉——**除了** [inFlight] 里登记着的、[store] 正在下载中的那个 itemId。
      *
-     * `.part` 文件无条件删,不做"是不是很新、可能还在下载"之类的判断——调用这个方法的前提就是
-     * "进程刚启动",而一个真正在下载的 `.part` 只可能在本进程存活期间由 [store] 持有,进程重启
-     * 后遗留的 `.part` 只可能是上次异常退出留下的半成品,没有第三种可能。
+     * ⚠️ 复审 Important:文档上"只在启动时调用"这句话本身挡不住任何代码——Task 6 的预取控制器、
+     * 以及未来"清除缓存"这类用户触发的操作,都会让这个方法和正在跑的 [store] 撞在同一个
+     * serverId 上。不做这个判断的话,一个正在写的 `.part` 文件会被这里 unlink 掉:写入的
+     * fd 还有效、能继续写完,但 [store] 之后按路径 `renameTo` 时源文件已经找不到了,下载会
+     * 莫名其妙地失败——bug 现场和"孤儿清扫"这个功能本身完全对不上号,很难联想到根因。
+     *
+     * `.part` 文件（不在 [inFlight] 里的）无条件删,不做"是不是很新"之类的时间判断——一个不在
+     * 登记表里的 `.part` 只可能是上次异常退出留下的半成品,没有第三种可能。
      *
      * 查索引本身失败(数据库损坏/迁移中)时整个跳过,不做任何删除——查不清楚"哪些文件有主"的
      * 时候乱删,风险比"这次没清成孤儿"更大。
@@ -187,6 +220,8 @@ class AudioCacheStore(
         }
 
         for (file in files) {
+            val itemId = file.name.removeSuffix(PART_SUFFIX)
+            if (inFlightKey(serverId, itemId) in inFlight) continue
             if (file.name.endsWith(PART_SUFFIX) || file.absolutePath !in knownPaths) {
                 file.delete()
             }
