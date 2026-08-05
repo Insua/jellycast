@@ -6,7 +6,9 @@ import androidx.media3.common.C
 import androidx.media3.common.TrackSelectionParameters
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+import androidx.media3.extractor.DefaultExtractorsFactory
 
 /**
  * 音频专用的 TrackSelector 参数:全局禁用视频轨。
@@ -91,21 +93,63 @@ private const val BUFFER_FOR_PLAYBACK_MS = 5_000
 private const val BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS = 20_000
 
 /**
+ * 音频缓存(L1,`Content-Type: audio/aac`,裸 ADTS,无容器)专用的媒体源工厂。
+ *
+ * ## Critical 复审:缓存文件其实不能 seek
+ *
+ * media3 1.10.1 的 [DefaultExtractorsFactory] 默认 `constantBitrateSeekingEnabled = false`,
+ * 于是 `AdtsExtractor` 对裸 ADTS 流只会给出 `SeekMap.Unseekable`——`ExoPlayer.isCurrentMediaItemSeekable`
+ * 是 `false`。[createAudioOnlyPlayer] 在这个函数存在之前从没覆盖过 media-source 工厂,直接用的
+ * media3 默认值。后果是:
+ *
+ * - 拖已缓存那一集的进度条 → [PlayerControl.seekTo] 落到 `player.seekTo()`,在不可 seek 的媒体上
+ *   要么整个被忽略要么把播放拉回 0——设计文档 §5.2「已缓存的集可以真正 seek」这条卖点根本没兑现。
+ * - 从中间续播一集已缓存的条目([AudioPlaybackEngineImpl.resolveAndPrepare] 本地文件分支里那次
+ *   `playerControl.seekTo(startPositionMs)`)同样落空,实际从 0 开始放。
+ * - 因为本地源的 [AudioPlaybackEngine.absolutePositionMs] 直接读 `player.currentPosition` 当绝对
+ *   位置(见该属性 KDoc),播放器実际停在 0 而进度上报以为在 `startPositionMs`,10 秒心跳会把这个
+ *   错误的、比实际进度更早的时间点报给 Jellyfin——这正是"报一个更早的时间点比不上报更糟"这个
+ *   本仓库已经在别处修过的坑,在缓存路径上原样复现。
+ *
+ * 实测(见任务报告):同一个 ffmpeg 生成的裸 ADTS 文件,`ExoPlayer.Builder(context)` 默认配置下
+ * `seekable=false`;换成这里的 [DefaultExtractorsFactory.setConstantBitrateSeekingEnabled] `true`
+ * 之后 `seekable=true`。ADTS AAC 是恒定码率编码,`ConstantBitrateSeekMap` 用首帧码率估算跳转位置
+ * 这个前提在这里成立。
+ *
+ * ## 为什么不影响远端流
+ *
+ * 远端转码流(同样是裸 ADTS)从不调 `player.seekTo()`——[AudioPlaybackEngineImpl] 对远端源的 seek
+ * 走的是"重新 resolve 一条新 URL 再 prepare"这条完全不同的路径(见该类类注释),这个开关只决定
+ * `isCurrentMediaItemSeekable` 上报什么、`seekTo()` 是否可靠,不改变 buffering/下载行为,因此对
+ * 远端流的既有 200+ 条测试没有任何影响。
+ */
+fun audioOnlyMediaSourceFactory(context: Context): DefaultMediaSourceFactory =
+    DefaultMediaSourceFactory(
+        context,
+        DefaultExtractorsFactory().setConstantBitrateSeekingEnabled(true),
+    )
+
+/**
  * 构建一个永不渲染视频的播放器:
  * 1. 用 [audioOnlyTrackSelectionParameters] 全局禁用视频轨。
  * 2. 永不绑定 Surface / SurfaceView / TextureView,不创建 PlayerView(本模块也没有引入
  *    media3-ui 依赖)。播放页只显示封面,这是全项目第一条铁律。
  * 3. 设为 MUSIC 用途并交出音频焦点控制权,让系统按音乐处理(耳机拔出暂停、音频焦点抢占)。
  * 4. 用 [audioStreamLoadControl] 替掉 media3 那套给点播视频调的默认缓冲参数 —— 见该函数 KDoc。
+ * 5. 用 [audioOnlyMediaSourceFactory] 开启恒定码率 seek——见该函数 KDoc(Critical 复审):
+ *    没有这一步,已缓存文件的 seek/续播会静默失败,还会污染进度上报。
  *
  * 本函数需要真实 Android Context 才能实例化 ExoPlayer/DefaultTrackSelector,未做 JVM 单测——
  * 取舍说明见任务报告。已单测覆盖的是它内部用到的纯逻辑 [audioOnlyTrackSelectionParameters]。
+ * [audioOnlyMediaSourceFactory] 本身的效果由 `:core:player` androidTest 里拿真实裸 ADTS 文件
+ * 钉死(见 `LocalAdtsSeekableDeviceTest`)。
  */
 fun createAudioOnlyPlayer(context: Context): ExoPlayer {
     val trackSelector = DefaultTrackSelector(context, audioOnlyTrackSelectionParameters())
     return ExoPlayer.Builder(context)
         .setTrackSelector(trackSelector)
         .setLoadControl(audioStreamLoadControl())
+        .setMediaSourceFactory(audioOnlyMediaSourceFactory(context))
         .setAudioAttributes(
             AudioAttributes.Builder()
                 .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
