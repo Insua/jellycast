@@ -127,6 +127,10 @@ adb shell dumpsys media.metrics | grep -i codec
 > **范围变更记录:**
 > - 2026-07-25:Spike 实测证明 L2(HLS 音频 rendition)不存在,降级链由三级改为**两级**。
 > - 2026-07-25:音轨选择改为**仅 L3 支持** —— `/Audio/{id}/universal` 无 `audioStreamIndex` 参数(已核对 OpenAPI)。
+> - 2026-08-03:**新增「音频缓存」子系统**。原「不做」列表里的「离线下载」指的是
+>   *用户手动下载*,仍然不做;这次做的是**自动预缓存**(仅 WiFi、串行、整集)。
+>   注意:转码流 `Accept-Ranges: none` 且字节流取决于 `startTimeTicks`,**分块缓存不成立**,
+>   只能整集缓存。见 `docs/superpowers/specs/2026-08-03-audio-cache-design.md` §2。
 > - 2026-07-26:**「搜索」由不做改为做**,并新增「媒体库分页」。原因见
 >   `docs/superpowers/specs/2026-07-26-library-paging-and-search-design.md`:
 >   目标服务器有 8744 集、数百部剧,无分页会卡、无搜索找不到东西。
