@@ -141,6 +141,28 @@ class CachePrefetchControllerTest {
         coVerify(exactly = 0) { cacheStore.store(SERVER_ID, any(), any(), any()) }
     }
 
+    /**
+     * 复审 Finding 2(Task 6):上一条用例的 DAO 是空的,`cacheStore.delete` 从未被断言过——一个
+     * 把 WiFi 判定挪到驱逐循环之前的回归(先判 WiFi、不在 WiFi 就直接 return,跳过驱逐)会让全部
+     * 8 条既有用例照常通过,却让"永远用蜂窝网络的用户"的缓存只进不出,一路涨到存储上限、然后
+     * 涨过上限也没有任何东西回收——这条用例专门堵住这个洞:非 WiFi 时驱逐必须照常执行,只是不
+     * 发起下载。
+     */
+    @Test fun `非 WiFi 时驱逐依然执行,只是不下载`() = runTest {
+        val api = mockk<JellyfinApi>().apply { stubThreeEpisodeSeries() }
+        val cacheStore = freshCacheStore()
+        // "stale-episode" 不在这次查到的 seriesOrder 里,任何网络状态下都应该被驱逐。
+        val cacheDao = freshDao(listOf(cachedEntity("stale-episode")))
+        val provider = PlaybackSourceProvider { itemId, _, _ -> remoteSource(itemId) }
+        val sut = controller(api, cacheStore, cacheDao, onWifi = false, downloadSourceProvider = provider, scope = this)
+
+        sut.onItemChanged(ep("e1", 1))
+        advanceUntilIdle()
+
+        coVerify(exactly = 1) { cacheStore.delete(SERVER_ID, "stale-episode") }
+        coVerify(exactly = 0) { cacheStore.store(SERVER_ID, any(), any(), any()) }
+    }
+
     // ---- WiFi 下按 planCache 给的顺序下载 ----
 
     @Test fun `WiFi 下按顺序下载还没缓存的条目`() = runTest {

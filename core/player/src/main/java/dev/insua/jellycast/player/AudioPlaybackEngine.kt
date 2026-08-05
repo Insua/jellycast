@@ -63,8 +63,24 @@ sealed interface PlaybackEngineState {
      * [startPositionMs] 是这条流在**条目内**的起始位置(即 resolve 时传给服务端的
      * `startTimeTicks` 对应的毫秒数)。进度上报需要它才能在"新源就绪"这一刻报出正确的绝对位置,
      * 而不是报一个刚归零的流内相对位置(全支线复审 Critical 1/2)。
+     *
+     * ⚠️ 复审(Task 6 Finding 1):[emissionSeq] 单调递增,只用来在结构上区分"两次内容完全相同的
+     * `Ready`"——调用方**不该**读它做任何业务判断,它纯粹是"强制 `StateFlow` 发射"的技术手段。
+     * `MutableStateFlow` 对结构相等的连续赋值会静默丢弃(conflation,`value` 的 setter 内部按
+     * `equals()` 比较),而 [Ready]/[PlaybackSource] 都是 `data class`——本地缓存源连续两次 seek
+     * 到**同一个**位置时,`source` 和 `startPositionMs` 会完全一样(见
+     * [AudioPlaybackEngineImpl.seekTo] 本地分支:复用同一个 [currentSource]、位置又相同),
+     * 第二次赋值因此被 `StateFlow` 悄悄吞掉,`playbackReadyEvents()` 收不到第二个事件,
+     * `PlaybackProgressCoordinator.onSourceReady` 也就不会跑——这正是这次修复本身要堵住的那个
+     * "seek 后立即上报进度"缺口,如果不处理会在"重复 seek 到同一位置"这一种子场景下原样复现。
+     * 默认值 `0L` 不影响任何既有测试:没有任何测试对 `Ready` 做完整的结构相等比较(全部是
+     * `is Ready` / 读某个字段),这里核对过。
      */
-    data class Ready(val source: PlaybackSource, val startPositionMs: Long = 0L) : PlaybackEngineState
+    data class Ready(
+        val source: PlaybackSource,
+        val startPositionMs: Long = 0L,
+        val emissionSeq: Long = 0L,
+    ) : PlaybackEngineState
 
     /** 对应设计文档 §8:「该条目无法播放」。由 Task 8 契约里 resolve() 的异常转换而来,绝不上抛。 */
     data class Error(val itemId: String, val message: String = "该条目无法播放") : PlaybackEngineState
@@ -252,6 +268,18 @@ class AudioPlaybackEngineImpl(
      */
     private val requestSeq = java.util.concurrent.atomic.AtomicLong(0L)
 
+    /**
+     * 见 [PlaybackEngineState.Ready.emissionSeq] 的 KDoc:每一次真正把 `_state` 置成 `Ready`
+     * 时领一个新号,保证连续两次 `Ready`(哪怕 `source`/`startPositionMs` 完全相同,比如本地缓存源
+     * 连续两次 seek 到同一位置)在结构上永远不相等,不会被 `MutableStateFlow` 的 conflation 悄悄
+     * 吞掉一次赋值。
+     *
+     * 刻意**不**复用 [requestSeq]:那个计数器管的是"迟到的 resolve 结果要不要被丢弃"这件事,
+     * 语义完全不同——本地 seek 分支根本不走 [resolveAndPrepare]/[isStale] 那条判定,把两件事的
+     * 计数器混在一起会让 [requestSeq] 的"哪次请求最新"语义变得难以推理。
+     */
+    private val stateEmissionSeq = java.util.concurrent.atomic.AtomicLong(0L)
+
     override val absolutePositionMs: Long
         get() {
             val relativeMs = playerControl.currentPositionMs.coerceAtLeast(0L)
@@ -289,7 +317,9 @@ class AudioPlaybackEngineImpl(
             // NEW_PLAYBACK,PlaybackProgressCoordinator.onSourceReady 按"同一条目再次就绪"分支
             // 立即发一次 progress——不重新 resolve、不重新 prepare(currentSource 是已经成功过
             // 的那个),只是把已经发生的本地 seek 尽快同步给服务端,和远端路径的行为对齐。
-            currentSource?.let { source -> _state.value = PlaybackEngineState.Ready(source, positionMs) }
+            currentSource?.let { source ->
+                _state.value = PlaybackEngineState.Ready(source, positionMs, stateEmissionSeq.incrementAndGet())
+            }
             return
         }
         // 远端源:见类注释,这里刻意重新 resolve + prepare,不是 player.seekTo。字面行为不变。
@@ -313,7 +343,7 @@ class AudioPlaybackEngineImpl(
             currentStartPositionMs = startPositionMs
             currentSourceIsLocalFile = source.isLocalFile
             currentSource = source
-            _state.value = PlaybackEngineState.Ready(source, startPositionMs)
+            _state.value = PlaybackEngineState.Ready(source, startPositionMs, stateEmissionSeq.incrementAndGet())
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {

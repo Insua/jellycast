@@ -177,6 +177,53 @@ class AudioPlaybackEngineTest {
         )
     }
 
+    /**
+     * 复审 Finding 1(Task 6):上一条用例的两次 seek 落在不同位置(10_000L → 90_000L),
+     * `Ready(source, startPositionMs)` 两次结构不同,天然不会被 `MutableStateFlow` 的 conflation
+     * 吞掉——所以那条用例**看不出**这个缺口。真正的坑是**连续两次 seek 到同一个位置**:本地分支
+     * 复用同一个 `currentSource`,`startPositionMs` 又相同,`Ready` 两次结构完全相等,朴素的
+     * `_state.value = Ready(...)` 会被 `StateFlow` 静默丢弃第二次赋值——`onSourceReady` 不会跑
+     * 第二次,`flushPending()` 也不会跑第二次。用户拖进度条两次都精确停在同一格(比如吸附到整
+     * 分钟的进度条),第二次 seek 在服务端就丢了。
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun `本地缓存源连续两次 seek 到同一位置,仍然各产生一次 Ready 事件`() = runTest {
+        val control = RecordingPlayerControl()
+        val provider = PlaybackSourceProvider { _, _, startPositionMs -> localSource(startPositionMs) }
+        val engine = AudioPlaybackEngineImpl(provider, control)
+        val events = mutableListOf<PlaybackReadyEvent>()
+        val collectJob = launch { engine.state.playbackReadyEvents().collect { events += it } }
+        advanceUntilIdle()
+
+        engine.play(ITEM_ID, USER_ID, startPositionMs = 10_000L)
+        advanceUntilIdle()
+        engine.seekTo(90_000L)
+        advanceUntilIdle()
+        engine.seekTo(90_000L) // 第二次 seek,落在和上一次完全相同的位置
+        advanceUntilIdle()
+        collectJob.cancel()
+
+        assertEquals(
+            3,
+            events.size,
+            "首播一次、seek 两次(哪怕第二次和第一次位置相同),应该各产生一次 Ready 事件,实际:$events",
+        )
+        assertEquals(90_000L, events[1].startPositionMs)
+        assertEquals(90_000L, events[2].startPositionMs, "第二次 seek 的位置和第一次相同,但事件本身不能被吞掉")
+        // 顺带核对复审要求:StateFlow 的 STATE_REPLAY 判定完全不依赖值相等,只依赖"是不是收集协程
+        // 收到的第一个值"——这里三次都是收集协程启动之后真正发生的状态变化,理应全部是 NEW_PLAYBACK,
+        // 不会被误判成重放。
+        assertEquals(
+            listOf(
+                PlaybackReadyTrigger.NEW_PLAYBACK,
+                PlaybackReadyTrigger.NEW_PLAYBACK,
+                PlaybackReadyTrigger.NEW_PLAYBACK,
+            ),
+            events.map { it.trigger },
+            "三次都发生在收集协程启动之后,不该有任何一次被误判成 STATE_REPLAY",
+        )
+    }
+
     @Test fun `resolve 抛异常时变为 Error 状态而不是向上抛出`() = runTest {
         val control = RecordingPlayerControl()
         val provider = PlaybackSourceProvider { _, _, _ -> error("PlaybackInfo 调用失败") }
