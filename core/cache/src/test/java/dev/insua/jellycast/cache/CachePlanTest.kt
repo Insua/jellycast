@@ -241,4 +241,51 @@ class CachePlanTest {
 
         assertEquals(listOf("S1E3"), decision.toPrefetch, "已缓存的 S1E1/S1E2 不应再次出现在 toPrefetch 中")
     }
+
+    // --- 复审 Finding 1:窗口步骤对锚点的保护是防御性的,maxEpisodes<=0 时才真正生效,
+    // 必须有一个测试在它被去掉时真正变红,否则这行代码就是没人守护的死代码。 ---
+
+    @Test
+    fun `anchor is protected in the window step even when maxEpisodes is zero`() {
+        val cached = listOf(entry("S1E1", 0))
+        val decision = planCache(
+            currentItemId = "S1E1",
+            seriesOrder = threeSeasons,
+            cached = cached,
+            maxEpisodes = 0, // 窗口目标集合因此为空,只有窗口步骤的显式排除能保住锚点
+            maxBytes = null,
+        )
+
+        assertFalse(
+            decision.toEvict.contains("S1E1"),
+            "maxEpisodes=0 时窗口目标集合为空,但锚点仍不应出现在 toEvict 里",
+        )
+        assertTrue(decision.toPrefetch.isEmpty(), "maxEpisodes=0 时锚点也不会被预取——结果是维持原状,不是清空")
+    }
+
+    // --- 复审 Finding 2:不属于当前剧序列的旧缓存(itemId 在 seriesOrder 里完全找不到)
+    // 必须无条件驱逐(§4.4 规则 1 明确点名的「不属于当前剧的旧剧集」)。 ---
+
+    @Test
+    fun `cached item absent from seriesOrder is evicted as a cross-series leftover`() {
+        val cached = listOf(
+            entry("S1E1", 0),
+            // 这一条不出现在 threeSeasons 里的任何一个 SeriesSlot 中(换过剧集库之类的残留),
+            // 它自己的 order 字段刻意设得比 anchorOrder 大,这样"order < anchorOrder"式的
+            // 误判无法命中它,只有"根本不在 seriesOrder 里"这条判断才能抓住它。
+            entry("leftover-from-other-series", order = 100),
+        )
+        val decision = planCache(
+            currentItemId = "S1E1",
+            seriesOrder = threeSeasons,
+            cached = cached,
+            maxEpisodes = 10,
+            maxBytes = null,
+        )
+
+        assertTrue(
+            decision.toEvict.contains("leftover-from-other-series"),
+            "不属于当前剧序列的旧缓存应无条件驱逐,即使它自己的 order 字段看起来在锚点之后",
+        )
+    }
 }
