@@ -41,14 +41,33 @@ class AudioPlaybackEngineTest {
         textSubtitles = emptyList(),
     )
 
-    /** 记录每次被要求"重新 prepare"的 URL。这个假实现压根没有 seekTo 方法可调 ——
-     *  结构上就杜绝了 AudioPlaybackEngine 误用 player.seekTo 的可能。 */
+    /** 本地缓存文件源(Task 4):streamUrl 指向本地文件,`isLocalFile = true`。 */
+    private fun localSource(startPositionMs: Long) = PlaybackSource(
+        itemId = ITEM_ID,
+        mediaSourceId = "ms1",
+        streamUrl = "file:///cache/$ITEM_ID.m4a",
+        level = AudioDeliveryLevel.SERVER_AUDIO_ONLY,
+        isHls = false,
+        playSessionId = null,
+        audioTracks = emptyList(),
+        textSubtitles = emptyList(),
+        isLocalFile = true,
+    )
+
+    /**
+     * 记录每次被要求"重新 prepare"的 URL,以及每次被要求直接 seek 的位置。
+     *
+     * 后者只应该在本地缓存源上发生——远端源的 seek 走"重新 resolve + prepare"那条路,
+     * [seekedPositions] 应该始终为空;这正是「远端源行为完全不变」这条回归防线的观测点。
+     */
     private class RecordingPlayerControl : PlayerControl {
         val preparedUrls = mutableListOf<String>()
+        val seekedPositions = mutableListOf<Long>()
         var released = false
         /** 流内相对位置(见 [PlayerControl.currentPositionMs]);绝对位置语义在 AbsolutePositionTest 里覆盖。 */
         override var currentPositionMs: Long = 0L
         override fun setMediaItemAndPrepare(url: String, metadata: PlaybackDisplayMetadata?) { preparedUrls += url }
+        override fun seekTo(positionMs: Long) { seekedPositions += positionMs; currentPositionMs = positionMs }
         override fun release() { released = true }
     }
 
@@ -79,6 +98,45 @@ class AudioPlaybackEngineTest {
         assertEquals(listOf(0L, 90_000L), requestedPositions)
         assertEquals(2, control.preparedUrls.size)
         assertTrue(control.preparedUrls[1].contains("startTimeTicks=900000000"), control.preparedUrls[1])
+        assertTrue(engine.state.value is PlaybackEngineState.Ready)
+        // 防回归核心:远端源整个过程绝不能碰 PlayerControl.seekTo —— 这是本任务风险最高的一条断言。
+        assertTrue(control.seekedPositions.isEmpty(), "远端源 seek 不该调用 player 的 seekTo,应为空:${control.seekedPositions}")
+    }
+
+    // ---- Task 4:本地缓存源(isLocalFile = true)的 seek 走另一条分支 ----
+
+    @Test fun `本地缓存源首次 play 时,prepare 之后播放器被 seek 到 startPositionMs`() = runTest {
+        val control = RecordingPlayerControl()
+        val provider = PlaybackSourceProvider { _, _, startPositionMs -> localSource(startPositionMs) }
+        val engine = AudioPlaybackEngineImpl(provider, control)
+
+        engine.play(ITEM_ID, USER_ID, startPositionMs = 480_000L)
+
+        assertEquals(1, control.preparedUrls.size)
+        assertEquals(listOf(480_000L), control.seekedPositions)
+        assertTrue(engine.state.value is PlaybackEngineState.Ready)
+    }
+
+    @Test fun `本地缓存源的 seekTo 不重新 resolve,直接让播放器 seek`() = runTest {
+        val control = RecordingPlayerControl()
+        var resolveCallCount = 0
+        val provider = PlaybackSourceProvider { _, _, startPositionMs ->
+            resolveCallCount++
+            localSource(startPositionMs)
+        }
+        val engine = AudioPlaybackEngineImpl(provider, control)
+        engine.play(ITEM_ID, USER_ID, startPositionMs = 10_000L)
+        val resolveCallsAfterPlay = resolveCallCount
+
+        engine.seekTo(90_000L)
+
+        assertEquals(
+            resolveCallsAfterPlay,
+            resolveCallCount,
+            "本地源 seek 不该再调用一次 PlaybackSourceProvider.resolve",
+        )
+        assertEquals(1, control.preparedUrls.size, "本地源 seek 不该重新 prepare")
+        assertEquals(listOf(10_000L, 90_000L), control.seekedPositions)
         assertTrue(engine.state.value is PlaybackEngineState.Ready)
     }
 

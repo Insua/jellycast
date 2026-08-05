@@ -22,6 +22,17 @@ data class PlaybackSource(
     val playSessionId: String?,
     val audioTracks: List<AudioTrack>,
     val textSubtitles: List<SubtitleTrackRef>,
+    /**
+     * `streamUrl` 是否指向一个本地缓存的完整文件,而不是服务端的实时转码流。
+     *
+     * 两者行为差异很大:转码流响应 `Accept-Ranges: none`,播放引擎因此把 seek 实现成"带新的
+     * `startTimeTicks` 重新 resolve + 重新 prepare"(见 `AudioPlaybackEngine` 类注释)。本地文件
+     * 完整、可 seek,引擎据此走另一条分支——直接 `player.seekTo()`,不重新 resolve。
+     *
+     * **加在末尾并给默认值 `false`**:`:core:player`/`:core:network` 等模块的既有测试里有大量
+     * `PlaybackSource(...)` 构造调用,不加默认值会全部编译失败。
+     */
+    val isLocalFile: Boolean = false,
 )
 
 data class AudioTrack(val index: Int, val language: String?, val displayName: String)

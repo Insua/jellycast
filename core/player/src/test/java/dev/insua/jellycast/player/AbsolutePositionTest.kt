@@ -48,8 +48,23 @@ class AbsolutePositionTest {
             preparedUrls += url
             currentPositionMs = 0L      // 新流刚 prepare,流内相对位置归零
         }
+        /** 本地缓存源专用:直接把播放器位置改到目标值,模拟真实 seek。 */
+        override fun seekTo(positionMs: Long) { currentPositionMs = positionMs }
         override fun release() {}
     }
+
+    /** 本地缓存文件源(Task 4):完整、可 seek,`absolutePositionMs` 不再叠加流起点基准。 */
+    private fun localSource(startPositionMs: Long) = PlaybackSource(
+        itemId = "ep1",
+        mediaSourceId = "ms1",
+        streamUrl = "file:///cache/ep1.m4a",
+        level = AudioDeliveryLevel.SERVER_AUDIO_ONLY,
+        isHls = false,
+        playSessionId = null,
+        audioTracks = emptyList(),
+        textSubtitles = emptyList(),
+        isLocalFile = true,
+    )
 
     @Test fun `absolutePositionMs 等于本条流的起始位置加上播放器的流内相对位置`() = runTest {
         val control = StreamRelativeControl()
@@ -57,6 +72,25 @@ class AbsolutePositionTest {
 
         engine.play("ep1", "u1", startPositionMs = 480_000L)
         control.currentPositionMs = 20_000L
+
+        assertEquals(500_000L, engine.absolutePositionMs)
+    }
+
+    /**
+     * Task 4 核心验收:本地缓存源没有"每次 seek 换一条新流、流内位置从 0 重新计时"这回事,
+     * 播放器位置本身就是条目内绝对位置,**不加**流起点偏移。
+     *
+     * 用非零的 startPositionMs(480_000)首次 play,再把播放器位置改到一个和它不同的新值
+     * (500_000)——如果实现退化成"统一加偏移"(currentStartPositionMs + player 位置),
+     * 会算出 980_000,而不是播放器实际报的 500_000。
+     */
+    @Test fun `本地缓存源的 absolutePositionMs 就是播放器位置,不叠加流起点偏移`() = runTest {
+        val control = StreamRelativeControl()
+        val engine = AudioPlaybackEngineImpl(PlaybackSourceProvider { _, _, pos -> localSource(pos) }, control)
+
+        engine.play("ep1", "u1", startPositionMs = 480_000L)
+        // prepare 后引擎已经把播放器 seek 到 480_000;这里模拟播放器又往前走了一段。
+        control.currentPositionMs = 500_000L
 
         assertEquals(500_000L, engine.absolutePositionMs)
     }
