@@ -9,6 +9,8 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
 import dev.insua.jellycast.cache.AudioCacheDownloader
 import dev.insua.jellycast.cache.AudioCacheStore
+import dev.insua.jellycast.cache.NetworkTypeMonitor
+import dev.insua.jellycast.database.CachedAudioDao
 import dev.insua.jellycast.database.JellyCastDatabase
 import dev.insua.jellycast.database.ProgressReportDao
 import dev.insua.jellycast.database.buildJellyCastDatabase
@@ -36,7 +38,23 @@ import dev.insua.jellycast.player.toPlaybackDisplayMetadata
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
+import javax.inject.Qualifier
 import javax.inject.Singleton
+
+/**
+ * 当前激活服务器 id 的**装配时刻快照**。和 [providePlaybackSourceProvider] / [provideProgressReporter]
+ * 各自内部用 `runBlocking { serverStore.activeServerId.first() }` 取到的值是**同一类**已知取舍
+ * (进程存活期间切换激活服务器不会更新),这里额外开一个 qualifier 是因为 `PlaybackService` 需要
+ * 在装配 [dev.insua.jellycast.player.CachePrefetchController] 时也拿到同一份 serverId——
+ * 后者不能像 [AudioPlaybackEngine] 那样整个交给 Hilt 装配(它需要 Service 生命周期的
+ * `serviceScope`,只能在 `PlaybackService.onCreate` 里手动 `new`,见该类改动的说明)。
+ *
+ * `Retention` 用 RUNTIME,和 `TrustAwareHttpClient` 那个 qualifier 同一个理由:留到运行时可见,
+ * 方便以后需要时用反射断言。
+ */
+@Qualifier
+@Retention(AnnotationRetention.RUNTIME)
+annotation class ActiveServerId
 
 /**
  * 闭合修正 §1(a):这个模块之前完全不存在——`AudioPlaybackEngine`/`PlaybackSourceResolver` 写好了
@@ -212,6 +230,34 @@ object PlayerModule {
 
     @Provides
     fun provideProgressReportDao(database: JellyCastDatabase): ProgressReportDao = database.progressReportDao()
+
+    /**
+     * [CachePrefetchController] 的编排逻辑需要读"这台服务器已经缓存了哪些条目"——直接用
+     * [AudioCacheStore] 内部已经在用的同一张表的 DAO,而不是给 [AudioCacheStore] 加一个
+     * "列出全部"的公开方法:那个类的公开面已经在 Task 3 定稿并测试过,这里没有必要为了 Task 6
+     * 一个调用方去扩大它的职责范围。
+     */
+    @Provides
+    fun provideCachedAudioDao(database: JellyCastDatabase): CachedAudioDao = database.cachedAudioDao()
+
+    /**
+     * 见 [ActiveServerId] 的类注释:和 [providePlaybackSourceProvider] / [provideProgressReporter]
+     * 各自私有的 serverId 快照同一类取舍,单独开一份给 `PlaybackService` 手动装配
+     * [CachePrefetchController] 时用。
+     */
+    @Provides
+    @Singleton
+    @ActiveServerId
+    fun provideActiveServerId(serverStore: ServerStore): String =
+        runBlocking { serverStore.activeServerId.first() } ?: "unknown-server"
+
+    /**
+     * [CachePrefetchController] 的 WiFi 闸门(设计文档 §3:仅 WiFi、串行一次一集)。
+     */
+    @Provides
+    @Singleton
+    fun provideNetworkTypeMonitor(@ApplicationContext context: Context): NetworkTypeMonitor =
+        NetworkTypeMonitor(context)
 
     /**
      * [ProgressReporter] 的 `serverId` 是构造时固定的值(既有、已测试过的签名,不改)。这里用

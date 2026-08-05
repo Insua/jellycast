@@ -140,6 +140,43 @@ class AudioPlaybackEngineTest {
         assertTrue(engine.state.value is PlaybackEngineState.Ready)
     }
 
+    /**
+     * Task 6 carry-forward 之二:本地缓存源的 seek 不重新 resolve(上一条用例),但**必须**补发一次
+     * `Ready`,让 [PlaybackProgressCoordinator]（经 [playbackReadyEvents]）把这次 seek 当成
+     * "同一条目再次就绪"立即上报一次 progress——否则只能靠 10 秒心跳自愈,用户 seek 后 10 秒内
+     * 被强杀 App 就会在服务端丢失这次 seek,而远端源不会有这个窗口(它的 seek 走
+     * `resolveAndPrepare`,天然发一次 Ready)。
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun `本地缓存源的 seekTo 重新发一次 Ready,补回立即上报进度这条纪律`() = runTest {
+        val control = RecordingPlayerControl()
+        val provider = PlaybackSourceProvider { _, _, startPositionMs -> localSource(startPositionMs) }
+        val engine = AudioPlaybackEngineImpl(provider, control)
+        val events = mutableListOf<PlaybackReadyEvent>()
+        val collectJob = launch { engine.state.playbackReadyEvents().collect { events += it } }
+        // 让收集协程先跑起来、消费掉初始的 Idle(StateFlow 对慢收集者只保留最新值,不 advance
+        // 的话 play/seekTo 两次状态变化会在收集协程真正开始跑之前就都发生,后一次会覆盖前一次,
+        // 收集协程启动时只会看到"最新的那个"——这正是生产环境里"换一个条目做一次真实动作"之间
+        // 天然存在时间间隔的原因,这里用 advanceUntilIdle() 显式还原这个间隔)。
+        advanceUntilIdle()
+
+        engine.play(ITEM_ID, USER_ID, startPositionMs = 10_000L)
+        advanceUntilIdle()
+        engine.seekTo(90_000L)
+        advanceUntilIdle()
+        collectJob.cancel()
+
+        assertEquals(2, events.size, "首播一次、seek 一次,应该各产生一次 Ready 事件,实际:$events")
+        assertEquals(PlaybackReadyTrigger.NEW_PLAYBACK, events[0].trigger)
+        assertEquals(PlaybackReadyTrigger.NEW_PLAYBACK, events[1].trigger)
+        assertEquals(90_000L, events[1].startPositionMs, "补发的 Ready 必须带上这次 seek 的新位置")
+        assertEquals(
+            events[0].source.itemId,
+            events[1].source.itemId,
+            "补发的 Ready 复用同一个 itemId,进度协调器才会走「同一条目再次就绪」分支发 progress 而不是 start",
+        )
+    }
+
     @Test fun `resolve 抛异常时变为 Error 状态而不是向上抛出`() = runTest {
         val control = RecordingPlayerControl()
         val provider = PlaybackSourceProvider { _, _, _ -> error("PlaybackInfo 调用失败") }

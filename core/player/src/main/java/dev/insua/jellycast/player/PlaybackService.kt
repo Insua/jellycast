@@ -16,10 +16,15 @@ import android.os.Handler
 import android.os.Looper
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import dev.insua.jellycast.cache.AudioCacheStore
+import dev.insua.jellycast.cache.NetworkTypeMonitor
+import dev.insua.jellycast.database.CachedAudioDao
 import dev.insua.jellycast.datastore.LastPlayedStore
 import dev.insua.jellycast.datastore.PreferencesStore
 import dev.insua.jellycast.model.MediaItem
+import dev.insua.jellycast.network.JellyfinApi
 import dev.insua.jellycast.network.session.JellyfinSession
+import dev.insua.jellycast.player.di.ActiveServerId
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -98,6 +103,31 @@ class PlaybackService : MediaSessionService() {
      */
     @Inject
     lateinit var lastPlayedStore: LastPlayedStore
+
+    /**
+     * Task 6:[CachePrefetchController] 编排要用到的几样东西——决策逻辑全在那个类里(它在 JVM
+     * 单测里可以完整覆盖),本 Service 只负责在换集时调它一次(见 [observeCachePrefetch]),
+     * 以及提供它需要、但只能在这里拿到的几样依赖(Service 生命周期的 `serviceScope`、装配时刻的
+     * `serverId` 快照)。
+     */
+    @Inject
+    lateinit var audioCacheStore: AudioCacheStore
+
+    @Inject
+    lateinit var networkTypeMonitor: NetworkTypeMonitor
+
+    @Inject
+    lateinit var cachedAudioDao: CachedAudioDao
+
+    @Inject
+    lateinit var playbackSourceResolver: PlaybackSourceResolver
+
+    @Inject
+    lateinit var jellyfinApi: JellyfinApi
+
+    @Inject
+    @ActiveServerId
+    lateinit var activeServerId: String
 
     private var mediaSession: MediaSession? = null
 
@@ -222,6 +252,7 @@ class PlaybackService : MediaSessionService() {
 
         observeProgressReporting()
         observePlaybackSpeedPreference()
+        observeCachePrefetch(userIdProvider)
 
         // 占位通知的收尾责任方。判据是"播放器手里还有内容吗" —— `STATE_IDLE` 表示 stop/clear 过或者
         // 从来没 prepare 成功过,也就是"占位通知后面什么都没有"。在主线程 scope 上读播放器,
@@ -351,6 +382,33 @@ class PlaybackService : MediaSessionService() {
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Task 6:预取控制器的**唯一**驱动时机——[PlayQueue.current] 只在真的换了条目
+     * ([PlayQueue.setQueue]/[PlayQueue.next]/[PlayQueue.previous])时变化,精确对应"换集"这件事
+     * 本身,不会被 seek 误触发(即使是 carry-forward 之二修好之后、本地缓存源 seek 也会重新发一次
+     * `Ready` 的那种情况——那条信号走的是 [AudioPlaybackEngine.state],不是这里)。
+     *
+     * [CachePrefetchController] 不能整个交给 Hilt 装配(它需要这个 Service 的 `serviceScope`,
+     * 生命周期必须和播放会话绑在一起——Service 销毁时 `serviceScope` 被取消,飞行中的预取下载
+     * 随之被取消并清理半成品文件),所以在这里手动 `new`,和 [EngineSeekRouter] /
+     * [EngineQueueNavigator] 是同一种取舍。
+     */
+    private fun observeCachePrefetch(userIdProvider: suspend () -> String?) {
+        val cachePrefetchController = CachePrefetchController(
+            cacheDao = cachedAudioDao,
+            cacheStore = audioCacheStore,
+            networkTypeMonitor = networkTypeMonitor,
+            downloadSourceProvider = playbackSourceResolver.asProvider(),
+            api = jellyfinApi,
+            serverId = activeServerId,
+            userIdProvider = userIdProvider,
+            scope = serviceScope,
+        )
+        serviceScope.launch {
+            playQueue.current.collect { item -> item?.let(cachePrefetchController::onItemChanged) }
         }
     }
 

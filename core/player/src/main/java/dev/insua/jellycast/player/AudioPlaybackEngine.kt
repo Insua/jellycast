@@ -221,6 +221,18 @@ class AudioPlaybackEngineImpl(
     private var currentSourceIsLocalFile: Boolean = false
 
     /**
+     * 当前这条流对应的 [PlaybackSource]。和 [currentStartPositionMs] / [currentSourceIsLocalFile]
+     * 同一套更新纪律——只在 resolve **成功**、播放器真的换到新流之后才更新。
+     *
+     * ⚠️ Task 6 carry-forward 之二(见任务简报):本地缓存源的 [seekTo] 需要重新发一次
+     * [PlaybackEngineState.Ready] 来恢复"seek 后立即上报进度"这条设计文档 §7 的纪律(见 [seekTo]
+     * 本地分支的说明),而那次重新发出的 `Ready` 必须携带**同一个** `PlaybackSource`——不能凭空
+     * 造一个,也不能重新 resolve(那正是本地源要避免的事)。这个字段就是那次重新发送时的数据来源。
+     */
+    @Volatile
+    private var currentSource: PlaybackSource? = null
+
+    /**
      * ## 稳定性根因 #2:连点快进时"最后请求的那一次说了算"
      *
      * 生产路径上唯一存在并发的地方:`SeekInterceptingPlayer.seekForward()` → [EngineSeekRouter] →
@@ -266,6 +278,18 @@ class AudioPlaybackEngineImpl(
             // 本地缓存文件:完整、可 seek,直接让播放器跳,不重新 resolve/prepare。
             // 见 PlayerControl.seekTo 与类注释 —— 这正是缓存路径下"拖进度条"变得即时的原因。
             playerControl.seekTo(positionMs)
+
+            // ⚠️ Task 6 carry-forward 之二:这条分支以前只挪动了播放器位置,不发新的
+            // PlaybackEngineState.Ready —— 于是"seek 后立即上报进度"这条设计文档 §7 的纪律,
+            // 在本地缓存源上悄悄消失了(远端源不受影响:它的 seek 走 resolveAndPrepare,天然
+            // 发一次 Ready)。10 秒心跳能自愈,但用户 seek 一集缓存好的剧集后 10 秒内被强杀 App,
+            // 这次 seek 在服务端就丢了——远端路径上不会发生这个窗口。
+            //
+            // 补发一次 Ready(同一个 source、新的 positionMs):playbackReadyEvents() 会把它识别成
+            // NEW_PLAYBACK,PlaybackProgressCoordinator.onSourceReady 按"同一条目再次就绪"分支
+            // 立即发一次 progress——不重新 resolve、不重新 prepare(currentSource 是已经成功过
+            // 的那个),只是把已经发生的本地 seek 尽快同步给服务端,和远端路径的行为对齐。
+            currentSource?.let { source -> _state.value = PlaybackEngineState.Ready(source, positionMs) }
             return
         }
         // 远端源:见类注释,这里刻意重新 resolve + prepare,不是 player.seekTo。字面行为不变。
@@ -288,6 +312,7 @@ class AudioPlaybackEngineImpl(
             // 的流内位置,报出一个"倒退"的绝对位置。
             currentStartPositionMs = startPositionMs
             currentSourceIsLocalFile = source.isLocalFile
+            currentSource = source
             _state.value = PlaybackEngineState.Ready(source, startPositionMs)
         } catch (e: CancellationException) {
             throw e
@@ -315,6 +340,7 @@ class AudioPlaybackEngineImpl(
         currentUserId = null
         currentStartPositionMs = null
         currentSourceIsLocalFile = false
+        currentSource = null
         _state.value = PlaybackEngineState.Idle
     }
 
