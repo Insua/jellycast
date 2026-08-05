@@ -199,10 +199,25 @@ private fun DeveloperInfoSection(
     bytesTransferred: Long,
 ) {
     Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-        DevInfoLine("当前 endpoint", endpoint ?: "未连接")
+        DevInfoLine("当前 endpoint", endpointDisplayLabel(endpoint, isLocalFile))
         DevInfoLine("当前音频降级级别", deliveryLevelDisplayLabel(deliveryLevel, isLocalFile))
         DevInfoLine("本次会话已传输", formatBytes(bytesTransferred))
     }
+}
+
+/**
+ * 复审发现:同一类"命中缓存时面板说瞎话"问题的第二处——[deliveryLevelDisplayLabel] 已经堵住了
+ * "L1 · 服务端纯音频"这句谎言,但「当前 endpoint」这一行原样显示 [endpoint](`JellyfinSession
+ * .baseUrl()` 的缓存值),没有看 [isLocalFile]。播一集完全没发网络请求的本地缓存文件时,这一行
+ * 照样显示"192.168.1.10:8096"之类的地址,像是这次播放真的在跟那个 endpoint 通信——不是。
+ * 命中本地缓存时这里改显示"本地缓存文件",和 [deliveryLevelDisplayLabel] 同一种"isLocalFile
+ * 优先、整体覆盖显示文案"的做法。
+ *
+ * 纯函数,不接触 Compose/Android——可离线单测,和 [formatBytes] 同一种做法。
+ */
+internal fun endpointDisplayLabel(endpoint: String?, isLocalFile: Boolean): String = when {
+    isLocalFile -> "本地缓存文件(未连接 endpoint)"
+    else -> endpoint ?: "未连接"
 }
 
 /**

@@ -38,6 +38,32 @@ class SettingsScreenTest {
         assertEquals("未在播放", label)
     }
 
+    // ---- 复审(同一类"命中缓存时面板说瞎话"问题第二处):「当前 endpoint」一行 ----
+
+    /**
+     * 命中本地缓存播放时,这次播放**一次请求都没发给 [endpoint]**——面板原样显示那个地址,
+     * 看起来像是这次播放真的在跟它通信,和 `deliveryLevelDisplayLabel` 已经堵住的「L1 · 服务端
+     * 纯音频」是同一类"谎报数据来源"问题。
+     */
+    @Test fun `本地缓存播放时不显示endpoint地址`() {
+        val label = endpointDisplayLabel("http://192.168.1.10:8096", isLocalFile = true)
+
+        assertEquals("本地缓存文件(未连接 endpoint)", label)
+        assertNotEquals("http://192.168.1.10:8096", label, "命中缓存时不应该显示成正在连接那个 endpoint")
+    }
+
+    @Test fun `远端播放正常显示endpoint地址`() {
+        val label = endpointDisplayLabel("http://192.168.1.10:8096", isLocalFile = false)
+
+        assertEquals("http://192.168.1.10:8096", label)
+    }
+
+    @Test fun `未连接且非本地文件时显示未连接`() {
+        val label = endpointDisplayLabel(null, isLocalFile = false)
+
+        assertEquals("未连接", label)
+    }
+
     // ---- Task 7:缓存最大占用存储选项文案 ----
 
     @Test fun `1GB 5GB 10GB 显示为对应的 GB 数`() {
