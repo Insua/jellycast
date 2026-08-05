@@ -15,6 +15,7 @@ import io.mockk.mockk
 import java.io.IOException
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
@@ -76,7 +77,7 @@ class CacheAwareSourceProviderTest {
         val api = mockk<JellyfinApi>()
         coEvery { api.playbackInfo(any(), any(), any()) } returns metadataResponse()
 
-        val provider = CacheAwareSourceProvider(delegate, cacheStore, api, SERVER_ID)
+        val provider = CacheAwareSourceProvider(delegate, cacheStore, api, { SERVER_ID })
         val source = provider.resolve(ITEM_ID, USER_ID, 0L)
 
         assertTrue(source.isLocalFile, "命中缓存必须标记为本地文件")
@@ -90,7 +91,7 @@ class CacheAwareSourceProviderTest {
         val api = mockk<JellyfinApi>()
         coEvery { api.playbackInfo(any(), any(), any()) } returns metadataResponse()
 
-        val provider = CacheAwareSourceProvider(delegate, cacheStore, api, SERVER_ID)
+        val provider = CacheAwareSourceProvider(delegate, cacheStore, api, { SERVER_ID })
         val source = provider.resolve(ITEM_ID, USER_ID, 0L)
 
         assertEquals("ms-cached", source.mediaSourceId)
@@ -106,7 +107,7 @@ class CacheAwareSourceProviderTest {
         val cacheStore = cacheStoreReturning(null)
         val api = mockk<JellyfinApi>()
 
-        val provider = CacheAwareSourceProvider(delegate, cacheStore, api, SERVER_ID)
+        val provider = CacheAwareSourceProvider(delegate, cacheStore, api, { SERVER_ID })
         val source = provider.resolve(ITEM_ID, USER_ID, 5_000L)
 
         assertEquals(listOf(ITEM_ID), calls, "未命中必须委派给底层解析器")
@@ -129,7 +130,7 @@ class CacheAwareSourceProviderTest {
         coEvery { cacheStore.pathIfComplete(SERVER_ID, ITEM_ID) } throws RuntimeException("index 数据库炸了")
         val api = mockk<JellyfinApi>()
 
-        val provider = CacheAwareSourceProvider(delegate, cacheStore, api, SERVER_ID)
+        val provider = CacheAwareSourceProvider(delegate, cacheStore, api, { SERVER_ID })
         val source = provider.resolve(ITEM_ID, USER_ID, 0L)
 
         assertEquals(listOf(ITEM_ID), calls, "缓存查询失败必须原样委派,不能让用户看到错误")
@@ -142,7 +143,7 @@ class CacheAwareSourceProviderTest {
         val api = mockk<JellyfinApi>()
         coEvery { api.playbackInfo(any(), any(), any()) } returns metadataResponse()
 
-        val provider = CacheAwareSourceProvider(delegate, cacheStore, api, SERVER_ID)
+        val provider = CacheAwareSourceProvider(delegate, cacheStore, api, { SERVER_ID })
         provider.resolve(ITEM_ID, USER_ID, 0L)
 
         coVerify(exactly = 1) { cacheStore.touch(SERVER_ID, ITEM_ID) }
@@ -160,7 +161,7 @@ class CacheAwareSourceProviderTest {
         val api = mockk<JellyfinApi>()
         coEvery { api.playbackInfo(any(), any(), any()) } throws IOException("断网了")
 
-        val provider = CacheAwareSourceProvider(delegate, cacheStore, api, SERVER_ID)
+        val provider = CacheAwareSourceProvider(delegate, cacheStore, api, { SERVER_ID })
         val source = provider.resolve(ITEM_ID, USER_ID, 0L)
 
         assertTrue(source.isLocalFile, "断网也必须能播——这正是缓存存在的意义")
@@ -174,5 +175,54 @@ class CacheAwareSourceProviderTest {
         // 没有 touch 就永远刷新不了 lastAccessAt,驱逐策略会把它当"很久没碰过"优先删掉,
         // 比真正很久没听的集更早被清掉。
         coVerify(exactly = 1) { cacheStore.touch(SERVER_ID, ITEM_ID) }
+    }
+
+    // ---- 复审 I3(Important):serverId 必须每次都动态查询,不能是装配时刻的一次性快照 ----
+
+    /**
+     * `AppSessionViewModel.onServerConnected` 切服务器不重启进程——如果 `serverIdProvider` 只在
+     * 构造时被读一次并缓存下来,切换到 server-B 之后这里仍然会拿着 server-A 的 id 去查缓存,
+     * 而 server-A 底下根本没有 server-B 条目的缓存记录(`AudioCacheStore` 按 serverId 隔离),
+     * 后果是"明明命中了,却因为查错了分区而被判定成未命中"。这条用例通过在**同一个** provider
+     * 实例上、两次 resolve 之间切换 `currentServerId`,验证每次 resolve 都重新问一次。
+     */
+    @Test fun `切换激活服务器后resolve使用新的serverId查询缓存`() = runTest {
+        val delegate = fakeDelegate(mutableListOf(), delegateSource())
+        var currentServerId = "server-A"
+        val cacheStore = mockk<AudioCacheStore>()
+        coEvery { cacheStore.pathIfComplete("server-A", ITEM_ID) } returns LOCAL_PATH
+        coEvery { cacheStore.pathIfComplete("server-B", ITEM_ID) } returns null
+        coEvery { cacheStore.touch(any(), any()) } returns Unit
+        val api = mockk<JellyfinApi>()
+        coEvery { api.playbackInfo(any(), any(), any()) } returns metadataResponse()
+
+        val provider = CacheAwareSourceProvider(delegate, cacheStore, api) { currentServerId }
+
+        val underA = provider.resolve(ITEM_ID, USER_ID, 0L)
+        assertTrue(underA.isLocalFile, "server-A 下这一条应该命中缓存")
+
+        currentServerId = "server-B" // 用户切换到了另一台服务器,进程没有重启。
+        val underB = provider.resolve(ITEM_ID, USER_ID, 0L)
+
+        assertFalse(
+            underB.isLocalFile,
+            "复审 I3:server-B 下没有这条缓存记录,必须原样委派——如果 serverId 是装配时刻缓存下来的" +
+                "旧快照,这里会继续错误地命中 server-A 的记录",
+        )
+    }
+
+    @Test fun `serverIdProvider查不到激活服务器时原样委派不查缓存`() = runTest {
+        val calls = mutableListOf<String>()
+        val expected = delegateSource()
+        val delegate = fakeDelegate(calls, expected)
+        val cacheStore = mockk<AudioCacheStore>()
+        val api = mockk<JellyfinApi>()
+
+        val provider = CacheAwareSourceProvider(delegate, cacheStore, api) { null }
+        val source = provider.resolve(ITEM_ID, USER_ID, 0L)
+
+        assertEquals(listOf(ITEM_ID), calls, "拿不到激活服务器 id 时应该原样委派")
+        assertEquals(expected, source)
+        coVerify(exactly = 0) { cacheStore.pathIfComplete(any(), any()) }
     }
 }

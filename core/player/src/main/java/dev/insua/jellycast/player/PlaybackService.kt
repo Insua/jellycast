@@ -21,10 +21,10 @@ import dev.insua.jellycast.cache.NetworkTypeMonitor
 import dev.insua.jellycast.database.CachedAudioDao
 import dev.insua.jellycast.datastore.LastPlayedStore
 import dev.insua.jellycast.datastore.PreferencesStore
+import dev.insua.jellycast.datastore.ServerStore
 import dev.insua.jellycast.model.MediaItem
 import dev.insua.jellycast.network.JellyfinApi
 import dev.insua.jellycast.network.session.JellyfinSession
-import dev.insua.jellycast.player.di.ActiveServerId
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -108,8 +108,8 @@ class PlaybackService : MediaSessionService() {
     /**
      * Task 6:[CachePrefetchController] 编排要用到的几样东西——决策逻辑全在那个类里(它在 JVM
      * 单测里可以完整覆盖),本 Service 只负责在换集时调它一次(见 [observeCachePrefetch]),
-     * 以及提供它需要、但只能在这里拿到的几样依赖(Service 生命周期的 `serviceScope`、装配时刻的
-     * `serverId` 快照)。
+     * 以及提供它需要、但只能在这里拿到的几样依赖(Service 生命周期的 `serviceScope`、每次换集都
+     * 重新读一次的激活服务器 id——见 [serverStore] 字段与 I3 复审)。
      */
     @Inject
     lateinit var audioCacheStore: AudioCacheStore
@@ -126,9 +126,13 @@ class PlaybackService : MediaSessionService() {
     @Inject
     lateinit var jellyfinApi: JellyfinApi
 
+    /**
+     * 复审 I3(Important):不再注入一份装配时刻的 serverId 快照——直接注入 [ServerStore] 本身,
+     * 让 [observeCachePrefetch] 每次换集都重新问一次"现在的激活服务器是谁"(见
+     * [CachePrefetchController] 的 `serverIdProvider` KDoc)。
+     */
     @Inject
-    @ActiveServerId
-    lateinit var activeServerId: String
+    lateinit var serverStore: ServerStore
 
     private var mediaSession: MediaSession? = null
 
@@ -404,7 +408,7 @@ class PlaybackService : MediaSessionService() {
             networkTypeMonitor = networkTypeMonitor,
             downloadSourceProvider = playbackSourceResolver.asProvider(),
             api = jellyfinApi,
-            serverId = activeServerId,
+            serverIdProvider = { serverStore.activeServerId.first() },
             userIdProvider = userIdProvider,
             scope = serviceScope,
             // Task 7:接住 CachePrefetchController 类注释「maxBytes」里留的接缝——读用户在设置页

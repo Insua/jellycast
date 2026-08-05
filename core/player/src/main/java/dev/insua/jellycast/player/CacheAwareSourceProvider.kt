@@ -36,19 +36,33 @@ import kotlinx.coroutines.CancellationException
  *
  * Task 6 的预取控制器不依赖这个类,只依赖 [AudioCacheStore] 本身。
  *
- * @param serverId 装配时刻的服务器快照,和 `PlayerModule.provideProgressReporter` 的 `serverId`
- *   同一类已知取舍——进程存活期间切换激活服务器不会更新这个值,需要重启进程才会用新服务器的 id。
+ * @param serverIdProvider 复审 I3(Important):**不是**装配时刻的一次性快照(旧实现是构造时固定
+ *   的 `serverId: String`)。缓存的文件系统真相按服务器隔离(设计文档 §6),`AppSessionViewModel
+ *   .onServerConnected` 切换激活服务器又不重启进程——快照如果不跟着变,切换之后这里会拿着**旧**
+ *   服务器的 id 去查**新**服务器条目的缓存(而 `CachePrefetchController` 那边如果没跟着一起改
+ *   就会拿同一个旧 id 把新服务器的整季音频写进旧服务器的目录——两处必须同步修复,是同一个缺陷
+ *   的两个面)。生产环境接的是 `{ serverStore.activeServerId.first() }`,每次 resolve 都重新问
+ *   一次"现在的激活服务器是谁"。查不到(`null`)时直接委派给 [delegate],不去查一个不知道
+ *   对不对的分区——和 [pathIfComplete] 本身查询失败时的降级是同一种保守默认值。
  */
 class CacheAwareSourceProvider(
     private val delegate: PlaybackSourceProvider,
     private val cacheStore: AudioCacheStore,
     private val api: JellyfinApi,
-    private val serverId: String,
+    private val serverIdProvider: suspend () -> String?,
 ) : PlaybackSourceProvider {
 
     override suspend fun resolve(itemId: String, userId: String, startPositionMs: Long): PlaybackSource {
         // 缓存查询自身失败一律静默降级为"当作没有缓存"——铁律:不得用 runCatching 包 suspend
         // 调用,CancellationException 必须重抛(仓库已经因为把取消当失败吞掉返工过一次)。
+        val serverId = try {
+            serverIdProvider()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            null
+        } ?: return delegate.resolve(itemId, userId, startPositionMs)
+
         val cachedPath = try {
             cacheStore.pathIfComplete(serverId, itemId)
         } catch (e: CancellationException) {

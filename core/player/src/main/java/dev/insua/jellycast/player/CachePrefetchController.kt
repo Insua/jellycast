@@ -91,8 +91,18 @@ import kotlinx.coroutines.launch
  * 单集下载失败(网络错误、resolve 抛异常、L3 兜底)不影响后续条目——`for` 循环里每一集单独
  * try/catch,一集失败只是这一集这次没缓存成,不中断循环、更不影响正在播放的那一集。
  *
- * @param serverId 装配时刻的服务器快照,和 `PlayerModule` 里 [CacheAwareSourceProvider] /
- *   `ProgressReporter` 的 `serverId` 同一类已知取舍——进程存活期间切换激活服务器不会更新这个值。
+ * @param serverIdProvider 复审 I3(Important):这里**不再**是装配时刻的一次性快照。旧实现是
+ *   构造时固定的 `serverId: String`,和 `PlayerModule.provideProgressReporter` 的 serverId
+ *   快照同一类取舍——但那处的代价只是"补报队列暂时分区错了",这里的代价是
+ *   **GB 级文件写错地方**:`AppSessionViewModel.onServerConnected` 切换
+ *   激活服务器不重启进程,快照如果不跟着变,服务器 B 的整季音频就会被下载进
+ *   `audio-cache/<A>/` 目录、索引行写成 `(A, B的itemId)`——本次会话内自洽(读写用的是同一个
+ *   过期 id),但下次冷启动快照变成 B 之后,这些文件和行永远查不到、也永远不会被
+ *   [AudioCacheStore.sweepOrphans] 扫到(那只扫**当前激活**服务器的目录),变成不可回收的
+ *   永久占用。改成每次换集都重新问一次"现在的激活服务器是谁"(`suspend () -> String?`,生产
+ *   环境接的是 `serverStore.activeServerId.first()`),彻底堵死这条路径,而不是等切换之后再去
+ *   回收——这是设计文档 §6"缓存按服务器隔离"这条边界本该有的语义。查不到时(`null`)整轮跳过,
+ *   不驱逐也不预取,和 [seriesOrderAndMeta] 的"查不清楚就什么都不做"是同一种保守默认值。
  * @param userIdProvider 调用方(`PlaybackService`)已经做好静默降级的 `suspend () -> String?`,
  *   直接调用、不再重复包一层——和 [EngineQueueNavigator] / [PlaybackEndedAdvancer] 对同一个
  *   契约的处理方式一致。
@@ -106,7 +116,7 @@ class CachePrefetchController(
     private val networkTypeMonitor: NetworkTypeMonitor,
     private val downloadSourceProvider: PlaybackSourceProvider,
     private val api: JellyfinApi,
-    private val serverId: String,
+    private val serverIdProvider: suspend () -> String?,
     private val userIdProvider: suspend () -> String?,
     private val scope: CoroutineScope,
     private val maxEpisodes: Int = DEFAULT_MAX_EPISODES,
@@ -136,32 +146,51 @@ class CachePrefetchController(
     }
 
     private suspend fun runCycle(item: MediaItem) {
+        // 见构造函数 [serverIdProvider] 的 KDoc(复审 I3):每次换集都重新问一次"现在的激活服务器
+        // 是谁",不用装配时刻的旧快照——查不到就整轮跳过,不驱逐也不预取,是刻意保守的默认值。
+        val serverId = safeServerId() ?: return
+
         if (!hasSweptOrphans) {
             hasSweptOrphans = true
-            sweepOrphansQuietly()
+            sweepOrphansQuietly(serverId)
         }
 
         val userId = userIdProvider() ?: return
         val (seriesOrder, metaByItemId) = seriesOrderAndMeta(item, userId) ?: return
-        val cached = listCachedEntries(seriesOrder)
+        val cached = listCachedEntries(serverId, seriesOrder)
         val maxBytes = safeMaxBytes()
 
         val decision = planCache(item.id, seriesOrder, cached, maxEpisodes, maxBytes)
 
         // 驱逐必须在预取之前:先腾地方,再下载(设计文档 §5.3 / brief 全局约束)。
-        for (evictItemId in decision.toEvict) evictQuietly(evictItemId)
-
-        // 仅 WiFi 才发起下载;驱逐已经在上面无条件做完了,不受网络类型影响——它只是本地文件清理。
-        if (!networkTypeMonitor.isOnWifi()) return
+        for (evictItemId in decision.toEvict) evictQuietly(serverId, evictItemId)
 
         // 串行:一个朴素的 for 循环里逐条 await,结构上就不可能有第二个下载在第一个完成前开始。
+        //
+        // ⚠️ 复审 I4(Important):WiFi 检查**必须在循环内部、每一集开始前**都重新查一次——只在
+        // 循环之前查一次(旧实现)只挡得住"压根没在 WiFi 上就一集都不下"这一种情况。真实场景是
+        // 一集要传几十秒,用户完全可能在下载到一半时走出门:检查挪进循环之后,第一集下载中途切到
+        // 蜂窝不会立即中止那一集本身(见 [downloadQuietly] 传给 `store` 的 `shouldContinue`,那才是
+        // 中止**当前**下载的地方),但从下一集开始不会再新起蜂窝下载——两者加起来才是设计文档 §3
+        // 「立即停止当前下载」的完整实现:当前这集靠 `shouldContinue` 按块检查提前中止,
+        // 后续几集靠这里的循环内检查压根不发起。
         for (prefetchItemId in decision.toPrefetch) {
+            if (!networkTypeMonitor.isOnWifi()) return
             val meta = metaByItemId[prefetchItemId] ?: AudioCacheMeta(seriesId = null, seasonNumber = null, episodeNumber = null)
-            downloadQuietly(prefetchItemId, userId, meta)
+            downloadQuietly(serverId, prefetchItemId, userId, meta)
         }
     }
 
-    private suspend fun sweepOrphansQuietly() {
+    /** 见 [serverIdProvider] 的 KDoc:读取失败(或调用方本来就不知道)一律当作"这轮不动"。 */
+    private suspend fun safeServerId(): String? = try {
+        serverIdProvider()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        null
+    }
+
+    private suspend fun sweepOrphansQuietly(serverId: String) {
         try {
             cacheStore.sweepOrphans(serverId)
         } catch (e: CancellationException) {
@@ -181,7 +210,7 @@ class CachePrefetchController(
         DEFAULT_CACHE_MAX_BYTES
     }
 
-    private suspend fun evictQuietly(itemId: String) {
+    private suspend fun evictQuietly(serverId: String, itemId: String) {
         try {
             cacheStore.delete(serverId, itemId)
         } catch (e: CancellationException) {
@@ -192,7 +221,7 @@ class CachePrefetchController(
         }
     }
 
-    private suspend fun downloadQuietly(itemId: String, userId: String, meta: AudioCacheMeta) {
+    private suspend fun downloadQuietly(serverId: String, itemId: String, userId: String, meta: AudioCacheMeta) {
         try {
             // 防御性复查:cached 快照在算计划和真正下载之间可能已经过期(比如同一集在别处被标记
             // 完成),已经缓存完成的不重复下载。
@@ -202,7 +231,10 @@ class CachePrefetchController(
             // 只缓存纯音频结果——见类注释「下载源」。
             if (source.level != AudioDeliveryLevel.SERVER_AUDIO_ONLY) return
 
-            cacheStore.store(serverId, itemId, meta, source.streamUrl)
+            // 复审 I4:按块检查是否还在 WiFi 上,断网/切到蜂窝时立即中止**当前**这次传输
+            // (见 AudioCacheStore.store / AudioCacheDownloader 的 shouldContinue KDoc),
+            // 不是等这一集传完、或等下一集开始前才发现。
+            cacheStore.store(serverId, itemId, meta, source.streamUrl, shouldContinue = networkTypeMonitor::isOnWifi)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -289,7 +321,7 @@ class CachePrefetchController(
      * 现有实现不读这个字段做任何判断,给哨兵值不影响驱逐/预取结论,只是不让这个字段看起来像是
      * 一个自己编出来的、有意义的序号。
      */
-    private suspend fun listCachedEntries(seriesOrder: List<SeriesSlot>): List<CachedEntry> {
+    private suspend fun listCachedEntries(serverId: String, seriesOrder: List<SeriesSlot>): List<CachedEntry> {
         val orderByItemId = seriesOrder.associate { it.itemId to it.order }
         return try {
             cacheDao.findByServer(serverId).map { entity ->

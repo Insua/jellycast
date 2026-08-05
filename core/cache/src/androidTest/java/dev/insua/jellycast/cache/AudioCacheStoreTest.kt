@@ -269,4 +269,135 @@ class AudioCacheStoreTest {
         assertTrue("下载完成后文件应该还在", file.exists())
         assertEquals("文件应该完整——没有被 unlink 后又在半路断掉", body.size.toLong(), file.length())
     }
+
+    // ---------------------------------------------------------------------
+    // clearServer(复审 I2:删服务器时的整套清理,此前 CachedAudioDao.clearServer 没有任何生产
+    // 调用方,音频缓存的索引行和文件目录会在用户删服务器之后永久占用磁盘)
+    // ---------------------------------------------------------------------
+
+    @Test
+    fun `clearServer清空索引与整个目录_同服务器下的多集全部被清掉`() = runBlocking {
+        server.enqueue(MockResponse().setBody(Buffer().write(ByteArray(1_000))))
+        assertTrue(store.store(SERVER_ID, ITEM_ID, meta(), server.url("/audio").toString()))
+        server.enqueue(MockResponse().setBody(Buffer().write(ByteArray(1_000))))
+        assertTrue(store.store(SERVER_ID, "ep2", meta(), server.url("/audio").toString()))
+
+        assertEquals("清空前索引应该有两条记录", 2, dao.findByServer(SERVER_ID).size)
+        assertTrue("清空前该服务器的目录应该存在", cacheServerDir().exists())
+
+        store.clearServer(SERVER_ID)
+
+        assertTrue("索引应该被整体清空", dao.findByServer(SERVER_ID).isEmpty())
+        assertFalse("整个服务器目录应该被递归删除,不留下任何文件", cacheServerDir().exists())
+    }
+
+    @Test
+    fun `clearServer只清指定服务器_不影响其它服务器的缓存`() = runBlocking {
+        val otherServerId = "other-server"
+        val otherDir = File(cacheServerDir().parentFile, otherServerId)
+        try {
+            server.enqueue(MockResponse().setBody(Buffer().write(ByteArray(1_000))))
+            assertTrue(store.store(SERVER_ID, ITEM_ID, meta(), server.url("/audio").toString()))
+            server.enqueue(MockResponse().setBody(Buffer().write(ByteArray(1_000))))
+            assertTrue(store.store(otherServerId, ITEM_ID, meta(), server.url("/audio").toString()))
+
+            store.clearServer(SERVER_ID)
+
+            assertTrue("被清空的服务器索引应该为空", dao.findByServer(SERVER_ID).isEmpty())
+            assertEquals("另一台服务器的索引不应该被动", 1, dao.findByServer(otherServerId).size)
+            assertTrue("另一台服务器的目录不应该被删除", otherDir.exists())
+        } finally {
+            otherDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `clearServer对没有任何缓存的服务器安静地什么都不做`() = runBlocking {
+        // 不应该抛异常——这条服务器从来没缓存过任何东西。
+        store.clearServer("never-cached-server")
+        assertTrue(dao.findByServer("never-cached-server").isEmpty())
+    }
+
+    // ---------------------------------------------------------------------
+    // I4 复审:断网/切到蜂窝时立即中止当前下载(shouldContinue 按块检查)
+    // ---------------------------------------------------------------------
+
+    /**
+     * 设计文档 §3「断网/切到蜂窝时:立即停止当前下载,丢弃未完成的部分」。用一个在读了几个缓冲块
+     * 之后就翻转为 false 的 [shouldContinue],验证中止发生在**传输中途**(而不是等一整集传完),
+     * 且中止之后的清理和普通下载失败完全一致:不留 `.part`、索引里没有记录。
+     */
+    @Test
+    fun `shouldContinue变为false时中途中止下载_不留半成品_索引里没有记录`() = runBlocking {
+        // 300KB、限速——确保不会一次 read() 就把整个响应体读完,中途中止才有意义。
+        val body = ByteArray(300_000) { it.toByte() }
+        server.enqueue(
+            MockResponse()
+                .setBody(Buffer().write(body))
+                .throttleBody(20_000, 200, TimeUnit.MILLISECONDS)
+        )
+
+        var checks = 0
+        val stored = store.store(SERVER_ID, ITEM_ID, meta(), server.url("/audio").toString()) {
+            checks++
+            checks < 3 // 放行前两次按块检查,第三次判定"不该继续"——发生在传输中途。
+        }
+
+        assertFalse("shouldContinue 判定不该继续之后,这次下载必须失败", stored)
+        assertTrue("必须真的中途检查过多次,不能一次就蒙对", checks >= 3)
+        assertNull("中止的下载不应该落索引", dao.findByItemId(SERVER_ID, ITEM_ID))
+        val remaining = cacheServerDir().listFiles()?.toList().orEmpty()
+        assertTrue("中止后不应该留下任何文件(正式文件或 .part 文件都不该在):$remaining", remaining.isEmpty())
+    }
+
+    @Test
+    fun `shouldContinue全程返回true时下载不受影响`() = runBlocking {
+        server.enqueue(MockResponse().setBody(Buffer().write(ByteArray(1_000))))
+
+        val stored = store.store(SERVER_ID, ITEM_ID, meta(), server.url("/audio").toString()) { true }
+
+        assertTrue("shouldContinue 全程放行时下载应该正常成功", stored)
+        assertNotNull(dao.findByItemId(SERVER_ID, ITEM_ID))
+    }
+
+    // ---------------------------------------------------------------------
+    // 外部存储不可用时的 filesDir 回退(复审「也一并处理」:这条分支此前完全没有测试覆盖)
+    // ---------------------------------------------------------------------
+
+    /** 强制 [Context.getExternalFilesDir] 返回 null,模拟外部存储不可用,走 [Context.filesDir] 回退。 */
+    private class NoExternalFilesDirContext(base: Context) : android.content.ContextWrapper(base) {
+        override fun getExternalFilesDir(type: String?): File? = null
+    }
+
+    @Test
+    fun `外部存储不可用时回退到filesDir_下载与查询仍然一致工作`() = runBlocking {
+        val fallbackDir = File(context.filesDir, "audio-cache")
+        fallbackDir.deleteRecursively()
+        val fallbackStore = AudioCacheStore(
+            context = NoExternalFilesDirContext(context),
+            dao = dao,
+            downloader = AudioCacheDownloader(OkHttpClient()),
+            clock = { clockMs },
+        )
+
+        try {
+            server.enqueue(MockResponse().setBody(Buffer().write(ByteArray(1_000))))
+            val stored = fallbackStore.store(SERVER_ID, ITEM_ID, meta(), server.url("/audio").toString())
+            assertTrue("外部存储不可用时,回退到 filesDir 之后下载应该照常成功", stored)
+
+            val entity = dao.findByItemId(SERVER_ID, ITEM_ID)
+            assertNotNull(entity)
+            assertTrue(
+                "索引记录的路径应该落在 context.filesDir 下,证明真的走了回退分支,不是外部存储",
+                entity!!.filePath.startsWith(context.filesDir.absolutePath),
+            )
+            assertEquals(
+                "回退路径上 pathIfComplete 应该能查到同一份记录——写入和查询用的是同一个 rootDir",
+                entity.filePath,
+                fallbackStore.pathIfComplete(SERVER_ID, ITEM_ID),
+            )
+        } finally {
+            fallbackDir.deleteRecursively()
+        }
+    }
 }

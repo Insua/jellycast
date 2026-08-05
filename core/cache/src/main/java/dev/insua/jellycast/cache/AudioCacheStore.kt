@@ -94,12 +94,19 @@ class AudioCacheStore(
      * ⚠️ "先 rename 再写索引"这个顺序是本类唯一的正确性核心,变异测试(Task 3 brief Step 5)
      * 就是把这个顺序倒过来验证:一旦索引在下载开始时就写入,取消下载后索引里会残留一行指向
      * 还没完工的文件,直接破坏"不完整文件不可播"这条铁律。
+     *
+     * @param shouldContinue 复审 I4(Important):每读完一个缓冲块就问一次"还该不该继续"——
+     *   生产环境([CachePrefetchController])接的是 `{ networkTypeMonitor.isOnWifi() }`,把设计
+     *   文档 §3「断网/切到蜂窝时立即停止当前下载」下沉到字节拷贝这一层,而不是只在**下一个**
+     *   下载开始前查一次(那样已经在传的这一集会传完整整一集蜂窝流量)。见 [AudioCacheDownloader]
+     *   类注释「I4 复审」——中止时按普通下载失败处理(清 `.part`、不落索引),不是取消。
      */
     suspend fun store(
         serverId: String,
         itemId: String,
         meta: AudioCacheMeta,
         sourceUrl: String,
+        shouldContinue: () -> Boolean = { true },
     ): Boolean {
         val dir = File(rootDir, serverId).apply { mkdirs() }
         val finalFile = File(dir, itemId)
@@ -113,7 +120,7 @@ class AudioCacheStore(
         inFlight += key
         try {
             val downloaded = try {
-                downloader.download(sourceUrl, partFile)
+                downloader.download(sourceUrl, partFile, shouldContinue)
             } catch (e: CancellationException) {
                 partFile.delete()
                 throw e
@@ -170,6 +177,37 @@ class AudioCacheStore(
             } catch (e: Exception) {
                 // 静默:索引已经清空,文件删不掉顶多是白占一点空间,不影响"这条不算已缓存"这个结论。
             }
+        }
+    }
+
+    /**
+     * 删服务器时整体清空该服务器的音频缓存:索引里这台服务器的全部行 + 整个
+     * `audio-cache/<serverId>/` 目录,递归删除。
+     *
+     * 复审 I2:[CachedAudioDao.clearServer] 在这个方法存在之前写好了、也测过,却从没有任何生产
+     * 调用方——`ServerViewModel.confirmDeleteServer` 只清了 `CachedItemDao`(库浏览缓存)和
+     * `LastPlayedStore`,音频缓存的索引行和文件目录被彻底遗漏。[sweepOrphans] 救不了这个场景:
+     * 它只在**当前激活**服务器的目录上跑(见 `CachePrefetchController` 调用方),被删掉的服务器
+     * 不再是激活服务器,从此再也没有任何代码会去扫它的目录——文件会一直占着地方,直到用户手动
+     * 清 App 数据。
+     *
+     * 和这个类其余方法同一种"失败即静默降级"纪律:索引清不掉、文件删不掉都不向上抛错
+     * (删除服务器这个操作本身的成败由 [CancellationException] 之外的异常单独判断,音频缓存
+     * 顶多是清理不干净,不应该让删服务器这个更重要的操作失败)——但 [CancellationException]
+     * 仍然必须重抛,不用 `runCatching` 包 suspend 调用,和类注释「失败即静默降级」是同一个理由。
+     */
+    suspend fun clearServer(serverId: String) {
+        try {
+            dao.clearServer(serverId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // 静默:索引清不掉不阻止文件目录清理,也不阻止调用方(删服务器)本身的其余步骤。
+        }
+        try {
+            File(rootDir, serverId).deleteRecursively()
+        } catch (e: Exception) {
+            // 静默:文件删不掉顶多是白占一点空间,不影响"这台服务器不再有已缓存内容"这个结论。
         }
     }
 

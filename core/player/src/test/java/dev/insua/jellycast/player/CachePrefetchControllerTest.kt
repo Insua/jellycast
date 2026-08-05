@@ -88,7 +88,7 @@ class CachePrefetchControllerTest {
         coEvery { store.sweepOrphans(SERVER_ID) } just Runs
         coEvery { store.pathIfComplete(SERVER_ID, any()) } returns null
         coEvery { store.delete(SERVER_ID, any()) } just Runs
-        coEvery { store.store(SERVER_ID, any(), any(), any()) } returns true
+        coEvery { store.store(SERVER_ID, any(), any(), any(), any()) } returns true
     }
 
     private fun freshDao(cached: List<CachedAudioEntity> = emptyList()): CachedAudioDao =
@@ -122,7 +122,7 @@ class CachePrefetchControllerTest {
             networkTypeMonitor = network,
             downloadSourceProvider = downloadSourceProvider,
             api = api,
-            serverId = SERVER_ID,
+            serverIdProvider = { SERVER_ID },
             userIdProvider = { USER_ID },
             scope = scope,
         )
@@ -139,7 +139,7 @@ class CachePrefetchControllerTest {
         sut.onItemChanged(ep("e1", 1))
         advanceUntilIdle()
 
-        coVerify(exactly = 0) { cacheStore.store(SERVER_ID, any(), any(), any()) }
+        coVerify(exactly = 0) { cacheStore.store(SERVER_ID, any(), any(), any(), any()) }
     }
 
     /**
@@ -161,7 +161,7 @@ class CachePrefetchControllerTest {
         advanceUntilIdle()
 
         coVerify(exactly = 1) { cacheStore.delete(SERVER_ID, "stale-episode") }
-        coVerify(exactly = 0) { cacheStore.store(SERVER_ID, any(), any(), any()) }
+        coVerify(exactly = 0) { cacheStore.store(SERVER_ID, any(), any(), any(), any()) }
     }
 
     // ---- WiFi 下按 planCache 给的顺序下载 ----
@@ -170,7 +170,7 @@ class CachePrefetchControllerTest {
         val api = mockk<JellyfinApi>().apply { stubThreeEpisodeSeries() }
         val cacheStore = freshCacheStore()
         val stored = mutableListOf<String>()
-        coEvery { cacheStore.store(SERVER_ID, any(), any(), any()) } coAnswers {
+        coEvery { cacheStore.store(SERVER_ID, any(), any(), any(), any()) } coAnswers {
             stored += secondArg<String>()
             true
         }
@@ -190,7 +190,7 @@ class CachePrefetchControllerTest {
         val cacheStore = freshCacheStore()
         val gate = CompletableDeferred<Unit>()
         val started = mutableListOf<String>()
-        coEvery { cacheStore.store(SERVER_ID, any(), any(), any()) } coAnswers {
+        coEvery { cacheStore.store(SERVER_ID, any(), any(), any(), any()) } coAnswers {
             val itemId = secondArg<String>()
             started += itemId
             if (itemId == "e1") gate.await() // 第一集卡在这里,模拟"还没下载完"的窗口
@@ -214,6 +214,57 @@ class CachePrefetchControllerTest {
         assertEquals(listOf("e1", "e2", "e3"), started, "第一集完成之后,后续几集应该依次跟上")
     }
 
+    // ---- 复审 I4(Important):断网/切到蜂窝发生在串行循环中途,后续集数不应该再新起下载 ----
+
+    /**
+     * 旧实现只在循环**之前**查一次 `isOnWifi()`——只挡得住"压根没在 WiFi 上就一集都不下"。
+     * 真实场景是一集要传几十秒,用户完全可能在第一集下载到一半时走出门:这条用例模拟"WiFi 状态
+     * 在 e1 下载过程中翻转为 false",断言 e1 完成之后 e2/e3(串行循环里排在后面的集)**不会**
+     * 被新起下载——即使它们此刻都还没缓存。当前这集本身是否被中途中止由 `shouldContinue` 参数
+     * 负责(见 `AudioCacheDownloader`/`AudioCacheStore` 的 androidTest),这里只覆盖"循环内部
+     * 每一集开始前都要重新查一次网络类型"这半条防线。
+     */
+    @Test fun `WiFi在循环中途丢失时后续集数不再新起下载`() = runTest {
+        val api = mockk<JellyfinApi>().apply { stubThreeEpisodeSeries() }
+        val cacheStore = freshCacheStore()
+        val gate = CompletableDeferred<Unit>()
+        val started = mutableListOf<String>()
+        var onWifi = true
+        val network = mockk<NetworkTypeMonitor>()
+        every { network.isOnWifi() } answers { onWifi }
+        coEvery { cacheStore.store(SERVER_ID, any(), any(), any(), any()) } coAnswers {
+            val itemId = secondArg<String>()
+            started += itemId
+            if (itemId == "e1") {
+                onWifi = false // e1 下载途中掉线/切到蜂窝。
+                gate.await()
+            }
+            true
+        }
+        val provider = PlaybackSourceProvider { itemId, _, _ -> remoteSource(itemId) }
+        val sut = CachePrefetchController(
+            cacheDao = freshDao(),
+            cacheStore = cacheStore,
+            networkTypeMonitor = network,
+            downloadSourceProvider = provider,
+            api = api,
+            serverIdProvider = { SERVER_ID },
+            userIdProvider = { USER_ID },
+            scope = this,
+        )
+
+        sut.onItemChanged(ep("e1", 1))
+        advanceUntilIdle()
+        gate.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf("e1"),
+            started,
+            "e1 下载中途掉线之后,e2/e3 不该被当作\"仍在 WiFi 上\"新起蜂窝下载,实际:$started",
+        )
+    }
+
     // ---- 已缓存的不重复下载 ----
 
     @Test fun `已缓存的条目不重复下载`() = runTest {
@@ -227,9 +278,9 @@ class CachePrefetchControllerTest {
         sut.onItemChanged(ep("e1", 1))
         advanceUntilIdle()
 
-        coVerify(exactly = 0) { cacheStore.store(SERVER_ID, "e1", any(), any()) }
-        coVerify(exactly = 1) { cacheStore.store(SERVER_ID, "e2", any(), any()) }
-        coVerify(exactly = 1) { cacheStore.store(SERVER_ID, "e3", any(), any()) }
+        coVerify(exactly = 0) { cacheStore.store(SERVER_ID, "e1", any(), any(), any()) }
+        coVerify(exactly = 1) { cacheStore.store(SERVER_ID, "e2", any(), any(), any()) }
+        coVerify(exactly = 1) { cacheStore.store(SERVER_ID, "e3", any(), any(), any()) }
     }
 
     // ---- 驱逐必须在预取之前执行 ----
@@ -239,7 +290,7 @@ class CachePrefetchControllerTest {
         val cacheStore = freshCacheStore()
         val events = mutableListOf<String>()
         coEvery { cacheStore.delete(SERVER_ID, any()) } coAnswers { events += "evict:${secondArg<String>()}" }
-        coEvery { cacheStore.store(SERVER_ID, any(), any(), any()) } coAnswers {
+        coEvery { cacheStore.store(SERVER_ID, any(), any(), any(), any()) } coAnswers {
             events += "download:${secondArg<String>()}"
             true
         }
@@ -265,15 +316,15 @@ class CachePrefetchControllerTest {
     @Test fun `单集下载失败不影响后续条目`() = runTest {
         val api = mockk<JellyfinApi>().apply { stubThreeEpisodeSeries() }
         val cacheStore = freshCacheStore()
-        coEvery { cacheStore.store(SERVER_ID, "e1", any(), any()) } throws RuntimeException("下载 e1 失败")
+        coEvery { cacheStore.store(SERVER_ID, "e1", any(), any(), any()) } throws RuntimeException("下载 e1 失败")
         val provider = PlaybackSourceProvider { itemId, _, _ -> remoteSource(itemId) }
         val sut = controller(api, cacheStore, freshDao(), onWifi = true, downloadSourceProvider = provider, scope = this)
 
         sut.onItemChanged(ep("e1", 1))
         advanceUntilIdle()
 
-        coVerify(exactly = 1) { cacheStore.store(SERVER_ID, "e2", any(), any()) }
-        coVerify(exactly = 1) { cacheStore.store(SERVER_ID, "e3", any(), any()) }
+        coVerify(exactly = 1) { cacheStore.store(SERVER_ID, "e2", any(), any(), any()) }
+        coVerify(exactly = 1) { cacheStore.store(SERVER_ID, "e3", any(), any(), any()) }
     }
 
     // ---- 换集时重新计算计划,并取消上一次尚未完成的预取 ----
@@ -283,7 +334,7 @@ class CachePrefetchControllerTest {
         val cacheStore = freshCacheStore()
         val gate = CompletableDeferred<Unit>()
         val stored = mutableListOf<String>()
-        coEvery { cacheStore.store(SERVER_ID, any(), any(), any()) } coAnswers {
+        coEvery { cacheStore.store(SERVER_ID, any(), any(), any(), any()) } coAnswers {
             val itemId = secondArg<String>()
             stored += itemId
             if (itemId == "e1") gate.await()
@@ -335,7 +386,7 @@ class CachePrefetchControllerTest {
             networkTypeMonitor = network,
             downloadSourceProvider = provider,
             api = api,
-            serverId = SERVER_ID,
+            serverIdProvider = { SERVER_ID },
             userIdProvider = { USER_ID },
             scope = this,
             // 模拟 DataStore 读取失败——safeMaxBytes() 必须退回 DEFAULT_CACHE_MAX_BYTES。
@@ -362,5 +413,66 @@ class CachePrefetchControllerTest {
         advanceUntilIdle()
 
         coVerify(exactly = 1) { cacheStore.sweepOrphans(SERVER_ID) }
+    }
+
+    // ---- 复审 I3(Important):serverId 必须每次换集都动态查询,不能是装配时刻的一次性快照 ----
+
+    /**
+     * `AppSessionViewModel.onServerConnected` 切服务器不重启进程。旧实现把 `serverId` 定死在
+     * 构造函数里(装配时刻的一次性快照)——切到 server-B 之后,这里会继续把 server-B 的整季音频
+     * 写进 `audio-cache/<server-A>/` 目录、索引行写成 `(server-A, server-B的itemId)`,本次会话内
+     * 自洽(读写用的都是过期 id),但下次冷启动快照变成 server-B 之后,这些文件和行永远查不到、
+     * 也永远不会被 [AudioCacheStore.sweepOrphans] 扫到(那只扫**当前激活**服务器的目录)——GB 级
+     * 文件永久占用磁盘。这条用例通过在**同一个** controller 实例上,两次 `onItemChanged` 之间
+     * 切换 `serverIdProvider` 的返回值,验证第二个周期真的用了新的 serverId,不是延续第一个周期
+     * 缓存下来的旧值。
+     */
+    @Test fun `切换激活服务器后新的预取周期使用新的serverId`() = runTest {
+        val api = mockk<JellyfinApi>().apply { stubThreeEpisodeSeries() }
+        val cacheStore = mockk<AudioCacheStore>()
+        coEvery { cacheStore.sweepOrphans(any()) } just Runs
+        coEvery { cacheStore.pathIfComplete(any(), any()) } returns null
+        coEvery { cacheStore.delete(any(), any()) } just Runs
+        val storedUnder = mutableListOf<Pair<String, String>>()
+        coEvery { cacheStore.store(any(), any(), any(), any(), any()) } coAnswers {
+            storedUnder += firstArg<String>() to secondArg<String>()
+            true
+        }
+        val cacheDao = mockk<CachedAudioDao>()
+        coEvery { cacheDao.findByServer(any()) } returns emptyList()
+        val network = mockk<NetworkTypeMonitor>()
+        every { network.isOnWifi() } returns true
+        var activeServerId = "server-A"
+        val provider = PlaybackSourceProvider { itemId, _, _ -> remoteSource(itemId) }
+        val sut = CachePrefetchController(
+            cacheDao = cacheDao,
+            cacheStore = cacheStore,
+            networkTypeMonitor = network,
+            downloadSourceProvider = provider,
+            api = api,
+            serverIdProvider = { activeServerId },
+            userIdProvider = { USER_ID },
+            scope = this,
+        )
+
+        sut.onItemChanged(ep("e1", 1))
+        advanceUntilIdle()
+
+        activeServerId = "server-B" // 用户切换到了另一台服务器,进程没有重启。
+        sut.onItemChanged(movie("m1"))
+        advanceUntilIdle()
+
+        assertTrue(
+            storedUnder.contains("server-A" to "e1"),
+            "切换前的下载应该记在 server-A 下,实际:$storedUnder",
+        )
+        assertTrue(
+            storedUnder.contains("server-B" to "m1"),
+            "切换服务器之后的新预取周期必须用新的 serverId,不能继续沿用装配时刻的旧快照。实际:$storedUnder",
+        )
+        assertFalse(
+            storedUnder.contains("server-A" to "m1"),
+            "电影 m1 属于 server-B,绝不能被误写进 server-A 的缓存目录/索引里,实际:$storedUnder",
+        )
     }
 }

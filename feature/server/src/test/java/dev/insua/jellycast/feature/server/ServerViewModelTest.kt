@@ -1,5 +1,6 @@
 package dev.insua.jellycast.feature.server
 
+import dev.insua.jellycast.cache.AudioCacheStore
 import dev.insua.jellycast.database.CachedItemDao
 import dev.insua.jellycast.datastore.LastPlayedStore
 import dev.insua.jellycast.datastore.ServerStore
@@ -47,6 +48,7 @@ class ServerViewModelTest {
     private val endpointSelector = mockk<EndpointSelector>()
     private val jellyfinApiFactory = mockk<JellyfinApiFactory>()
     private val cachedItemDao = mockk<CachedItemDao>(relaxed = true)
+    private val audioCacheStore = mockk<AudioCacheStore>(relaxed = true)
     private val lastPlayedStore = mockk<LastPlayedStore>(relaxed = true)
 
     @BeforeEach
@@ -63,7 +65,8 @@ class ServerViewModelTest {
 
     private fun viewModel(certificateFetcher: PeerCertificateFetcher = mockk(relaxed = true)) =
         ServerViewModel(
-            serverStore, endpointSelector, jellyfinApiFactory, cachedItemDao, lastPlayedStore, certificateFetcher,
+            serverStore, endpointSelector, jellyfinApiFactory, cachedItemDao, audioCacheStore, lastPlayedStore,
+            certificateFetcher,
         )
 
     private fun server(id: String, name: String = "server-$id") =
@@ -486,6 +489,21 @@ class ServerViewModelTest {
         coVerify(exactly = 1) { cachedItemDao.clearServer("srv-1") }
     }
 
+    // ---- 复审 I2(Important):AudioCacheStore.clearServer 写好了却从没有生产调用方,音频缓存的
+    // 索引行和 audio-cache/<serverId>/ 目录被彻底遗漏——用户设的存储上限(默认 1G,最高可选
+    // 10G/不限制)对应的文件会一直占着磁盘,直到用户手动清 App 数据。这条用例专门堵这个洞。
+
+    @Test
+    fun `删除当前活跃服务器时清掉音频缓存`() = runTest {
+        every { serverStore.activeServerId } returns MutableStateFlow("srv-1")
+        val vm = viewModel()
+
+        vm.requestDeleteServer("srv-1")
+        vm.confirmDeleteServer()
+
+        coVerify(exactly = 1) { audioCacheStore.clearServer("srv-1") }
+    }
+
     // ---- 复审 Task 5 Important 1:删除活跃服务器必须清掉「上次播放」记录 ----
     // 之前只有 AppSessionViewModel.onServerConnected()(连接新服务器成功之后)才会清这份记录,
     // 删除活跃服务器这一步本身完全不碰 LastPlayedStore——如果用户删完不再连任何服务器,
@@ -513,6 +531,7 @@ class ServerViewModelTest {
         coVerify(exactly = 1) { serverStore.delete("srv-1") }
         coVerify(exactly = 0) { serverStore.clearActive() }
         coVerify(exactly = 0) { cachedItemDao.clearServer(any()) }
+        coVerify(exactly = 0) { audioCacheStore.clearServer(any()) }
         coVerify(exactly = 0) { lastPlayedStore.clear() }
     }
 
@@ -546,6 +565,7 @@ class ServerViewModelTest {
         assertNull(vm.uiState.value.deleteConfirmation)
         coVerify(exactly = 0) { serverStore.clearActive() }
         coVerify(exactly = 0) { cachedItemDao.clearServer(any()) }
+        coVerify(exactly = 0) { audioCacheStore.clearServer(any()) }
         coVerify(exactly = 0) { lastPlayedStore.clear() }
     }
 }

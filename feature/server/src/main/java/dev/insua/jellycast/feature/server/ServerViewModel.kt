@@ -3,6 +3,7 @@ package dev.insua.jellycast.feature.server
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dev.insua.jellycast.cache.AudioCacheStore
 import dev.insua.jellycast.database.CachedItemDao
 import dev.insua.jellycast.datastore.LastPlayedStore
 import dev.insua.jellycast.datastore.ServerStore
@@ -84,6 +85,7 @@ class ServerViewModel @Inject constructor(
     private val endpointSelector: EndpointSelector,
     private val jellyfinApiFactory: JellyfinApiFactory,
     private val cachedItemDao: CachedItemDao,
+    private val audioCacheStore: AudioCacheStore,
     private val lastPlayedStore: LastPlayedStore,
     private val certificateFetcher: PeerCertificateFetcher = DefaultPeerCertificateFetcher,
 ) : ViewModel() {
@@ -301,10 +303,17 @@ class ServerViewModel @Inject constructor(
      * 用户在确认弹窗里点了「删除」。真正调 [ServerStore.delete] 的唯一入口。
      *
      * 被删的如果正好是当前活跃服务器,还要清掉活跃标记([ServerStore.clearActive])、清空
-     * 它的缓存([CachedItemDao.clearServer]),并清掉「上次播放」记录([LastPlayedStore.clear],
-     * 复审 Task 5 Important 1)——否则激活标记会指向一台不存在的服务器,缓存表里会留下无主的行,
-     * 「上次播放」记录也会继续指着一台已经被删掉的服务器,下次冷启动迷你条恢复出来的条目连
-     * 服务器都不存在了。四步全部包在同一个 try 里:任何一步失败都算这次删除失败,必须给用户
+     * 它的库浏览缓存([CachedItemDao.clearServer])**和音频缓存**([AudioCacheStore.clearServer],
+     * 复审 I2),并清掉「上次播放」记录([LastPlayedStore.clear],复审 Task 5 Important 1)——
+     * 否则激活标记会指向一台不存在的服务器,两张缓存表里都会留下无主的行,「上次播放」记录也会
+     * 继续指着一台已经被删掉的服务器,下次冷启动迷你条恢复出来的条目连服务器都不存在了。
+     *
+     * ⚠️ 复审 I2(Important):[AudioCacheStore.clearServer] 在这次修复之前**没有任何生产调用方
+     * ——[CachedAudioDao.clearServer] 写好了、也单测过,却从没被这里调用**,音频缓存的索引行
+     * 和 `audio-cache/<serverId>/` 目录整个被漏掉,删服务器不会清掉它可能高达设置上限(默认
+     * 1 GB,最高可选 10 GB/不限制)的本地文件,永久占用磁盘直到用户手动清 App 数据。
+     *
+     * 五步全部包在同一个 try 里:任何一步失败都算这次删除失败,必须给用户
      * 看得到的提示(铁律:删除失败不得静默),不能让用户以为删成功了。
      *
      * 这一步只清磁盘上的记录。若用户删完立刻连一台新服务器,导航层随后会调
@@ -320,6 +329,7 @@ class ServerViewModel @Inject constructor(
                 if (activeServerId == id) {
                     serverStore.clearActive()
                     cachedItemDao.clearServer(id)
+                    audioCacheStore.clearServer(id)
                     lastPlayedStore.clear()
                 }
                 _uiState.update { it.copy(deleteConfirmation = null, error = null) }
