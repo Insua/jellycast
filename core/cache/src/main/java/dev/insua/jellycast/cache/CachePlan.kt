@@ -52,7 +52,7 @@ data class CacheDecision(val toPrefetch: List<String>, val toEvict: List<String>
  *
  * 这条保护在**窗口步骤**(窗口目标集合的构造)和**容量步骤**(§3 的 `continue`)里各实现
  * 了一次,不是多余:容量步骤的排除是必需的(幸存集合按 `lastAccessAt` 排序,锚点可能排在
- * 最前面被当成"最老的"删掉);窗口步骤的排除只在 [maxEpisodes] `<= 0` 时才会真正生效
+ * 最前面被当成"最老的"删掉);窗口步骤的排除只在 [maxEpisodes] `== 0` 时才会真正生效
  * ——否则锚点自身的 `order` 必然让它留在窗口目标集合里,这层保护是防御性的,为了不让
  * "锚点永不驱逐"这个不变量依赖调用方永远传一个合法的 `maxEpisodes`。
  *
@@ -60,9 +60,11 @@ data class CacheDecision(val toPrefetch: List<String>, val toEvict: List<String>
  * - 锚点不在 [seriesOrder] 里(包括 [seriesOrder] 为空,比如上游数据还没同步好该剧的顺序)——
  *   返回空的 [CacheDecision](既不预取也不驱逐)。这是刻意保守的默认值:在不知道锚点在
  *   序列里的位置时,任何驱逐决定都可能是错的,宁可什么都不做。
- * - [maxEpisodes] `<= 0` —— 窗口目标集合为空,锚点因此既不会出现在 [CacheDecision.toPrefetch]
+ * - [maxEpisodes] `== 0` —— 窗口目标集合为空,锚点因此既不会出现在 [CacheDecision.toPrefetch]
  *   里,也不会(借助上面提到的窗口步骤保护)出现在 [CacheDecision.toEvict] 里:结果是
  *   "维持原状",不是"清空"。调用方目前的取值范围里 `maxEpisodes` 恒为正数,这条只是防御性行为。
+ *   负数不受支持:内部用 `List.take(maxEpisodes)` 截取窗口目标,负数会让它直接抛
+ *   `IllegalArgumentException`,不会退化成空操作。
  *
  * @param currentItemId 锚点:当前正在播放的条目 id。
  * @param seriesOrder 该剧(或电影)完整的顺序列表;电影传只含自己的单元素列表。
