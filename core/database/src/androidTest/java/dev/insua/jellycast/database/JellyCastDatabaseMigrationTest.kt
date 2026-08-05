@@ -100,4 +100,56 @@ class JellyCastDatabaseMigrationTest {
             assertEquals(0, it.getInt(0))
         }
     }
+
+    /**
+     * 迁移 3 -> 4 只新增 `cached_audio` 表(音频缓存索引,见 [MIGRATION_3_4]),不得触碰
+     * `progress_report`/`cached_item`/`cache_bucket_meta` 里已有的任何一行——这三张表在 v3
+     * 就已经存在,这个数据库没有用 `fallbackToDestructiveMigration()`,漏写迁移会导致用户
+     * 升级时 Room 直接抛异常,而不是静默清空数据,但仍然要用真实迁移验证已有数据不受影响。
+     */
+    @Test
+    fun `迁移3到4后progress_report和cached_item里的行原封不动_cached_audio表可查询`() {
+        val v3: SupportSQLiteDatabase = helper.createDatabase(TEST_DB, 3)
+        v3.execSQL(
+            """
+            INSERT INTO progress_report (id, serverId, itemId, playSessionId, positionMs, kind, createdAt)
+            VALUES (1, 'sA', 'item-1', NULL, 12345, 'progress', 1000)
+            """.trimIndent()
+        )
+        v3.execSQL(
+            """
+            INSERT INTO cached_item (serverId, bucket, itemId, position, payloadJson, updatedAt)
+            VALUES ('sA', 'home.resume', 'item-1', 0, '{}', 1000)
+            """.trimIndent()
+        )
+        v3.close()
+
+        val v4 = helper.runMigrationsAndValidate(TEST_DB, 4, true, MIGRATION_3_4)
+
+        val progressCursor = v4.query("SELECT serverId, itemId, positionMs FROM progress_report")
+        progressCursor.use {
+            assertEquals(1, it.count)
+            it.moveToFirst()
+            assertEquals("sA", it.getString(0))
+            assertEquals("item-1", it.getString(1))
+            assertEquals(12345L, it.getLong(2))
+        }
+
+        val cachedItemCursor = v4.query("SELECT serverId, bucket, itemId, position FROM cached_item")
+        cachedItemCursor.use {
+            assertEquals(1, it.count)
+            it.moveToFirst()
+            assertEquals("sA", it.getString(0))
+            assertEquals("home.resume", it.getString(1))
+            assertEquals("item-1", it.getString(2))
+            assertEquals(0, it.getInt(3))
+        }
+
+        // 新表存在且可查询(空表,这条 INSERT 之前 v3 里没有这张表)。
+        val cachedAudioCursor = v4.query("SELECT COUNT(*) FROM cached_audio")
+        cachedAudioCursor.use {
+            it.moveToFirst()
+            assertEquals(0, it.getInt(0))
+        }
+    }
 }

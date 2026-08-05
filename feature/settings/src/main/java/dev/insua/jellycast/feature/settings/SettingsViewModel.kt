@@ -4,6 +4,7 @@ import android.content.Intent
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dev.insua.jellycast.datastore.DEFAULT_CACHE_MAX_BYTES
 import dev.insua.jellycast.datastore.PreferencesStore
 import dev.insua.jellycast.diagnostics.DiagnosticsExporter
 import dev.insua.jellycast.model.AudioDeliveryLevel
@@ -28,12 +29,32 @@ data class SettingsUiState(
     val audioBitRateKbps: Int = 128,
     val currentEndpoint: String? = null,
     val currentDeliveryLevel: AudioDeliveryLevel? = null,
+    /**
+     * 当前播放源是否来自本地音频缓存([dev.insua.jellycast.model.PlaybackSource.isLocalFile])。
+     *
+     * 复审发现:命中缓存的 `PlaybackSource.level` 仍然是 [AudioDeliveryLevel.SERVER_AUDIO_ONLY]
+     * (`CacheAwareSourceProvider` 的实现细节,见其 KDoc),但那条流其实**一次请求都没发给服务端**。
+     * `currentDeliveryLevel` 单独暴露会让「开发者信息」面板在播缓存文件时显示「L1 · 服务端纯音频」
+     * ——这是假话,而且会和旁边几乎是 0 的「本次会话已传输字节数」自相矛盾。这个面板存在的唯一
+     * 目的就是让人能看清"这次到底走的是哪条网络路径",报错比什么都不报更糟。
+     *
+     * 这里单独暴露 [isLocalFile],由显示层([SettingsScreen] 的 `deliveryLevelDisplayLabel`)在
+     * `isLocalFile` 为真时整体覆盖显示文案——而不是往 [AudioDeliveryLevel] 里加一个新枚举值:
+     * `SettingsScreen` 对该枚举有一处穷尽 `when`,加值会牵连到那处无关代码。
+     */
+    val currentSourceIsLocalFile: Boolean = false,
     val sessionBytesTransferred: Long = 0L,
     val diagnosticsEnabled: Boolean = true,
+    /**
+     * 音频缓存的存储上限,单位字节(Task 7,design doc §4.3)。`null` = 不限制——和
+     * [dev.insua.jellycast.datastore.PreferencesStore.cacheMaxBytes] 的表示一致。默认值直接引用
+     * [DEFAULT_CACHE_MAX_BYTES],与该 Flow 无数据时的默认值保持同一份定义,不再各自维护。
+     */
+    val cacheMaxBytes: Long? = DEFAULT_CACHE_MAX_BYTES,
 )
 
 /**
- * 设置页。前七项([playbackSpeed]…[diagnosticsEnabled])直接把 [PreferencesStore] 的
+ * 设置页。前八项([playbackSpeed]…[cacheMaxBytes])直接把 [PreferencesStore] 的
  * Flow 摆到 UI 上,双向绑定——没有额外的领域逻辑。
  *
  * [buildDiagnosticsExportIntent](Task 5,design doc §5)是个例外:导出诊断日志不是一条偏好,
@@ -87,9 +108,17 @@ class SettingsViewModel @Inject constructor(
             preferencesStore.diagnosticsEnabled.collect { v -> _uiState.update { it.copy(diagnosticsEnabled = v) } }
         }
         viewModelScope.launch {
+            preferencesStore.cacheMaxBytes.collect { v -> _uiState.update { it.copy(cacheMaxBytes = v) } }
+        }
+        viewModelScope.launch {
             playbackEngine.state.collect { state ->
-                val level = (state as? PlaybackEngineState.Ready)?.source?.level
-                _uiState.update { it.copy(currentDeliveryLevel = level) }
+                val source = (state as? PlaybackEngineState.Ready)?.source
+                _uiState.update {
+                    it.copy(
+                        currentDeliveryLevel = source?.level,
+                        currentSourceIsLocalFile = source?.isLocalFile ?: false,
+                    )
+                }
             }
         }
         viewModelScope.launch {
@@ -118,6 +147,8 @@ class SettingsViewModel @Inject constructor(
 
     fun onDiagnosticsEnabledChange(value: Boolean) =
         viewModelScope.launch { preferencesStore.setDiagnosticsEnabled(value) }
+
+    fun onCacheMaxBytesChange(value: Long?) = viewModelScope.launch { preferencesStore.setCacheMaxBytes(value) }
 
     /**
      * "导出诊断日志"背后的动作(design doc §5)。返回 `null` 时(从未记录过任何内容,或用户此前

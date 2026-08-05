@@ -16,9 +16,14 @@ import android.os.Handler
 import android.os.Looper
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import dev.insua.jellycast.cache.AudioCacheStore
+import dev.insua.jellycast.cache.NetworkTypeMonitor
+import dev.insua.jellycast.database.CachedAudioDao
 import dev.insua.jellycast.datastore.LastPlayedStore
 import dev.insua.jellycast.datastore.PreferencesStore
+import dev.insua.jellycast.datastore.ServerStore
 import dev.insua.jellycast.model.MediaItem
+import dev.insua.jellycast.network.JellyfinApi
 import dev.insua.jellycast.network.session.JellyfinSession
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -27,6 +32,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.android.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -98,6 +104,35 @@ class PlaybackService : MediaSessionService() {
      */
     @Inject
     lateinit var lastPlayedStore: LastPlayedStore
+
+    /**
+     * Task 6:[CachePrefetchController] 编排要用到的几样东西——决策逻辑全在那个类里(它在 JVM
+     * 单测里可以完整覆盖),本 Service 只负责在换集时调它一次(见 [observeCachePrefetch]),
+     * 以及提供它需要、但只能在这里拿到的几样依赖(Service 生命周期的 `serviceScope`、每次换集都
+     * 重新读一次的激活服务器 id——见 [serverStore] 字段与 I3 复审)。
+     */
+    @Inject
+    lateinit var audioCacheStore: AudioCacheStore
+
+    @Inject
+    lateinit var networkTypeMonitor: NetworkTypeMonitor
+
+    @Inject
+    lateinit var cachedAudioDao: CachedAudioDao
+
+    @Inject
+    lateinit var playbackSourceResolver: PlaybackSourceResolver
+
+    @Inject
+    lateinit var jellyfinApi: JellyfinApi
+
+    /**
+     * 复审 I3(Important):不再注入一份装配时刻的 serverId 快照——直接注入 [ServerStore] 本身,
+     * 让 [observeCachePrefetch] 每次换集都重新问一次"现在的激活服务器是谁"(见
+     * [CachePrefetchController] 的 `serverIdProvider` KDoc)。
+     */
+    @Inject
+    lateinit var serverStore: ServerStore
 
     private var mediaSession: MediaSession? = null
 
@@ -222,6 +257,7 @@ class PlaybackService : MediaSessionService() {
 
         observeProgressReporting()
         observePlaybackSpeedPreference()
+        observeCachePrefetch(userIdProvider)
 
         // 占位通知的收尾责任方。判据是"播放器手里还有内容吗" —— `STATE_IDLE` 表示 stop/clear 过或者
         // 从来没 prepare 成功过,也就是"占位通知后面什么都没有"。在主线程 scope 上读播放器,
@@ -351,6 +387,37 @@ class PlaybackService : MediaSessionService() {
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Task 6:预取控制器的**唯一**驱动时机——[PlayQueue.current] 只在真的换了条目
+     * ([PlayQueue.setQueue]/[PlayQueue.next]/[PlayQueue.previous])时变化,精确对应"换集"这件事
+     * 本身,不会被 seek 误触发(即使是 carry-forward 之二修好之后、本地缓存源 seek 也会重新发一次
+     * `Ready` 的那种情况——那条信号走的是 [AudioPlaybackEngine.state],不是这里)。
+     *
+     * [CachePrefetchController] 不能整个交给 Hilt 装配(它需要这个 Service 的 `serviceScope`,
+     * 生命周期必须和播放会话绑在一起——Service 销毁时 `serviceScope` 被取消,飞行中的预取下载
+     * 随之被取消并清理半成品文件),所以在这里手动 `new`,和 [EngineSeekRouter] /
+     * [EngineQueueNavigator] 是同一种取舍。
+     */
+    private fun observeCachePrefetch(userIdProvider: suspend () -> String?) {
+        val cachePrefetchController = CachePrefetchController(
+            cacheDao = cachedAudioDao,
+            cacheStore = audioCacheStore,
+            networkTypeMonitor = networkTypeMonitor,
+            downloadSourceProvider = playbackSourceResolver.asProvider(),
+            api = jellyfinApi,
+            serverIdProvider = { serverStore.activeServerId.first() },
+            userIdProvider = userIdProvider,
+            scope = serviceScope,
+            // Task 7:接住 CachePrefetchController 类注释「maxBytes」里留的接缝——读用户在设置页
+            // 选的存储上限,不再用构造默认值(DEFAULT_CACHE_MAX_BYTES)。读取失败时 safeMaxBytes()
+            // 已经会退回保守默认值,这里不需要重复处理异常。
+            maxBytesProvider = { preferencesStore.cacheMaxBytes.first() },
+        )
+        serviceScope.launch {
+            playQueue.current.collect { item -> item?.let(cachePrefetchController::onItemChanged) }
         }
     }
 

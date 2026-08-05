@@ -35,6 +35,10 @@ dependencies {
     // RoomDatabase 基类,所以和 :core:network 一样是 implementation,不需要额外声明
     // room-runtime(参见 :core:network/build.gradle.kts 同一处注释)。
     implementation(project(":core:database"))
+    // 删除服务器时要清掉该服务器的整套音频缓存(索引 + 文件目录),AudioCacheStore.clearServer——
+    // 复审 I2:CachedAudioDao.clearServer 写好了却从没有生产调用方,音频缓存目录因此永远不会
+    // 在删服务器时被清掉。
+    implementation(project(":core:cache"))
 
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)

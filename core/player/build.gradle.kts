@@ -11,7 +11,10 @@ plugins {
 android {
     namespace = "dev.insua.jellycast.player"
     compileSdk = 36
-    defaultConfig { minSdk = 26 }
+    defaultConfig {
+        minSdk = 26
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -28,6 +31,8 @@ dependencies {
     implementation(project(":core:network"))
     implementation(project(":core:database"))
     implementation(project(":core:datastore"))
+    // CacheAwareSourceProvider 消费 Task 3 交付的 AudioCacheStore。
+    implementation(project(":core:cache"))
 
     implementation(libs.kotlinx.coroutines)
     // NotificationCompat / ServiceCompat.startForeground —— PlaybackService 自己进前台需要它们
@@ -52,6 +57,12 @@ dependencies {
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.okhttp.mockwebserver)
     testImplementation(libs.robolectric.junit5.extension)
+
+    // LocalAdtsSeekableDeviceTest(C1 复审):裸 ADTS 文件是否真的可 seek 是平台行为,
+    // JVM 单测结构上测不出(v4 铁律),需要真实 ExoPlayer + 真实 MediaCodec。
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.junit4)
 }
 
 // AGP library 模块下 tasks.test 访问器不可用(它是 DefaultTask 聚合器),

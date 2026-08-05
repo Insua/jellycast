@@ -45,6 +45,14 @@ class ExoPlayerControl(private val player: ExoPlayer) : PlayerControl {
         player.playWhenReady = true
     }
 
+    /**
+     * 见 [PlayerControl] 类注释:只应该在本地缓存文件上被调用。远端转码流 seek 走的是
+     * [AudioPlaybackEngineImpl] 里"重新 resolve + prepare"那条路,压根不会调到这里。
+     */
+    override fun seekTo(positionMs: Long) {
+        player.seekTo(positionMs)
+    }
+
     override fun release() {
         player.release()
     }

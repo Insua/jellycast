@@ -20,8 +20,17 @@ fun PlaybackSourceResolver.asProvider(): PlaybackSourceProvider =
     PlaybackSourceProvider { itemId, userId, startPositionMs -> resolve(itemId, userId, startPositionMs) }
 
 /**
- * ExoPlayer 操作的最小接口。只暴露"换一个 URL 重新准备播放"、"读当前流内相对位置"和"释放",
- * 刻意不提供 seekTo —— 这样 [AudioPlaybackEngine] 在结构上就不可能调用 player.seekTo。
+ * ExoPlayer 操作的最小接口:换一个 URL 重新准备播放、读当前流内相对位置、直接 seek、释放。
+ *
+ * [seekTo] 只为**本地缓存文件**而设:本地完整文件支持 Range,seek 可以直接落到播放器身上,
+ * 响应是即时的。远端转码流 `Accept-Ranges: none`,`player.seekTo()` 在它身上不可靠(可能卡住
+ * 或从头播放)——[AudioPlaybackEngine] 对远端源的 seek 因此**从不**调这个方法,而是重新
+ * resolve 一条从目标位置起转码的新流再 prepare(见 [AudioPlaybackEngineImpl] 类注释)。这条
+ * 铁律现在靠 [AudioPlaybackEngineImpl] 内部按 `PlaybackSource.isLocalFile` 分支来保证,
+ * 不再像早期版本那样靠"接口里压根没有 seekTo"这种结构性手段——
+ * `AudioPlaybackEngineTest`「远端源行为完全不变」一条测试是这条铁律的回归防线。
+ *
+ * 默认实现是空操作:不关心 seek 的假实现(既有测试里那些)不必跟着补方法体。
  * 生产实现见 [ExoPlayerControl]。
  */
 interface PlayerControl {
@@ -40,6 +49,10 @@ interface PlayerControl {
      * ([ExoPlayerControl])对 `null` 的处理是"标题/副标题/封面都不设",不是崩溃或抛错。
      */
     fun setMediaItemAndPrepare(url: String, metadata: PlaybackDisplayMetadata?)
+
+    /** 见类注释:只应该在本地缓存文件上调用。空操作默认实现,详见类注释。 */
+    fun seekTo(positionMs: Long) {}
+
     fun release()
 }
 
@@ -50,8 +63,24 @@ sealed interface PlaybackEngineState {
      * [startPositionMs] 是这条流在**条目内**的起始位置(即 resolve 时传给服务端的
      * `startTimeTicks` 对应的毫秒数)。进度上报需要它才能在"新源就绪"这一刻报出正确的绝对位置,
      * 而不是报一个刚归零的流内相对位置(全支线复审 Critical 1/2)。
+     *
+     * ⚠️ 复审(Task 6 Finding 1):[emissionSeq] 单调递增,只用来在结构上区分"两次内容完全相同的
+     * `Ready`"——调用方**不该**读它做任何业务判断,它纯粹是"强制 `StateFlow` 发射"的技术手段。
+     * `MutableStateFlow` 对结构相等的连续赋值会静默丢弃(conflation,`value` 的 setter 内部按
+     * `equals()` 比较),而 [Ready]/[PlaybackSource] 都是 `data class`——本地缓存源连续两次 seek
+     * 到**同一个**位置时,`source` 和 `startPositionMs` 会完全一样(见
+     * [AudioPlaybackEngineImpl.seekTo] 本地分支:复用同一个 [currentSource]、位置又相同),
+     * 第二次赋值因此被 `StateFlow` 悄悄吞掉,`playbackReadyEvents()` 收不到第二个事件,
+     * `PlaybackProgressCoordinator.onSourceReady` 也就不会跑——这正是这次修复本身要堵住的那个
+     * "seek 后立即上报进度"缺口,如果不处理会在"重复 seek 到同一位置"这一种子场景下原样复现。
+     * 默认值 `0L` 不影响任何既有测试:没有任何测试对 `Ready` 做完整的结构相等比较(全部是
+     * `is Ready` / 读某个字段),这里核对过。
      */
-    data class Ready(val source: PlaybackSource, val startPositionMs: Long = 0L) : PlaybackEngineState
+    data class Ready(
+        val source: PlaybackSource,
+        val startPositionMs: Long = 0L,
+        val emissionSeq: Long = 0L,
+    ) : PlaybackEngineState
 
     /** 对应设计文档 §8:「该条目无法播放」。由 Task 8 契约里 resolve() 的异常转换而来,绝不上抛。 */
     data class Error(val itemId: String, val message: String = "该条目无法播放") : PlaybackEngineState
@@ -155,8 +184,13 @@ fun AudioPlaybackEngine.asAbsoluteTimeline(durationProvider: () -> Long? = { nul
  * 因此这里把 seek 实现成:带着新的 `startPositionMs` 重新调用 [PlaybackSourceProvider.resolve]
  * 换一个新 URL(服务端用 `startTimeTicks` 参数从目标位置开始转码),再 setMediaItem + prepare。
  *
- * **不要把这里"优化"回 `player.seekTo` —— 那样在真实服务器上会直接踩坑。**
- * [PlayerControl] 接口本身就没有暴露 seekTo,结构上杜绝了误用。
+ * **不要把远端源这条路"优化"回 `player.seekTo` —— 那样在真实服务器上会直接踩坑。**
+ *
+ * ⚠️ 但这条铁律只管**远端**源。[PlaybackSource.isLocalFile] 为 `true` 时(音频缓存落地后的
+ * 本地文件),上面这段限制根本不存在:本地完整文件支持 Range,`player.seekTo()` 直接可用、
+ * 即时生效——这正是"拖进度条不跟手"这个体验问题在缓存路径上被彻底根治的原因,不必再等一轮
+ * `PlaybackInfo` 往返 + 服务端起转码。[seekTo] 因此按 [currentSourceIsLocalFile] 分两条路:
+ * 本地源直接 [PlayerControl.seekTo],远端源维持上面这套"重新 resolve"逻辑一字不变。
  *
  * resolve() 抛出的异常(PlaybackInfo 无媒体源 / 网络或认证失败,见 Task 8 契约)在这里被捕获,
  * 转成 [PlaybackEngineState.Error],绝不向上抛出、绝不崩掉调用方(Service/播放会话)。
@@ -194,6 +228,27 @@ class AudioPlaybackEngineImpl(
     private var currentStartPositionMs: Long? = null
 
     /**
+     * 当前这条流是否来自 [PlaybackSource.isLocalFile]。决定 [absolutePositionMs] 与 [seekTo]
+     * 走哪条分支(见类注释)。和 [currentStartPositionMs] 同一套更新纪律:只在 resolve **成功**、
+     * 播放器真的换到新流之后才更新,道理相同——resolve 失败时播放器还在放旧流,不能把它的
+     * 源类型也跟着改了。
+     */
+    @Volatile
+    private var currentSourceIsLocalFile: Boolean = false
+
+    /**
+     * 当前这条流对应的 [PlaybackSource]。和 [currentStartPositionMs] / [currentSourceIsLocalFile]
+     * 同一套更新纪律——只在 resolve **成功**、播放器真的换到新流之后才更新。
+     *
+     * ⚠️ Task 6 carry-forward 之二(见任务简报):本地缓存源的 [seekTo] 需要重新发一次
+     * [PlaybackEngineState.Ready] 来恢复"seek 后立即上报进度"这条设计文档 §7 的纪律(见 [seekTo]
+     * 本地分支的说明),而那次重新发出的 `Ready` 必须携带**同一个** `PlaybackSource`——不能凭空
+     * 造一个,也不能重新 resolve(那正是本地源要避免的事)。这个字段就是那次重新发送时的数据来源。
+     */
+    @Volatile
+    private var currentSource: PlaybackSource? = null
+
+    /**
      * ## 稳定性根因 #2:连点快进时"最后请求的那一次说了算"
      *
      * 生产路径上唯一存在并发的地方:`SeekInterceptingPlayer.seekForward()` → [EngineSeekRouter] →
@@ -213,10 +268,30 @@ class AudioPlaybackEngineImpl(
      */
     private val requestSeq = java.util.concurrent.atomic.AtomicLong(0L)
 
+    /**
+     * 见 [PlaybackEngineState.Ready.emissionSeq] 的 KDoc:每一次真正把 `_state` 置成 `Ready`
+     * 时领一个新号,保证连续两次 `Ready`(哪怕 `source`/`startPositionMs` 完全相同,比如本地缓存源
+     * 连续两次 seek 到同一位置)在结构上永远不相等,不会被 `MutableStateFlow` 的 conflation 悄悄
+     * 吞掉一次赋值。
+     *
+     * 刻意**不**复用 [requestSeq]:那个计数器管的是"迟到的 resolve 结果要不要被丢弃"这件事,
+     * 语义完全不同——本地 seek 分支根本不走 [resolveAndPrepare]/[isStale] 那条判定,把两件事的
+     * 计数器混在一起会让 [requestSeq] 的"哪次请求最新"语义变得难以推理。
+     */
+    private val stateEmissionSeq = java.util.concurrent.atomic.AtomicLong(0L)
+
     override val absolutePositionMs: Long
-        get() = currentStartPositionMs
-            ?.plus(playerControl.currentPositionMs.coerceAtLeast(0L))
-            ?: 0L
+        get() {
+            val relativeMs = playerControl.currentPositionMs.coerceAtLeast(0L)
+            // 本地缓存文件:播放器本身就在放完整文件,player 报的位置就是条目内绝对位置,
+            // 不需要(也不能)再叠加流起点基准 —— 那是给"每次 seek 都换一条新流,从 0 重新计时"
+            // 的远端转码流准备的补偿,本地文件根本没有这个问题。
+            return if (currentSourceIsLocalFile) {
+                relativeMs
+            } else {
+                currentStartPositionMs?.plus(relativeMs) ?: 0L
+            }
+        }
 
     override suspend fun play(itemId: String, userId: String, startPositionMs: Long) {
         currentItemId = itemId
@@ -227,7 +302,27 @@ class AudioPlaybackEngineImpl(
     override suspend fun seekTo(positionMs: Long) {
         val itemId = currentItemId ?: return
         val userId = currentUserId ?: return
-        // 见类注释:这里刻意重新 resolve + prepare,不是 player.seekTo。
+        if (currentSourceIsLocalFile) {
+            // 本地缓存文件:完整、可 seek,直接让播放器跳,不重新 resolve/prepare。
+            // 见 PlayerControl.seekTo 与类注释 —— 这正是缓存路径下"拖进度条"变得即时的原因。
+            playerControl.seekTo(positionMs)
+
+            // ⚠️ Task 6 carry-forward 之二:这条分支以前只挪动了播放器位置,不发新的
+            // PlaybackEngineState.Ready —— 于是"seek 后立即上报进度"这条设计文档 §7 的纪律,
+            // 在本地缓存源上悄悄消失了(远端源不受影响:它的 seek 走 resolveAndPrepare,天然
+            // 发一次 Ready)。10 秒心跳能自愈,但用户 seek 一集缓存好的剧集后 10 秒内被强杀 App,
+            // 这次 seek 在服务端就丢了——远端路径上不会发生这个窗口。
+            //
+            // 补发一次 Ready(同一个 source、新的 positionMs):playbackReadyEvents() 会把它识别成
+            // NEW_PLAYBACK,PlaybackProgressCoordinator.onSourceReady 按"同一条目再次就绪"分支
+            // 立即发一次 progress——不重新 resolve、不重新 prepare(currentSource 是已经成功过
+            // 的那个),只是把已经发生的本地 seek 尽快同步给服务端,和远端路径的行为对齐。
+            currentSource?.let { source ->
+                _state.value = PlaybackEngineState.Ready(source, positionMs, stateEmissionSeq.incrementAndGet())
+            }
+            return
+        }
+        // 远端源:见类注释,这里刻意重新 resolve + prepare,不是 player.seekTo。字面行为不变。
         resolveAndPrepare(itemId, userId, positionMs)
     }
 
@@ -237,10 +332,18 @@ class AudioPlaybackEngineImpl(
             val source = sourceProvider.resolve(itemId, userId, startPositionMs)
             if (isStale(token)) return
             playerControl.setMediaItemAndPrepare(source.streamUrl, metadataProvider(itemId))
+            if (source.isLocalFile) {
+                // 本地文件 prepare 后播放器默认从文件开头(0)起播;远端源的"从目标位置起播"
+                // 是靠 resolve URL 里的 startTimeTicks 让服务端从那里开始转码,本地文件没有这个
+                // 服务端环节,起播位置必须由播放器自己 seek 过去。
+                playerControl.seekTo(startPositionMs)
+            }
             // 顺序要紧:先换基准,再发 Ready。反过来的话观察 Ready 的进度上报可能读到旧基准 + 已归零
             // 的流内位置,报出一个"倒退"的绝对位置。
             currentStartPositionMs = startPositionMs
-            _state.value = PlaybackEngineState.Ready(source, startPositionMs)
+            currentSourceIsLocalFile = source.isLocalFile
+            currentSource = source
+            _state.value = PlaybackEngineState.Ready(source, startPositionMs, stateEmissionSeq.incrementAndGet())
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -266,6 +369,8 @@ class AudioPlaybackEngineImpl(
         currentItemId = null
         currentUserId = null
         currentStartPositionMs = null
+        currentSourceIsLocalFile = false
+        currentSource = null
         _state.value = PlaybackEngineState.Idle
     }
 

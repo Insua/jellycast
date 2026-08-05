@@ -41,14 +41,33 @@ class AudioPlaybackEngineTest {
         textSubtitles = emptyList(),
     )
 
-    /** 记录每次被要求"重新 prepare"的 URL。这个假实现压根没有 seekTo 方法可调 ——
-     *  结构上就杜绝了 AudioPlaybackEngine 误用 player.seekTo 的可能。 */
+    /** 本地缓存文件源(Task 4):streamUrl 指向本地文件,`isLocalFile = true`。 */
+    private fun localSource(startPositionMs: Long) = PlaybackSource(
+        itemId = ITEM_ID,
+        mediaSourceId = "ms1",
+        streamUrl = "file:///cache/$ITEM_ID.m4a",
+        level = AudioDeliveryLevel.SERVER_AUDIO_ONLY,
+        isHls = false,
+        playSessionId = null,
+        audioTracks = emptyList(),
+        textSubtitles = emptyList(),
+        isLocalFile = true,
+    )
+
+    /**
+     * 记录每次被要求"重新 prepare"的 URL,以及每次被要求直接 seek 的位置。
+     *
+     * 后者只应该在本地缓存源上发生——远端源的 seek 走"重新 resolve + prepare"那条路,
+     * [seekedPositions] 应该始终为空;这正是「远端源行为完全不变」这条回归防线的观测点。
+     */
     private class RecordingPlayerControl : PlayerControl {
         val preparedUrls = mutableListOf<String>()
+        val seekedPositions = mutableListOf<Long>()
         var released = false
         /** 流内相对位置(见 [PlayerControl.currentPositionMs]);绝对位置语义在 AbsolutePositionTest 里覆盖。 */
         override var currentPositionMs: Long = 0L
         override fun setMediaItemAndPrepare(url: String, metadata: PlaybackDisplayMetadata?) { preparedUrls += url }
+        override fun seekTo(positionMs: Long) { seekedPositions += positionMs; currentPositionMs = positionMs }
         override fun release() { released = true }
     }
 
@@ -80,6 +99,129 @@ class AudioPlaybackEngineTest {
         assertEquals(2, control.preparedUrls.size)
         assertTrue(control.preparedUrls[1].contains("startTimeTicks=900000000"), control.preparedUrls[1])
         assertTrue(engine.state.value is PlaybackEngineState.Ready)
+        // 防回归核心:远端源整个过程绝不能碰 PlayerControl.seekTo —— 这是本任务风险最高的一条断言。
+        assertTrue(control.seekedPositions.isEmpty(), "远端源 seek 不该调用 player 的 seekTo,应为空:${control.seekedPositions}")
+    }
+
+    // ---- Task 4:本地缓存源(isLocalFile = true)的 seek 走另一条分支 ----
+
+    @Test fun `本地缓存源首次 play 时,prepare 之后播放器被 seek 到 startPositionMs`() = runTest {
+        val control = RecordingPlayerControl()
+        val provider = PlaybackSourceProvider { _, _, startPositionMs -> localSource(startPositionMs) }
+        val engine = AudioPlaybackEngineImpl(provider, control)
+
+        engine.play(ITEM_ID, USER_ID, startPositionMs = 480_000L)
+
+        assertEquals(1, control.preparedUrls.size)
+        assertEquals(listOf(480_000L), control.seekedPositions)
+        assertTrue(engine.state.value is PlaybackEngineState.Ready)
+    }
+
+    @Test fun `本地缓存源的 seekTo 不重新 resolve,直接让播放器 seek`() = runTest {
+        val control = RecordingPlayerControl()
+        var resolveCallCount = 0
+        val provider = PlaybackSourceProvider { _, _, startPositionMs ->
+            resolveCallCount++
+            localSource(startPositionMs)
+        }
+        val engine = AudioPlaybackEngineImpl(provider, control)
+        engine.play(ITEM_ID, USER_ID, startPositionMs = 10_000L)
+        val resolveCallsAfterPlay = resolveCallCount
+
+        engine.seekTo(90_000L)
+
+        assertEquals(
+            resolveCallsAfterPlay,
+            resolveCallCount,
+            "本地源 seek 不该再调用一次 PlaybackSourceProvider.resolve",
+        )
+        assertEquals(1, control.preparedUrls.size, "本地源 seek 不该重新 prepare")
+        assertEquals(listOf(10_000L, 90_000L), control.seekedPositions)
+        assertTrue(engine.state.value is PlaybackEngineState.Ready)
+    }
+
+    /**
+     * Task 6 carry-forward 之二:本地缓存源的 seek 不重新 resolve(上一条用例),但**必须**补发一次
+     * `Ready`,让 [PlaybackProgressCoordinator]（经 [playbackReadyEvents]）把这次 seek 当成
+     * "同一条目再次就绪"立即上报一次 progress——否则只能靠 10 秒心跳自愈,用户 seek 后 10 秒内
+     * 被强杀 App 就会在服务端丢失这次 seek,而远端源不会有这个窗口(它的 seek 走
+     * `resolveAndPrepare`,天然发一次 Ready)。
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun `本地缓存源的 seekTo 重新发一次 Ready,补回立即上报进度这条纪律`() = runTest {
+        val control = RecordingPlayerControl()
+        val provider = PlaybackSourceProvider { _, _, startPositionMs -> localSource(startPositionMs) }
+        val engine = AudioPlaybackEngineImpl(provider, control)
+        val events = mutableListOf<PlaybackReadyEvent>()
+        val collectJob = launch { engine.state.playbackReadyEvents().collect { events += it } }
+        // 让收集协程先跑起来、消费掉初始的 Idle(StateFlow 对慢收集者只保留最新值,不 advance
+        // 的话 play/seekTo 两次状态变化会在收集协程真正开始跑之前就都发生,后一次会覆盖前一次,
+        // 收集协程启动时只会看到"最新的那个"——这正是生产环境里"换一个条目做一次真实动作"之间
+        // 天然存在时间间隔的原因,这里用 advanceUntilIdle() 显式还原这个间隔)。
+        advanceUntilIdle()
+
+        engine.play(ITEM_ID, USER_ID, startPositionMs = 10_000L)
+        advanceUntilIdle()
+        engine.seekTo(90_000L)
+        advanceUntilIdle()
+        collectJob.cancel()
+
+        assertEquals(2, events.size, "首播一次、seek 一次,应该各产生一次 Ready 事件,实际:$events")
+        assertEquals(PlaybackReadyTrigger.NEW_PLAYBACK, events[0].trigger)
+        assertEquals(PlaybackReadyTrigger.NEW_PLAYBACK, events[1].trigger)
+        assertEquals(90_000L, events[1].startPositionMs, "补发的 Ready 必须带上这次 seek 的新位置")
+        assertEquals(
+            events[0].source.itemId,
+            events[1].source.itemId,
+            "补发的 Ready 复用同一个 itemId,进度协调器才会走「同一条目再次就绪」分支发 progress 而不是 start",
+        )
+    }
+
+    /**
+     * 复审 Finding 1(Task 6):上一条用例的两次 seek 落在不同位置(10_000L → 90_000L),
+     * `Ready(source, startPositionMs)` 两次结构不同,天然不会被 `MutableStateFlow` 的 conflation
+     * 吞掉——所以那条用例**看不出**这个缺口。真正的坑是**连续两次 seek 到同一个位置**:本地分支
+     * 复用同一个 `currentSource`,`startPositionMs` 又相同,`Ready` 两次结构完全相等,朴素的
+     * `_state.value = Ready(...)` 会被 `StateFlow` 静默丢弃第二次赋值——`onSourceReady` 不会跑
+     * 第二次,`flushPending()` 也不会跑第二次。用户拖进度条两次都精确停在同一格(比如吸附到整
+     * 分钟的进度条),第二次 seek 在服务端就丢了。
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun `本地缓存源连续两次 seek 到同一位置,仍然各产生一次 Ready 事件`() = runTest {
+        val control = RecordingPlayerControl()
+        val provider = PlaybackSourceProvider { _, _, startPositionMs -> localSource(startPositionMs) }
+        val engine = AudioPlaybackEngineImpl(provider, control)
+        val events = mutableListOf<PlaybackReadyEvent>()
+        val collectJob = launch { engine.state.playbackReadyEvents().collect { events += it } }
+        advanceUntilIdle()
+
+        engine.play(ITEM_ID, USER_ID, startPositionMs = 10_000L)
+        advanceUntilIdle()
+        engine.seekTo(90_000L)
+        advanceUntilIdle()
+        engine.seekTo(90_000L) // 第二次 seek,落在和上一次完全相同的位置
+        advanceUntilIdle()
+        collectJob.cancel()
+
+        assertEquals(
+            3,
+            events.size,
+            "首播一次、seek 两次(哪怕第二次和第一次位置相同),应该各产生一次 Ready 事件,实际:$events",
+        )
+        assertEquals(90_000L, events[1].startPositionMs)
+        assertEquals(90_000L, events[2].startPositionMs, "第二次 seek 的位置和第一次相同,但事件本身不能被吞掉")
+        // 顺带核对复审要求:StateFlow 的 STATE_REPLAY 判定完全不依赖值相等,只依赖"是不是收集协程
+        // 收到的第一个值"——这里三次都是收集协程启动之后真正发生的状态变化,理应全部是 NEW_PLAYBACK,
+        // 不会被误判成重放。
+        assertEquals(
+            listOf(
+                PlaybackReadyTrigger.NEW_PLAYBACK,
+                PlaybackReadyTrigger.NEW_PLAYBACK,
+                PlaybackReadyTrigger.NEW_PLAYBACK,
+            ),
+            events.map { it.trigger },
+            "三次都发生在收集协程启动之后,不该有任何一次被误判成 STATE_REPLAY",
+        )
     }
 
     @Test fun `resolve 抛异常时变为 Error 状态而不是向上抛出`() = runTest {

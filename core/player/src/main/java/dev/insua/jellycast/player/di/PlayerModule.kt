@@ -7,6 +7,10 @@ import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
+import dev.insua.jellycast.cache.AudioCacheDownloader
+import dev.insua.jellycast.cache.AudioCacheStore
+import dev.insua.jellycast.cache.NetworkTypeMonitor
+import dev.insua.jellycast.database.CachedAudioDao
 import dev.insua.jellycast.database.JellyCastDatabase
 import dev.insua.jellycast.database.ProgressReportDao
 import dev.insua.jellycast.database.buildJellyCastDatabase
@@ -19,6 +23,7 @@ import dev.insua.jellycast.network.session.JellyfinSession
 import dev.insua.jellycast.player.AudioPlaybackEngine
 import dev.insua.jellycast.player.AudioPlaybackEngineImpl
 import dev.insua.jellycast.player.AutoPlayNextController
+import dev.insua.jellycast.player.CacheAwareSourceProvider
 import dev.insua.jellycast.player.ExoPlayerControl
 import dev.insua.jellycast.player.HttpStreamProbe
 import dev.insua.jellycast.player.PlaybackProgressCoordinator
@@ -96,9 +101,44 @@ object PlayerModule {
         )
     }
 
+    /**
+     * [AudioCacheStore] 复用 [provideStreamProbe] 那份带证书信任策略的 [TrustAwareHttpClient]——
+     * 缓存下载和 L1 探测打的是同一个可能自签证书的 endpoint,不新增第二套证书处理逻辑。
+     * `dao` 取自下面 [provideJellyCastDatabase] 提供的同一个单例数据库实例。
+     */
     @Provides
     @Singleton
-    fun providePlaybackSourceProvider(resolver: PlaybackSourceResolver): PlaybackSourceProvider = resolver.asProvider()
+    fun provideAudioCacheStore(
+        @ApplicationContext context: Context,
+        database: JellyCastDatabase,
+        @TrustAwareHttpClient client: OkHttpClient,
+    ): AudioCacheStore = AudioCacheStore(
+        context = context,
+        dao = database.cachedAudioDao(),
+        downloader = AudioCacheDownloader(client),
+    )
+
+    /**
+     * 生产环境的 [PlaybackSourceProvider] 是 [CacheAwareSourceProvider] 包一层 [PlaybackSourceResolver]
+     * ——命中本地音频缓存就直接播本地文件,未命中原样委派给 resolver 的 L1/L3 降级链,一字不动。
+     * 设计决定见 [CacheAwareSourceProvider] 类 KDoc。
+     *
+     * 复审 I3(Important):`serverId` **不再**在装配时刻快照——见 [CacheAwareSourceProvider]
+     * 的 `serverIdProvider` KDoc,这里传一个每次都重新读 [ServerStore.activeServerId] 的 lambda。
+     */
+    @Provides
+    @Singleton
+    fun providePlaybackSourceProvider(
+        resolver: PlaybackSourceResolver,
+        cacheStore: AudioCacheStore,
+        api: JellyfinApi,
+        serverStore: ServerStore,
+    ): PlaybackSourceProvider = CacheAwareSourceProvider(
+        delegate = resolver.asProvider(),
+        cacheStore = cacheStore,
+        api = api,
+        serverIdProvider = { serverStore.activeServerId.first() },
+    )
 
     @Provides
     @Singleton
@@ -171,6 +211,23 @@ object PlayerModule {
 
     @Provides
     fun provideProgressReportDao(database: JellyCastDatabase): ProgressReportDao = database.progressReportDao()
+
+    /**
+     * [CachePrefetchController] 的编排逻辑需要读"这台服务器已经缓存了哪些条目"——直接用
+     * [AudioCacheStore] 内部已经在用的同一张表的 DAO,而不是给 [AudioCacheStore] 加一个
+     * "列出全部"的公开方法:那个类的公开面已经在 Task 3 定稿并测试过,这里没有必要为了 Task 6
+     * 一个调用方去扩大它的职责范围。
+     */
+    @Provides
+    fun provideCachedAudioDao(database: JellyCastDatabase): CachedAudioDao = database.cachedAudioDao()
+
+    /**
+     * [CachePrefetchController] 的 WiFi 闸门(设计文档 §3:仅 WiFi、串行一次一集)。
+     */
+    @Provides
+    @Singleton
+    fun provideNetworkTypeMonitor(@ApplicationContext context: Context): NetworkTypeMonitor =
+        NetworkTypeMonitor(context)
 
     /**
      * [ProgressReporter] 的 `serverId` 是构造时固定的值(既有、已测试过的签名,不改)。这里用

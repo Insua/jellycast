@@ -1,0 +1,163 @@
+package dev.insua.jellycast.cache
+
+/**
+ * 策略的输入:一个已缓存条目的最小描述。
+ *
+ * 故意不复用 `:core:database` 的 `CachedAudioEntity` —— 策略函数不应该认识存储 schema,
+ * 二者之间的映射由调用方(Task 6)负责。
+ *
+ * @param order 该条目在 [SeriesSlot.order] 序列里的位置,决定它相对锚点是"之前"还是"之后"。
+ * @param sizeBytes 文件大小,用于判断是否超出 `maxBytes`。
+ * @param lastAccessAt 最后一次被访问(播放)的时间戳。用于超容量时决定先删谁 —— **不是**下载完成时间。
+ */
+data class CachedEntry(
+    val itemId: String,
+    val order: Int,
+    val sizeBytes: Long,
+    val lastAccessAt: Long,
+)
+
+/**
+ * 策略的输入:剧集顺序里的一个位置。
+ *
+ * `order` 是全剧唯一且递增的序号,季号 → 集号拍平之后的结果(跨季连续,例如 S2 最后一集之后
+ * 紧接着就是 S3E01 的 order)。这是序列顺序的**唯一**依据 —— 上游 DAO 不保证
+ * `seasonNumber` / `episodeNumber` 为 null 时的排序,所以这个函数绝不直接看季号/集号,
+ * 只看 `order`。电影只传一个只含自己的单元素列表。
+ */
+data class SeriesSlot(val itemId: String, val order: Int)
+
+/** `planCache` 的输出:接下来要下载的条目(按顺序)与要立即删除的条目。 */
+data class CacheDecision(val toPrefetch: List<String>, val toEvict: List<String>)
+
+/**
+ * 计算"该缓存哪几集、该删哪几个"。纯函数:不读文件、不发请求、不碰 Android、不看时钟——
+ * 调用方如果需要"现在几点",必须自己算好通过参数传进来(这里目前没有用到,因为驱逐只依赖
+ * `lastAccessAt` 的相对顺序,不依赖绝对的"现在")。
+ *
+ * ### 驱逐优先级(§4.4)
+ * 1. **窗口外**:排在锚点([currentItemId])之前的一律驱逐,无条件。
+ * 2. **超出集数上限**:窗口内(锚点及之后)按 `order` 从近到远排列,超出 [maxEpisodes]
+ *    (含锚点本身)的部分驱逐,离锚点越远越先删。
+ * 3. **超出存储上限**:上面两条筛过之后如果总大小仍超过 [maxBytes],按 [CachedEntry.lastAccessAt]
+ *    从老到新继续驱逐,直到落在上限内或只剩锚点。这里刻意用"最后访问时间"而不是下载时间——
+ *    一集下载得早但反复回听,不该比一集下载得晚但再也没碰过的更早被删。
+ *
+ * [maxBytes] 为 `null` 表示不设容量上限,但规则 1、2(窗口、集数)照常生效,只是跳过规则 3
+ * (以及下面「预取预算」这一段)。
+ *
+ * ### 复审 I5(Important):[CacheDecision.toPrefetch] 也必须受 [maxBytes] 约束
+ *
+ * 在这条修复之前,[toPrefetch] 只看"窗口目标里还没缓存的",完全不看 [maxBytes]——容量上限只在
+ * **已经缓存**的条目上生效(规则 3),而规则 3 只在**下一次**换集重新算计划时才会看到"现在超了"。
+ * 后果是一个不收敛的下载/驱逐循环:窗口偏满时,规则 3 按 `lastAccessAt` 删的往往是**刚下载完、
+ * 还没被回听过**的那几集(它们的 `lastAccessAt` = 下载完成时间,是所有幸存条目里最老的),
+ * 而这些集恰恰常常就是**紧跟在锚点后面、马上要播的那几集**——删完它们,`toPrefetch` 下一轮又会
+ * 把它们重新拉回来,顶掉窗口更靠后的另一集,如此往复,同时还伴随着"正要播的那一集缓存却刚好在
+ * 这一刻被删掉,不得不现场走远端流"这个体验倒退。
+ *
+ * 修复:在窗口 + 集数规则(规则 1/2)筛过、规则 3 驱逐执行**之后**,基于"驱逐后真正留下来的字节数"
+ * 计算剩余预算,再从窗口目标里按 order 顺序挑还没缓存的条目塞进 [toPrefetch],每塞一个就从预算里
+ * 扣掉一个**估算大小**,直到预算不够为止。
+ *
+ * 估算大小从 [cached] 里"这次窗口内、这部剧自己已经缓存过的条目"取平均值——纯函数没有能力
+ * 预知一个还没下载的条目最终会有多大,只能用同一部剧已知的样本去估。**取不到任何样本时
+ * (这部剧一集都还没缓存过)不做预算约束**,退回"只按窗口/集数决定"的旧行为——没有任何数据的
+ * 情况下把预算算成 0、直接不预取任何东西,比"这次没管住总量"更糟(违背设计文档"下一集不卡"
+ * 这个核心价值)。
+ *
+ * ### 锚点永不驱逐
+ * [currentItemId] 代表正在播放的条目,在任何规则下都不会出现在 [CacheDecision.toEvict] 里,
+ * 哪怕它自己的大小就已经超过 [maxBytes]。删掉正在播放的文件会直接打断播放——这个体验代价
+ * 远大于暂时超一点容量上限。
+ *
+ * 这条保护在**窗口步骤**(窗口目标集合的构造)和**容量步骤**(§3 的 `continue`)里各实现
+ * 了一次,不是多余:容量步骤的排除是必需的(幸存集合按 `lastAccessAt` 排序,锚点可能排在
+ * 最前面被当成"最老的"删掉);窗口步骤的排除只在 [maxEpisodes] `== 0` 时才会真正生效
+ * ——否则锚点自身的 `order` 必然让它留在窗口目标集合里,这层保护是防御性的,为了不让
+ * "锚点永不驱逐"这个不变量依赖调用方永远传一个合法的 `maxEpisodes`。
+ *
+ * ### 边界情况
+ * - 锚点不在 [seriesOrder] 里(包括 [seriesOrder] 为空,比如上游数据还没同步好该剧的顺序)——
+ *   返回空的 [CacheDecision](既不预取也不驱逐)。这是刻意保守的默认值:在不知道锚点在
+ *   序列里的位置时,任何驱逐决定都可能是错的,宁可什么都不做。
+ * - [maxEpisodes] `== 0` —— 窗口目标集合为空,锚点因此既不会出现在 [CacheDecision.toPrefetch]
+ *   里,也不会(借助上面提到的窗口步骤保护)出现在 [CacheDecision.toEvict] 里:结果是
+ *   "维持原状",不是"清空"。调用方目前的取值范围里 `maxEpisodes` 恒为正数,这条只是防御性行为。
+ *   负数不受支持:内部用 `List.take(maxEpisodes)` 截取窗口目标,负数会让它直接抛
+ *   `IllegalArgumentException`,不会退化成空操作。
+ *
+ * @param currentItemId 锚点:当前正在播放的条目 id。
+ * @param seriesOrder 该剧(或电影)完整的顺序列表;电影传只含自己的单元素列表。
+ * @param cached 当前已缓存的条目列表。
+ * @param maxEpisodes 一部剧最多保留的集数,含锚点本身。
+ * @param maxBytes 存储上限;`null` 表示不限制总量。
+ */
+fun planCache(
+    currentItemId: String,
+    seriesOrder: List<SeriesSlot>,
+    cached: List<CachedEntry>,
+    maxEpisodes: Int,
+    maxBytes: Long?,
+): CacheDecision {
+    val anchorOrder = seriesOrder.firstOrNull { it.itemId == currentItemId }?.order
+        ?: return CacheDecision(toPrefetch = emptyList(), toEvict = emptyList())
+
+    // 窗口内的目标集合:锚点及之后,按 order 排序,最多 maxEpisodes 个(含锚点)。
+    val windowTargets = seriesOrder
+        .filter { it.order >= anchorOrder }
+        .sortedBy { it.order }
+        .take(maxEpisodes)
+    val windowTargetIds = windowTargets.map { it.itemId }.toSet()
+
+    val cachedById = cached.associateBy { it.itemId }
+
+    // 规则 1:窗口外(不在"锚点及之后、且未超集数上限"的目标集合里)的一律驱逐。
+    // 注:窗口目标本身已经把"超出集数上限的窗口内条目"排除在外了,所以这里同时覆盖了
+    // 规则 1(锚点之前)和规则 2(超出集数上限、离锚点最远的部分)。
+    val outsideWindow = cached.filter { it.itemId !in windowTargetIds && it.itemId != currentItemId }
+
+    val evicted = mutableListOf<String>()
+    evicted += outsideWindow.map { it.itemId }
+
+    // 窗口内、这部剧已经缓存过的条目——规则 3 的驱逐候选,也是下面「预取预算」估算大小的样本来源。
+    val cachedInWindow = cached.filter { it.itemId in windowTargetIds }
+
+    // 规则 3:窗口内保留的部分如果仍超容量,按 lastAccessAt 从老到新继续删,锚点永不驱逐。
+    // `survivingBytes` 是这一步跑完之后、真正留下来(没被规则 3 删掉)的窗口内已缓存字节数——
+    // 「预取预算」用它当起点,而不是驱逐前的总量,否则会重复计入马上要被删掉的字节。
+    var survivingBytes = cachedInWindow.sumOf { it.sizeBytes }
+    if (maxBytes != null) {
+        val survivors = cachedInWindow.sortedBy { it.lastAccessAt }
+        for (entry in survivors) {
+            if (survivingBytes <= maxBytes) break
+            if (entry.itemId == currentItemId) continue // 锚点永不驱逐,即使它自己就超了上限
+            evicted += entry.itemId
+            survivingBytes -= entry.sizeBytes
+        }
+    }
+
+    // toPrefetch:窗口目标里还没缓存的,按 order 顺序,受「预取预算」约束(见类 KDoc「复审 I5」)。
+    val notYetCached = windowTargets.filter { it.itemId !in cachedById }
+    val toPrefetch = if (maxBytes == null) {
+        notYetCached.map { it.itemId }
+    } else {
+        val estimatedItemBytes = cachedInWindow.takeIf { it.isNotEmpty() }
+            ?.let { entries -> entries.sumOf { it.sizeBytes } / entries.size }
+        if (estimatedItemBytes == null || estimatedItemBytes <= 0L) {
+            // 这部剧一集都还没缓存过,没有样本可估算——不做预算约束,见类 KDoc。
+            notYetCached.map { it.itemId }
+        } else {
+            var budget = maxBytes - survivingBytes
+            val result = mutableListOf<String>()
+            for (target in notYetCached) {
+                if (budget < estimatedItemBytes) break
+                result += target.itemId
+                budget -= estimatedItemBytes
+            }
+            result
+        }
+    }
+
+    return CacheDecision(toPrefetch = toPrefetch, toEvict = evicted)
+}
