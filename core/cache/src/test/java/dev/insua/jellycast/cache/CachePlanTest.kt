@@ -266,6 +266,83 @@ class CachePlanTest {
     // --- 复审 Finding 2:不属于当前剧序列的旧缓存(itemId 在 seriesOrder 里完全找不到)
     // 必须无条件驱逐(§4.4 规则 1 明确点名的「不属于当前剧的旧剧集」)。 ---
 
+    // --- 复审 I5(Important):toPrefetch 也必须受 maxBytes 约束,不能只在已缓存条目上生效 ---
+    // 修复前 toPrefetch 完全不看 maxBytes,规则 3 只在**下一次**换集重新算计划时才会看到"现在超了"
+    // ——这条一直不收敛的下载/驱逐循环见 CachePlan.kt 类 KDoc「复审 I5」的详细分析。
+
+    @Test
+    fun `toPrefetch 受 maxBytes 约束,预算只够部分新条目时提前停止`() {
+        // 窗口 E0..E4(含锚点最多 5 集),只有锚点 E0 已缓存(10 字节)——估算样本 = 10。
+        // maxBytes=35,扣掉锚点占用的 10,预算剩 25,刚好够塞下两个"10 字节"的新条目(E1、E2),
+        // 第三个(E3)预算不够,必须被挡在 toPrefetch 之外——不是"能塞多少塞多少"的旧行为
+        // (旧行为会把 E1..E4 全部塞进 toPrefetch,完全不管 maxBytes)。
+        val cached = listOf(entry("E0", 0, sizeBytes = 10L))
+        val decision = planCache(
+            currentItemId = "E0",
+            seriesOrder = (0..4).map { slot("E$it", it) },
+            cached = cached,
+            maxEpisodes = 5,
+            maxBytes = 35L,
+        )
+
+        assertEquals(
+            listOf("E1", "E2"),
+            decision.toPrefetch,
+            "预算只够两个新条目时,toPrefetch 必须在预算耗尽处停止,不能把窗口里剩下的全部塞进去",
+        )
+    }
+
+    @Test
+    fun `toPrefetch 预算以驱逐后的剩余字节数为起点,不是驱逐前的总量`() {
+        // 窗口 E0..E3(锚点 E0 + 最多 4 集)。E0(锚点,10 字节)+ E1(190 字节)= 200,超过
+        // maxBytes=150,规则 3 会把 E1(不是锚点、lastAccessAt 更早)驱逐掉,驱逐后只剩 10 字节。
+        //
+        // 如果预取预算错误地用"驱逐前"的总量(200)起算:150-200 = 负数,E2 连一个字节的预算
+        // 都分不到,toPrefetch 会是空的。只有用"驱逐后真正留下来"的字节数(10)起算,
+        // 150-10=140 才够放下一个按 (10+190)/2=100 估算大小的新条目(E2)——这条用例直接
+        // 区分这两种实现,唯有用驱逐后的余量才能通过。
+        val cached = listOf(
+            entry("E0", 0, sizeBytes = 10L, lastAccessAt = 999_999L), // 锚点,访问时间最新
+            entry("E1", 1, sizeBytes = 190L, lastAccessAt = 1L),      // 访问时间最早,应被规则 3 驱逐
+        )
+        val decision = planCache(
+            currentItemId = "E0",
+            seriesOrder = (0..3).map { slot("E$it", it) },
+            cached = cached,
+            maxEpisodes = 4,
+            maxBytes = 150L,
+        )
+
+        assertTrue(decision.toEvict.contains("E1"), "E1 应该先被规则 3 驱逐,腾出空间")
+        assertEquals(
+            listOf("E2"),
+            decision.toPrefetch,
+            "预取预算必须以驱逐后真正剩下的字节数起算,不是驱逐前的总量——否则这里会算出负预算," +
+                "E2 连一个都塞不进去",
+        )
+    }
+
+    @Test
+    fun `这部剧一集都没缓存过时_预取预算不做限制`() {
+        // 没有任何该剧已缓存的样本可供估算大小——查不清楚一集大概多大时,宁可不限制也不要错误地
+        // 把预算算成 0、直接不预取任何东西(那样违背"下一集不卡"这个核心价值)。maxBytes 故意设成
+        // 荒谬地小(1 字节),如果预算被应用会导致 toPrefetch 立刻清空;结果应该是维持"不限制"时
+        // 的行为,三集全部进 toPrefetch。
+        val decision = planCache(
+            currentItemId = "E0",
+            seriesOrder = (0..2).map { slot("E$it", it) },
+            cached = emptyList(),
+            maxEpisodes = 3,
+            maxBytes = 1L,
+        )
+
+        assertEquals(
+            listOf("E0", "E1", "E2"),
+            decision.toPrefetch,
+            "没有该剧的已缓存样本可供估算大小时,不应该把预取预算错误地约束成 0",
+        )
+    }
+
     @Test
     fun `cached item absent from seriesOrder is evicted as a cross-series leftover`() {
         val cached = listOf(

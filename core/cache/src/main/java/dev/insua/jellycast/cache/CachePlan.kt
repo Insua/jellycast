@@ -43,7 +43,28 @@ data class CacheDecision(val toPrefetch: List<String>, val toEvict: List<String>
  *    从老到新继续驱逐,直到落在上限内或只剩锚点。这里刻意用"最后访问时间"而不是下载时间——
  *    一集下载得早但反复回听,不该比一集下载得晚但再也没碰过的更早被删。
  *
- * [maxBytes] 为 `null` 表示不设容量上限,但规则 1、2(窗口、集数)照常生效,只是跳过规则 3。
+ * [maxBytes] 为 `null` 表示不设容量上限,但规则 1、2(窗口、集数)照常生效,只是跳过规则 3
+ * (以及下面「预取预算」这一段)。
+ *
+ * ### 复审 I5(Important):[CacheDecision.toPrefetch] 也必须受 [maxBytes] 约束
+ *
+ * 在这条修复之前,[toPrefetch] 只看"窗口目标里还没缓存的",完全不看 [maxBytes]——容量上限只在
+ * **已经缓存**的条目上生效(规则 3),而规则 3 只在**下一次**换集重新算计划时才会看到"现在超了"。
+ * 后果是一个不收敛的下载/驱逐循环:窗口偏满时,规则 3 按 `lastAccessAt` 删的往往是**刚下载完、
+ * 还没被回听过**的那几集(它们的 `lastAccessAt` = 下载完成时间,是所有幸存条目里最老的),
+ * 而这些集恰恰常常就是**紧跟在锚点后面、马上要播的那几集**——删完它们,`toPrefetch` 下一轮又会
+ * 把它们重新拉回来,顶掉窗口更靠后的另一集,如此往复,同时还伴随着"正要播的那一集缓存却刚好在
+ * 这一刻被删掉,不得不现场走远端流"这个体验倒退。
+ *
+ * 修复:在窗口 + 集数规则(规则 1/2)筛过、规则 3 驱逐执行**之后**,基于"驱逐后真正留下来的字节数"
+ * 计算剩余预算,再从窗口目标里按 order 顺序挑还没缓存的条目塞进 [toPrefetch],每塞一个就从预算里
+ * 扣掉一个**估算大小**,直到预算不够为止。
+ *
+ * 估算大小从 [cached] 里"这次窗口内、这部剧自己已经缓存过的条目"取平均值——纯函数没有能力
+ * 预知一个还没下载的条目最终会有多大,只能用同一部剧已知的样本去估。**取不到任何样本时
+ * (这部剧一集都还没缓存过)不做预算约束**,退回"只按窗口/集数决定"的旧行为——没有任何数据的
+ * 情况下把预算算成 0、直接不预取任何东西,比"这次没管住总量"更糟(违背设计文档"下一集不卡"
+ * 这个核心价值)。
  *
  * ### 锚点永不驱逐
  * [currentItemId] 代表正在播放的条目,在任何规则下都不会出现在 [CacheDecision.toEvict] 里,
@@ -91,11 +112,6 @@ fun planCache(
 
     val cachedById = cached.associateBy { it.itemId }
 
-    // toPrefetch:窗口目标里还没缓存的,按 order 顺序。
-    val toPrefetch = windowTargets
-        .filter { it.itemId !in cachedById }
-        .map { it.itemId }
-
     // 规则 1:窗口外(不在"锚点及之后、且未超集数上限"的目标集合里)的一律驱逐。
     // 注:窗口目标本身已经把"超出集数上限的窗口内条目"排除在外了,所以这里同时覆盖了
     // 规则 1(锚点之前)和规则 2(超出集数上限、离锚点最远的部分)。
@@ -104,18 +120,42 @@ fun planCache(
     val evicted = mutableListOf<String>()
     evicted += outsideWindow.map { it.itemId }
 
-    // 规则 3:窗口内保留的部分如果仍超容量,按 lastAccessAt 从老到新继续删,锚点永不驱逐。
-    if (maxBytes != null) {
-        val survivors = cached
-            .filter { it.itemId in windowTargetIds }
-            .sortedBy { it.lastAccessAt }
+    // 窗口内、这部剧已经缓存过的条目——规则 3 的驱逐候选,也是下面「预取预算」估算大小的样本来源。
+    val cachedInWindow = cached.filter { it.itemId in windowTargetIds }
 
-        var totalBytes = survivors.sumOf { it.sizeBytes }
+    // 规则 3:窗口内保留的部分如果仍超容量,按 lastAccessAt 从老到新继续删,锚点永不驱逐。
+    // `survivingBytes` 是这一步跑完之后、真正留下来(没被规则 3 删掉)的窗口内已缓存字节数——
+    // 「预取预算」用它当起点,而不是驱逐前的总量,否则会重复计入马上要被删掉的字节。
+    var survivingBytes = cachedInWindow.sumOf { it.sizeBytes }
+    if (maxBytes != null) {
+        val survivors = cachedInWindow.sortedBy { it.lastAccessAt }
         for (entry in survivors) {
-            if (totalBytes <= maxBytes) break
+            if (survivingBytes <= maxBytes) break
             if (entry.itemId == currentItemId) continue // 锚点永不驱逐,即使它自己就超了上限
             evicted += entry.itemId
-            totalBytes -= entry.sizeBytes
+            survivingBytes -= entry.sizeBytes
+        }
+    }
+
+    // toPrefetch:窗口目标里还没缓存的,按 order 顺序,受「预取预算」约束(见类 KDoc「复审 I5」)。
+    val notYetCached = windowTargets.filter { it.itemId !in cachedById }
+    val toPrefetch = if (maxBytes == null) {
+        notYetCached.map { it.itemId }
+    } else {
+        val estimatedItemBytes = cachedInWindow.takeIf { it.isNotEmpty() }
+            ?.let { entries -> entries.sumOf { it.sizeBytes } / entries.size }
+        if (estimatedItemBytes == null || estimatedItemBytes <= 0L) {
+            // 这部剧一集都还没缓存过,没有样本可估算——不做预算约束,见类 KDoc。
+            notYetCached.map { it.itemId }
+        } else {
+            var budget = maxBytes - survivingBytes
+            val result = mutableListOf<String>()
+            for (target in notYetCached) {
+                if (budget < estimatedItemBytes) break
+                result += target.itemId
+                budget -= estimatedItemBytes
+            }
+            result
         }
     }
 
