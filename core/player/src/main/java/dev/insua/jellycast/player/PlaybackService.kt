@@ -32,6 +32,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.android.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -406,6 +407,10 @@ class PlaybackService : MediaSessionService() {
             serverId = activeServerId,
             userIdProvider = userIdProvider,
             scope = serviceScope,
+            // Task 7:接住 CachePrefetchController 类注释「maxBytes」里留的接缝——读用户在设置页
+            // 选的存储上限,不再用类内部的 DEFAULT_MAX_BYTES 占位值。读取失败时 safeMaxBytes()
+            // 已经会退回保守默认值,这里不需要重复处理异常。
+            maxBytesProvider = { preferencesStore.cacheMaxBytes.first() },
         )
         serviceScope.launch {
             playQueue.current.collect { item -> item?.let(cachePrefetchController::onItemChanged) }

@@ -54,6 +54,7 @@ class SettingsViewModelTest {
         every { store.preferredSubtitleLanguage } returns flowOf("chi")
         every { store.audioBitRateKbps } returns flowOf(64)
         every { store.diagnosticsEnabled } returns flowOf(true)
+        every { store.cacheMaxBytes } returns flowOf(5L * 1024 * 1024 * 1024)
         return store
     }
 
@@ -94,6 +95,7 @@ class SettingsViewModelTest {
         assertEquals("chi", state.preferredSubtitleLanguage)
         assertEquals(64, state.audioBitRateKbps)
         assertEquals(true, state.diagnosticsEnabled)
+        assertEquals(5L * 1024 * 1024 * 1024, state.cacheMaxBytes)
     }
 
     @Test fun `开发者信息读取当前 endpoint 与本次会话已传输字节数`() = runTest(testDispatcher) {
@@ -178,6 +180,33 @@ class SettingsViewModelTest {
         advanceUntilIdle()
 
         coVerify { store.setDiagnosticsEnabled(false) }
+    }
+
+    @Test fun `修改缓存最大占用存储会写回 PreferencesStore`() = runTest(testDispatcher) {
+        val store = preferencesStore()
+        val viewModel = SettingsViewModel(store, session(), engine(), byteCounter(), exporter())
+        advanceUntilIdle()
+
+        viewModel.onCacheMaxBytesChange(10L * 1024 * 1024 * 1024)
+        advanceUntilIdle()
+
+        coVerify { store.setCacheMaxBytes(10L * 1024 * 1024 * 1024) }
+    }
+
+    /**
+     * task-7-brief 明确要防的坑:「不限制」和某个具体字节数(比如 1 GB)一旦在写回时被混淆,
+     * 用户选的「不限制」就会静默退化成一个有限值。这里断言 ViewModel 把 `null` 原样透传给
+     * [PreferencesStore],不做任何"null 就当默认值处理"之类的转换。
+     */
+    @Test fun `选择不限制时写回 null 而不是某个具体字节数`() = runTest(testDispatcher) {
+        val store = preferencesStore()
+        val viewModel = SettingsViewModel(store, session(), engine(), byteCounter(), exporter())
+        advanceUntilIdle()
+
+        viewModel.onCacheMaxBytesChange(null)
+        advanceUntilIdle()
+
+        coVerify { store.setCacheMaxBytes(null) }
     }
 
     @Test fun `导出诊断日志委托给 DiagnosticsExporter 并返回其分享 Intent`() = runTest(testDispatcher) {

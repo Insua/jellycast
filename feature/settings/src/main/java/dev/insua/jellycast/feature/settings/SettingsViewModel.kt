@@ -44,10 +44,16 @@ data class SettingsUiState(
     val currentSourceIsLocalFile: Boolean = false,
     val sessionBytesTransferred: Long = 0L,
     val diagnosticsEnabled: Boolean = true,
+    /**
+     * 音频缓存的存储上限,单位字节(Task 7,design doc §4.3)。`null` = 不限制——和
+     * [dev.insua.jellycast.datastore.PreferencesStore.cacheMaxBytes] 的表示一致。默认值
+     * 1 GiB 与该 Flow 无数据时的默认值保持一致。
+     */
+    val cacheMaxBytes: Long? = 1024L * 1024L * 1024L,
 )
 
 /**
- * 设置页。前七项([playbackSpeed]…[diagnosticsEnabled])直接把 [PreferencesStore] 的
+ * 设置页。前八项([playbackSpeed]…[cacheMaxBytes])直接把 [PreferencesStore] 的
  * Flow 摆到 UI 上,双向绑定——没有额外的领域逻辑。
  *
  * [buildDiagnosticsExportIntent](Task 5,design doc §5)是个例外:导出诊断日志不是一条偏好,
@@ -101,6 +107,9 @@ class SettingsViewModel @Inject constructor(
             preferencesStore.diagnosticsEnabled.collect { v -> _uiState.update { it.copy(diagnosticsEnabled = v) } }
         }
         viewModelScope.launch {
+            preferencesStore.cacheMaxBytes.collect { v -> _uiState.update { it.copy(cacheMaxBytes = v) } }
+        }
+        viewModelScope.launch {
             playbackEngine.state.collect { state ->
                 val source = (state as? PlaybackEngineState.Ready)?.source
                 _uiState.update {
@@ -137,6 +146,8 @@ class SettingsViewModel @Inject constructor(
 
     fun onDiagnosticsEnabledChange(value: Boolean) =
         viewModelScope.launch { preferencesStore.setDiagnosticsEnabled(value) }
+
+    fun onCacheMaxBytesChange(value: Long?) = viewModelScope.launch { preferencesStore.setCacheMaxBytes(value) }
 
     /**
      * "导出诊断日志"背后的动作(design doc §5)。返回 `null` 时(从未记录过任何内容,或用户此前

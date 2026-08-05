@@ -36,9 +36,15 @@ private val REWIND_OPTIONS = listOf(5, 10, 15, 30)
 private val FORWARD_OPTIONS = listOf(10, 15, 30, 60)
 private val BIT_RATE_OPTIONS = listOf(64, 128, 256)
 
+private const val GB = 1024L * 1024L * 1024L
+
+/** 设计文档 §4.3 / task-7-brief:1 GB / 5 GB / 10 GB / 不限制(`null`),默认 1 GB。 */
+private val CACHE_MAX_BYTES_OPTIONS: List<Long?> = listOf(1L * GB, 5L * GB, 10L * GB, null)
+
 /**
  * 设置页(Task 21):服务器管理入口 / 默认倍速 / 快退快进秒数 / 自动连播 / 歌词式字幕 /
- * 首选字幕语言 / 音频码率(修正 §3) / 诊断日志开关与导出(Task 5)/ 开发者信息(折叠)。
+ * 首选字幕语言 / 音频码率(修正 §3) / 缓存最大占用存储(Task 7)/ 诊断日志开关与导出(Task 5)/
+ * 开发者信息(折叠)。
  */
 @Composable
 fun SettingsScreen(
@@ -74,12 +80,14 @@ fun SettingsScreen(
                 options = REWIND_OPTIONS,
                 selected = uiState.rewindSeconds,
                 onSelect = viewModel::onRewindSecondsChange,
+                formatOption = { "${it}s" },
             )
             ChoiceRow(
                 label = "快进秒数",
                 options = FORWARD_OPTIONS,
                 selected = uiState.forwardSeconds,
                 onSelect = viewModel::onForwardSecondsChange,
+                formatOption = { "${it}s" },
             )
             SwitchRow(
                 label = "自动连播下一集",
@@ -111,6 +119,25 @@ fun SettingsScreen(
                 selected = uiState.audioBitRateKbps,
                 onSelect = viewModel::onAudioBitRateKbpsChange,
                 formatOption = { "${it}k" },
+            )
+        }
+
+        item {
+            // Task 7 / design doc §4.3:存储上限是"缓存会占多少设备空间"这个问题,和上面「网络」
+            // 分组关心的"这次播放走多少流量"是两个维度,所以单独起一个分组而不是塞进「网络」。
+            SectionTitle("缓存")
+            ChoiceRow(
+                label = "最大占用存储",
+                options = CACHE_MAX_BYTES_OPTIONS,
+                selected = uiState.cacheMaxBytes,
+                onSelect = viewModel::onCacheMaxBytesChange,
+                formatOption = ::formatCacheMaxBytesOption,
+            )
+            Text(
+                "只限制缓存总占用空间;每部剧最多缓存当前及之后 10 集,“不限制”不会突破这条上限",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
             )
         }
 
@@ -201,6 +228,16 @@ internal fun formatBytes(bytes: Long): String = when {
     else -> "%.2f MB".format(bytes / (1024.0 * 1024.0))
 }
 
+/**
+ * 「最大占用存储」ChoiceRow 的选项文案。`null` = 不限制(Task 7,design doc §4.3)——和
+ * [dev.insua.jellycast.datastore.PreferencesStore.cacheMaxBytes] / `CachePrefetchController`
+ * 的 `maxBytes: Long?` 契约保持一致。
+ *
+ * 纯函数,不接触 Compose/Android——可离线单测,和 [formatBytes] 同一种做法。
+ */
+internal fun formatCacheMaxBytesOption(bytes: Long?): String =
+    if (bytes == null) "不限制" else "${bytes / GB} GB"
+
 @Composable
 private fun DevInfoLine(label: String, value: String) {
     Row(
@@ -255,13 +292,18 @@ private fun SliderRow(
     }
 }
 
+/**
+ * 泛型化(Task 7):原本只接 [Int] 选项,「最大占用存储」的选项是 [Long]`?`(`null` = 不限制,
+ * 见 [formatCacheMaxBytesOption])——没有一个对全部 `T` 都成立的合理默认格式化方式,
+ * [formatOption] 因此改成必填参数,各调用点显式传入。
+ */
 @Composable
-private fun ChoiceRow(
+private fun <T> ChoiceRow(
     label: String,
-    options: List<Int>,
-    selected: Int,
-    onSelect: (Int) -> Unit,
-    formatOption: (Int) -> String = { "${it}s" },
+    options: List<T>,
+    selected: T,
+    onSelect: (T) -> Unit,
+    formatOption: (T) -> String,
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
         Text(label)
