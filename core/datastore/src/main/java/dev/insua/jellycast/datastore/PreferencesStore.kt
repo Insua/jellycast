@@ -36,11 +36,13 @@ private const val DEFAULT_DIAGNOSTICS_ENABLED = true
 private const val DEFAULT_AUDIO_BIT_RATE_KBPS = 128
 
 /**
- * 设计文档 §4.3 / task-7-brief:缓存存储上限默认 1 GB(取 GiB),和 `CachePrefetchController`
- * 里 Task 7 落地前占位用的 `DEFAULT_MAX_BYTES` 是同一个值——Task 7 把那边的占位 lambda
- * 换成读这份偏好后,两处不能再各自维护一份、悄悄漂移。
+ * 设计文档 §4.3:缓存存储上限默认 1 GB(取 GiB)。这是唯一权威定义——`CachePrefetchController`
+ * 的构造默认值/`safeMaxBytes()` 读取失败兜底值,以及 `SettingsUiState.cacheMaxBytes` 的
+ * 初始展示值,都直接引用这个常量,不再各自声明一份 `1024L * 1024L * 1024L` 悄悄漂移。
+ * 公开可见性(而非 `internal`)是因为引用方跨模块(`:core:player`、`:feature:settings`),
+ * `internal` 在模块边界上不可见。
  */
-private const val DEFAULT_CACHE_MAX_BYTES = 1024L * 1024L * 1024L
+const val DEFAULT_CACHE_MAX_BYTES = 1024L * 1024L * 1024L
 
 /**
  * 「不限制」在 DataStore 里的哨兵值。这里不能像 [preferredSubtitleLanguage] 那样用"键不存在"

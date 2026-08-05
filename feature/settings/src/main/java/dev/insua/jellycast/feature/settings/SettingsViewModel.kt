@@ -4,6 +4,7 @@ import android.content.Intent
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dev.insua.jellycast.datastore.DEFAULT_CACHE_MAX_BYTES
 import dev.insua.jellycast.datastore.PreferencesStore
 import dev.insua.jellycast.diagnostics.DiagnosticsExporter
 import dev.insua.jellycast.model.AudioDeliveryLevel
@@ -46,10 +47,10 @@ data class SettingsUiState(
     val diagnosticsEnabled: Boolean = true,
     /**
      * 音频缓存的存储上限,单位字节(Task 7,design doc §4.3)。`null` = 不限制——和
-     * [dev.insua.jellycast.datastore.PreferencesStore.cacheMaxBytes] 的表示一致。默认值
-     * 1 GiB 与该 Flow 无数据时的默认值保持一致。
+     * [dev.insua.jellycast.datastore.PreferencesStore.cacheMaxBytes] 的表示一致。默认值直接引用
+     * [DEFAULT_CACHE_MAX_BYTES],与该 Flow 无数据时的默认值保持同一份定义,不再各自维护。
      */
-    val cacheMaxBytes: Long? = 1024L * 1024L * 1024L,
+    val cacheMaxBytes: Long? = DEFAULT_CACHE_MAX_BYTES,
 )
 
 /**

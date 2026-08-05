@@ -7,6 +7,7 @@ import dev.insua.jellycast.cache.NetworkTypeMonitor
 import dev.insua.jellycast.cache.SeriesSlot
 import dev.insua.jellycast.cache.planCache
 import dev.insua.jellycast.database.CachedAudioDao
+import dev.insua.jellycast.datastore.DEFAULT_CACHE_MAX_BYTES
 import dev.insua.jellycast.model.AudioDeliveryLevel
 import dev.insua.jellycast.model.MediaItem
 import dev.insua.jellycast.model.MediaKind
@@ -67,14 +68,14 @@ import kotlinx.coroutines.launch
  * MB~GB),也会在用户毫无预期的地方吃光刚设置的存储上限。落到 L3 的条目本次预取直接跳过、
  * 不计入任何"失败",下次换集重算计划时还会再试一次。
  *
- * ## `maxBytes`:Task 7 落地前的接线缝(carry-forward 之三)
+ * ## `maxBytes`:接线缝,读取失败保守回退
  *
- * Task 7 才会新增"最大占用存储"这个偏好项。[maxBytesProvider] 是特意留的接缝——一个 `suspend
- * () -> Long?` 而不是构造时定死的 `Long?`,好让 Task 7 只需要在 `PlayerModule` 里把
- * `{ DEFAULT_MAX_BYTES }` 换成 `{ preferencesStore.maxCacheBytes.first() }`,不需要改动本类
- * 一行代码。默认值 1 GiB,和设计文档 §4.3"默认 1 GB"一致;读取失败(DataStore 异常)时退回
- * 同一个默认值,不是"不限制"——存储上限这种东西查不清楚时应该保守,不应该在读取失败时意外放开
- * 到无限制。`null` = 不限制,和 [planCache] 已经定好的契约一致,Task 7 必须原样沿用这个表示。
+ * [maxBytesProvider] 是一个 `suspend () -> Long?` 而不是构造时定死的 `Long?`——生产环境
+ * `PlayerModule` 接的是 `{ preferencesStore.cacheMaxBytes.first() }`,好让"最大占用存储"这个
+ * 偏好项能被换电池式地替换成任何来源,不需要改动本类一行代码。默认值与读取失败(DataStore 异常)
+ * 时的兜底值都是同一个 [DEFAULT_CACHE_MAX_BYTES](定义在 `:core:datastore`,和 `PreferencesStore`
+ * 的默认值同一份,不在这里另起一份),不是"不限制"——存储上限这种东西查不清楚时应该保守,不应该
+ * 在读取失败时意外放开到无限制。`null` = 不限制,和 [planCache] 已经定好的契约一致。
  *
  * ## 剧集顺序:只查够用的那一段,不查整部剧
  *
@@ -109,7 +110,7 @@ class CachePrefetchController(
     private val userIdProvider: suspend () -> String?,
     private val scope: CoroutineScope,
     private val maxEpisodes: Int = DEFAULT_MAX_EPISODES,
-    private val maxBytesProvider: suspend () -> Long? = { DEFAULT_MAX_BYTES },
+    private val maxBytesProvider: suspend () -> Long? = { DEFAULT_CACHE_MAX_BYTES },
 ) {
     /** 见类注释「驱动时机」:同一个 itemId 不重复触发,天然吸收 `PlayQueue.current` 的重放。 */
     @Volatile
@@ -177,7 +178,7 @@ class CachePrefetchController(
         throw e
     } catch (e: Exception) {
         // 读取失败退回保守默认值,不是"不限制"——见类注释「maxBytes」。
-        DEFAULT_MAX_BYTES
+        DEFAULT_CACHE_MAX_BYTES
     }
 
     private suspend fun evictQuietly(itemId: String) {
@@ -309,9 +310,6 @@ class CachePrefetchController(
     private companion object {
         /** 设计文档 §4.2:一部剧最多缓存 10 集,含锚点本身。 */
         const val DEFAULT_MAX_EPISODES = 10
-
-        /** 设计文档 §4.3:默认 1 GB(取 GiB)。Task 7 落地前的默认值,见类注释「maxBytes」。 */
-        const val DEFAULT_MAX_BYTES = 1024L * 1024L * 1024L
 
         /** 见 [listCachedEntries]:窗口/查询范围之外的已缓存记录,order 无意义时的哨兵值。 */
         const val OUT_OF_WINDOW_ORDER = -1

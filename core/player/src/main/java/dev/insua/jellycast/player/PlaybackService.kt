@@ -408,7 +408,7 @@ class PlaybackService : MediaSessionService() {
             userIdProvider = userIdProvider,
             scope = serviceScope,
             // Task 7:接住 CachePrefetchController 类注释「maxBytes」里留的接缝——读用户在设置页
-            // 选的存储上限,不再用类内部的 DEFAULT_MAX_BYTES 占位值。读取失败时 safeMaxBytes()
+            // 选的存储上限,不再用构造默认值(DEFAULT_CACHE_MAX_BYTES)。读取失败时 safeMaxBytes()
             // 已经会退回保守默认值,这里不需要重复处理异常。
             maxBytesProvider = { preferencesStore.cacheMaxBytes.first() },
         )

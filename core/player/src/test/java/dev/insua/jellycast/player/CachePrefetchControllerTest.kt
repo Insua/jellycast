@@ -4,6 +4,7 @@ import dev.insua.jellycast.cache.AudioCacheStore
 import dev.insua.jellycast.cache.NetworkTypeMonitor
 import dev.insua.jellycast.database.CachedAudioDao
 import dev.insua.jellycast.database.CachedAudioEntity
+import dev.insua.jellycast.datastore.DEFAULT_CACHE_MAX_BYTES
 import dev.insua.jellycast.model.AudioDeliveryLevel
 import dev.insua.jellycast.model.MediaItem
 import dev.insua.jellycast.model.MediaKind
@@ -307,6 +308,44 @@ class CachePrefetchControllerTest {
 
         assertFalse(stored.contains("e2"), "旧计划必须在换集时被取消,不该在 gate 释放后又继续走 e2,实际:$stored")
         assertFalse(stored.contains("e3"), "同上,e3 也不该出现,实际:$stored")
+    }
+
+    // ---- 存储上限读取失败时的兜底值必须和 PreferencesStore 的默认值同一份(防悄悄漂移) ----
+
+    /**
+     * 复审发现:`DEFAULT_CACHE_MAX_BYTES` 曾经在 `PreferencesStore` / `CachePrefetchController` /
+     * `SettingsViewModel` 三处各自声明一份 `1024L * 1024L * 1024L`,现在只在 `:core:datastore`
+     * 定义一份、其余两处引用它。这条用例是行为级的防回归网:不直接比较两个常量字面量(那样只要
+     * 有人手滑改了其中一处的*字面量*而不是常量引用就测不出来),而是真正驱动一次
+     * `maxBytesProvider()` 读取失败的场景,断言 [CachePrefetchController.safeMaxBytes] 的兜底值
+     * 落在 [DEFAULT_CACHE_MAX_BYTES] 这个边界上——`e2` 的体积恰好比这个边界多 1 字节,只有兜底值
+     * 真的等于 [DEFAULT_CACHE_MAX_BYTES] 时它才会被驱逐;兜底值只要和这个常量不一致(不论改大还是
+     * 改小),这条用例就会翻红。
+     */
+    @Test fun `安全读取上限失败时的兜底值与 PreferencesStore 默认值一致`() = runTest {
+        val api = mockk<JellyfinApi>().apply { stubThreeEpisodeSeries() }
+        val cacheStore = freshCacheStore()
+        val cacheDao = freshDao(listOf(cachedEntity("e2").copy(sizeBytes = DEFAULT_CACHE_MAX_BYTES + 1)))
+        val provider = PlaybackSourceProvider { itemId, _, _ -> remoteSource(itemId) }
+        val network = mockk<NetworkTypeMonitor>()
+        every { network.isOnWifi() } returns true
+        val sut = CachePrefetchController(
+            cacheDao = cacheDao,
+            cacheStore = cacheStore,
+            networkTypeMonitor = network,
+            downloadSourceProvider = provider,
+            api = api,
+            serverId = SERVER_ID,
+            userIdProvider = { USER_ID },
+            scope = this,
+            // 模拟 DataStore 读取失败——safeMaxBytes() 必须退回 DEFAULT_CACHE_MAX_BYTES。
+            maxBytesProvider = { throw RuntimeException("DataStore 读取失败") },
+        )
+
+        sut.onItemChanged(ep("e1", 1))
+        advanceUntilIdle()
+
+        coVerify(exactly = 1) { cacheStore.delete(SERVER_ID, "e2") }
     }
 
     // ---- 孤儿清扫的生产调用方(carry-forward 之一) ----
