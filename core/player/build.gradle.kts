@@ -28,6 +28,8 @@ dependencies {
     implementation(project(":core:network"))
     implementation(project(":core:database"))
     implementation(project(":core:datastore"))
+    // CacheAwareSourceProvider 消费 Task 3 交付的 AudioCacheStore。
+    implementation(project(":core:cache"))
 
     implementation(libs.kotlinx.coroutines)
     // NotificationCompat / ServiceCompat.startForeground —— PlaybackService 自己进前台需要它们

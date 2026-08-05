@@ -7,6 +7,8 @@ import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
+import dev.insua.jellycast.cache.AudioCacheDownloader
+import dev.insua.jellycast.cache.AudioCacheStore
 import dev.insua.jellycast.database.JellyCastDatabase
 import dev.insua.jellycast.database.ProgressReportDao
 import dev.insua.jellycast.database.buildJellyCastDatabase
@@ -19,6 +21,7 @@ import dev.insua.jellycast.network.session.JellyfinSession
 import dev.insua.jellycast.player.AudioPlaybackEngine
 import dev.insua.jellycast.player.AudioPlaybackEngineImpl
 import dev.insua.jellycast.player.AutoPlayNextController
+import dev.insua.jellycast.player.CacheAwareSourceProvider
 import dev.insua.jellycast.player.ExoPlayerControl
 import dev.insua.jellycast.player.HttpStreamProbe
 import dev.insua.jellycast.player.PlaybackProgressCoordinator
@@ -96,9 +99,47 @@ object PlayerModule {
         )
     }
 
+    /**
+     * [AudioCacheStore] 复用 [provideStreamProbe] 那份带证书信任策略的 [TrustAwareHttpClient]——
+     * 缓存下载和 L1 探测打的是同一个可能自签证书的 endpoint,不新增第二套证书处理逻辑。
+     * `dao` 取自下面 [provideJellyCastDatabase] 提供的同一个单例数据库实例。
+     */
     @Provides
     @Singleton
-    fun providePlaybackSourceProvider(resolver: PlaybackSourceResolver): PlaybackSourceProvider = resolver.asProvider()
+    fun provideAudioCacheStore(
+        @ApplicationContext context: Context,
+        database: JellyCastDatabase,
+        @TrustAwareHttpClient client: OkHttpClient,
+    ): AudioCacheStore = AudioCacheStore(
+        context = context,
+        dao = database.cachedAudioDao(),
+        downloader = AudioCacheDownloader(client),
+    )
+
+    /**
+     * 生产环境的 [PlaybackSourceProvider] 是 [CacheAwareSourceProvider] 包一层 [PlaybackSourceResolver]
+     * ——命中本地音频缓存就直接播本地文件,未命中原样委派给 resolver 的 L1/L3 降级链,一字不动。
+     * 设计决定见 [CacheAwareSourceProvider] 类 KDoc。
+     *
+     * `serverId` 是装配时刻的快照,和 [provideProgressReporter] 的 `serverId` 同一类已知取舍——
+     * 进程存活期间切换激活服务器不会更新这个值,需要重启进程才会用新服务器的 id。
+     */
+    @Provides
+    @Singleton
+    fun providePlaybackSourceProvider(
+        resolver: PlaybackSourceResolver,
+        cacheStore: AudioCacheStore,
+        api: JellyfinApi,
+        serverStore: ServerStore,
+    ): PlaybackSourceProvider {
+        val serverId = runBlocking { serverStore.activeServerId.first() } ?: "unknown-server"
+        return CacheAwareSourceProvider(
+            delegate = resolver.asProvider(),
+            cacheStore = cacheStore,
+            api = api,
+            serverId = serverId,
+        )
+    }
 
     @Provides
     @Singleton
