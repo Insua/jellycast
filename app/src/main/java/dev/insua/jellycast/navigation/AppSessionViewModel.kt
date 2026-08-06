@@ -156,6 +156,7 @@ class AppSessionViewModel @Inject constructor(
         }
         restoreLastPlayed()
         observeMiniPlayer()
+        observeBaseUrlForRestoredPoster()
         observePlaybackFailure()
         observePlaybackSequenceEnd()
     }
@@ -215,6 +216,37 @@ class AppSessionViewModel @Inject constructor(
                 progress = miniPlayerProgress(record.positionMs, record.runTimeMs),
                 hasNext = false,
             )
+        }
+    }
+
+    /**
+     * baseUrl 就绪后,给 [restoreLastPlayed] 恢复出来的迷你条补上封面(设计文档 §3.2)。
+     *
+     * **背景:** [restoreLastPlayed] 在 `init` 里跑,读 [baseUrl] 时它还是初始空串——
+     * [refreshBaseUrl] 是另一条独立异步,此刻多半还没跑完。于是 `posterUrl` 算出来是 `null`,
+     * 而 `_miniPlayer` 是一次性快照,`baseUrl` 后来解析出来了也没人重算。这里就是那个"重算"。
+     *
+     * **和 [observeMiniPlayer] 的边界(读者需要先确认再改这两个函数)：**
+     * 只要 [restoredWithoutSession] 还是 `true`——也就是真实播放会话还没接管 `_miniPlayer`——
+     * 这里就在 [baseUrl] 每次变化时尝试给"恢复出来的那个快照"补 `posterUrl`(用
+     * [playQueue] 当前条目重算,不改 `title`/`subtitle`/`progress` 等其余字段)。一旦
+     * [observeMiniPlayer] 收到过一次非 `null` 的 `nowPlaying`([restoredWithoutSession] 因此
+     * 永久置回 `false`),这个函数即便之后还会被 [baseUrl] 的新值触发,也会在第一行直接
+     * 短路退出——绝不再碰 `_miniPlayer`。两条路径因此不会同时写同一个 `StateFlow`,不会闪、
+     * 不会互相覆盖。
+     *
+     * **不引入网络请求。** 只订阅已有的 [baseUrl] `StateFlow`,不主动触发选路——那是
+     * [refreshBaseUrl] 的职责,兜底顺序见其 KDoc,后两级都不联网。
+     */
+    private fun observeBaseUrlForRestoredPoster() {
+        viewModelScope.launch {
+            baseUrl.collect { url ->
+                if (!restoredWithoutSession) return@collect
+                if (url.isBlank()) return@collect
+                val restoredItem = playQueue.current.value ?: return@collect
+                val current = _miniPlayer.value ?: return@collect
+                _miniPlayer.value = current.copy(posterUrl = restoredItem.posterUrl(url))
+            }
         }
     }
 
@@ -326,6 +358,10 @@ class AppSessionViewModel @Inject constructor(
      * 和 [dev.insua.jellycast.feature.player.PlayerViewModel.observePlaybackState] 同样的
      * "绑定 nowPlaying 生命周期的轻量轮询"模式:一旦 [PlayerConnection.nowPlaying] 变化(新条目/
      * 置空),[collectLatest] 自动取消上一个轮询协程,不会有多个轮询并存。
+     *
+     * **和 [observeBaseUrlForRestoredPoster] 的边界**见后者 KDoc:一旦这里收到过一次非 `null` 的
+     * `info`([restoredWithoutSession] 置回 `false`),`_miniPlayer` 之后只由这个函数写,
+     * [observeBaseUrlForRestoredPoster] 会自行短路退出,不会再插手。
      */
     private fun observeMiniPlayer() {
         viewModelScope.launch {

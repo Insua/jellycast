@@ -310,6 +310,51 @@ class AppSessionViewModelTest {
         assertEquals("season-7", item.seasonId, "seasonId 缺失会让离线时自动连播/缓存预取的兜底也失败")
     }
 
+    // ---- Task 2(2026-08-06):baseUrl 就绪后补写恢复出来的封面 ----
+    // restoreLastPlayed 在 init 里跑,读 baseUrl 时它还是初始空串(refreshBaseUrl 是另一条独立
+    // 异步),posterUrl 因此永远算出 null;_miniPlayer 是一次性快照,baseUrl 后来解析出来了也没人
+    // 重算。这里钉住"当前行为"(第一条)和"必须补上"(第二条,核心断言)。
+
+    @Test
+    fun `恢复时baseUrl还是空串,迷你条posterUrl为null`() = runTest(testDispatcher) {
+        // 默认 fakeServerStore(activeServerId = null):refreshBaseUrl 不会被触发,baseUrl 一直是空串。
+        val viewModel = newViewModel()
+
+        advanceUntilIdle()
+
+        val state = viewModel.miniPlayer.value
+        assertNotNull(state, "前提:确实发生过一次恢复")
+        assertNull(state!!.posterUrl, "baseUrl 还没解析出来时,当前行为就是没有封面")
+    }
+
+    @Test
+    fun `baseUrl随后解析出值,恢复出来的迷你条posterUrl补上,指向恢复出来的那个条目`() = runTest(testDispatcher) {
+        val r = record(itemId = "item-42", imageTag = "tag-42")
+        // activeServerId 非空,init 里的 refreshBaseUrl 才会被触发;session.baseUrl() 模拟这一刻
+        // 选路失败(比如离线),落到 cachedBaseUrlOrNull() 这一级兜底 —— 本进程上次成功解析的地址,
+        // 不联网(brief 里的第二级兜底)。
+        val session = mockk<JellyfinSession>()
+        coEvery { session.baseUrl() } throws IllegalStateException("this-moment selection fails offline")
+        every { session.cachedBaseUrlOrNull() } returns "https://cached.example.com"
+
+        val viewModel = newViewModel(
+            lastPlayed = r,
+            serverStore = fakeServerStore(activeServerId = "server-1"),
+            session = session,
+        )
+
+        advanceUntilIdle()
+
+        val state = viewModel.miniPlayer.value
+        assertNotNull(state, "前提:确实发生过一次恢复")
+        assertNotNull(state!!.posterUrl, "baseUrl 就绪之后,恢复出来的迷你条封面必须补上")
+        assertEquals(
+            "https://cached.example.com/Items/item-42/Images/Primary?maxWidth=400&tag=tag-42",
+            state.posterUrl,
+            "补写的封面必须指向恢复出来的那个条目,不是别的什么 URL",
+        )
+    }
+
     // ---- 复审 Task 5 Important 1:换服务器必须重置进程内已经装填好的迷你条/播放队列 ----
     // 复现路径:设置 → 管理服务器 → 删除当前活跃服务器 → 连一台新服务器 → 回首页。之前
     // onServerConnected() 只清了 LastPlayedStore 这一份磁盘记录,init 里 restoreLastPlayed()
