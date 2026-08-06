@@ -21,6 +21,10 @@ import dev.insua.jellycast.model.displaySubtitle
  * 冷启动恢复出来的条目在导航层就只能硬编码成 `EPISODE`——电影播完之后
  * [AutoPlayNextController.onPlaybackEnded] 会把它误判成"未完结的剧集"去找下一集,
  * 连播结束该有的"回首页"永远不会触发。
+ *
+ * [seriesName]/[seasonNumber]/[episodeNumber]/[seriesId]/[seasonId](Task 1,2026-08-06)同样原样
+ * 透传,理由见 [LastPlayed] 类内对这五个字段的 KDoc:电影条目这五项在 [item] 上本就是 `null`,
+ * 这里不额外判断,直接抄一遍就是正确的"电影没有季集"结果。
  */
 fun buildLastPlayedRecord(
     item: MediaItem,
@@ -35,4 +39,9 @@ fun buildLastPlayedRecord(
     runTimeMs = item.runTimeMs,
     updatedAt = now,
     kind = item.kind.name,
+    seriesName = item.seriesName,
+    seasonNumber = item.seasonNumber,
+    episodeNumber = item.episodeNumber,
+    seriesId = item.seriesId,
+    seasonId = item.seasonId,
 )

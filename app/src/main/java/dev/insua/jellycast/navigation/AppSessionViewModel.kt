@@ -182,6 +182,12 @@ class AppSessionViewModel @Inject constructor(
      * 会去找"下一集"而不是判定为整部片子播完,"播完回首页"永远不会触发。`valueOf` 失败(未来
      * 新增枚举值、记录被手工改坏等边缘情况)时退化成 [MediaKind.EPISODE]——这条路径本来就是
      * "尽力而为的本地缓存",容错值随手挑一个不会崩的即可,不值得为它另设一种更精确的降级。
+     *
+     * `seriesName`/`seasonNumber`/`episodeNumber`/`seriesId`/`seasonId`(Task 1,2026-08-06)同样
+     * 原样从 [record] 回填:播放页顶栏读 `MediaItem.seriesName`、副标题靠
+     * `MediaItem.displaySubtitle` 从季集编号现拼,不回填这五个字段的话恢复出来的迷你条点开播放页
+     * 后顶栏剧名和 S01E02 副标题都是空的;`seriesId`/`seasonId` 还决定离线时自动连播/缓存预取的
+     * 兜底路径是否可用(两者拿不到这两个字段都会去发一次网络请求找剧集归属,断网时那次兜底也失败)。
      */
     private fun restoreLastPlayed() {
         viewModelScope.launch {
@@ -190,9 +196,14 @@ class AppSessionViewModel @Inject constructor(
                 id = record.itemId,
                 kind = runCatching { MediaKind.valueOf(record.kind) }.getOrDefault(MediaKind.EPISODE),
                 name = record.title,
+                seriesName = record.seriesName,
+                seasonNumber = record.seasonNumber,
+                episodeNumber = record.episodeNumber,
                 runTimeMs = record.runTimeMs,
                 resumePositionMs = record.positionMs,
                 imageTag = record.imageTag,
+                seriesId = record.seriesId,
+                seasonId = record.seasonId,
             )
             playQueue.setQueue(listOf(item), 0)
             restoredWithoutSession = true

@@ -75,6 +75,11 @@ class AppSessionViewModelTest {
         imageTag: String? = "tag-1",
         runTimeMs: Long? = 1_800_000L,
         kind: String = MediaKind.EPISODE.name,
+        seriesName: String? = "某剧",
+        seasonNumber: Int? = 1,
+        episodeNumber: Int? = 3,
+        seriesId: String? = "series-1",
+        seasonId: String? = "season-1",
     ) = LastPlayed(
         itemId = itemId,
         positionMs = positionMs,
@@ -84,6 +89,11 @@ class AppSessionViewModelTest {
         runTimeMs = runTimeMs,
         updatedAt = 0L,
         kind = kind,
+        seriesName = seriesName,
+        seasonNumber = seasonNumber,
+        episodeNumber = episodeNumber,
+        seriesId = seriesId,
+        seasonId = seasonId,
     )
 
     /** 默认没有激活服务器(相当于"退出登录"/冷启动还没连过):[refreshBaseUrl] 不会被触发,
@@ -270,6 +280,34 @@ class AppSessionViewModelTest {
         advanceUntilIdle()
 
         assertEquals(MediaKind.EPISODE, queue.current.value?.kind, "无法识别的 kind 应该静默降级,不影响冷启动")
+    }
+
+    // ---- Task 1(2026-08-06):恢复出来的 MediaItem 必须带着结构化季集字段 ----
+    // 之前 restoreLastPlayed 只从记录里读 title/subtitle 拼好的显示字符串,seriesName/
+    // seasonNumber/episodeNumber/seriesId/seasonId 全部漏填——播放页顶栏剧名、S01E02 副标题都是
+    // 空的,自动连播/缓存预取靠 seriesId/seasonId 找本剧集序,拿不到时的网络兜底离线还会失败。
+
+    @Test
+    fun `恢复出来的条目,结构化季集字段与记录一致`() = runTest(testDispatcher) {
+        val queue = PlayQueue()
+        val r = record(
+            seriesName = "某剧",
+            seasonNumber = 2,
+            episodeNumber = 5,
+            seriesId = "series-42",
+            seasonId = "season-7",
+        )
+        newViewModel(lastPlayed = r, playQueue = queue)
+
+        advanceUntilIdle()
+
+        val item = queue.current.value
+        assertNotNull(item, "前提:确实发生过一次恢复")
+        assertEquals("某剧", item!!.seriesName, "恢复出来的条目剧名应与记录一致,播放页顶栏才有内容")
+        assertEquals(2, item.seasonNumber, "恢复出来的条目季号应与记录一致")
+        assertEquals(5, item.episodeNumber, "恢复出来的条目集号应与记录一致")
+        assertEquals("series-42", item.seriesId, "seriesId 缺失会让离线时自动连播/缓存预取的兜底也失败")
+        assertEquals("season-7", item.seasonId, "seasonId 缺失会让离线时自动连播/缓存预取的兜底也失败")
     }
 
     // ---- 复审 Task 5 Important 1:换服务器必须重置进程内已经装填好的迷你条/播放队列 ----
