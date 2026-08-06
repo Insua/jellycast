@@ -148,6 +148,20 @@ class AppSessionViewModel @Inject constructor(
      */
     private var restoredWithoutSession = false
 
+    /**
+     * [restoreLastPlayed] 恢复出来的那个条目的 id,只在 [restoredWithoutSession] 仍是 `true`
+     * 期间有意义。
+     *
+     * [observeBaseUrlForRestoredPoster] 用它核对"此刻 [playQueue] 头部的条目,是不是当初被恢复、
+     * 现在还摆在 `_miniPlayer` 里的那一个"——光看 [restoredWithoutSession] 不够:用户完全可能在
+     * baseUrl 解析完成**之前**就点开了另一个条目 B。[play] 会先同步把 [playQueue] 换成 B,
+     * 但要等 `audioPlaybackEngine.play(...)` 的网络往返落地、[observeMiniPlayer] 收到真实
+     * `nowPlaying` 之后才会碰 `_miniPlayer`/[restoredWithoutSession]——这个窗口期里
+     * `playQueue.current` 已经是 B,`_miniPlayer` 却还是 A 的快照。这时候若只按
+     * `playQueue.current.value` 取条目去补封面,补出来的会是"A 的标题/副标题 + B 的封面"。
+     */
+    private var restoredItemId: String? = null
+
     init {
         viewModelScope.launch {
             val activeId = serverStore.activeServerId.first()
@@ -156,6 +170,7 @@ class AppSessionViewModel @Inject constructor(
         }
         restoreLastPlayed()
         observeMiniPlayer()
+        observeBaseUrlForRestoredPoster()
         observePlaybackFailure()
         observePlaybackSequenceEnd()
     }
@@ -182,6 +197,12 @@ class AppSessionViewModel @Inject constructor(
      * 会去找"下一集"而不是判定为整部片子播完,"播完回首页"永远不会触发。`valueOf` 失败(未来
      * 新增枚举值、记录被手工改坏等边缘情况)时退化成 [MediaKind.EPISODE]——这条路径本来就是
      * "尽力而为的本地缓存",容错值随手挑一个不会崩的即可,不值得为它另设一种更精确的降级。
+     *
+     * `seriesName`/`seasonNumber`/`episodeNumber`/`seriesId`/`seasonId`(Task 1,2026-08-06)同样
+     * 原样从 [record] 回填:播放页顶栏读 `MediaItem.seriesName`、副标题靠
+     * `MediaItem.displaySubtitle` 从季集编号现拼,不回填这五个字段的话恢复出来的迷你条点开播放页
+     * 后顶栏剧名和 S01E02 副标题都是空的;`seriesId`/`seasonId` 还决定离线时自动连播/缓存预取的
+     * 兜底路径是否可用(两者拿不到这两个字段都会去发一次网络请求找剧集归属,断网时那次兜底也失败)。
      */
     private fun restoreLastPlayed() {
         viewModelScope.launch {
@@ -190,12 +211,18 @@ class AppSessionViewModel @Inject constructor(
                 id = record.itemId,
                 kind = runCatching { MediaKind.valueOf(record.kind) }.getOrDefault(MediaKind.EPISODE),
                 name = record.title,
+                seriesName = record.seriesName,
+                seasonNumber = record.seasonNumber,
+                episodeNumber = record.episodeNumber,
                 runTimeMs = record.runTimeMs,
                 resumePositionMs = record.positionMs,
                 imageTag = record.imageTag,
+                seriesId = record.seriesId,
+                seasonId = record.seasonId,
             )
             playQueue.setQueue(listOf(item), 0)
             restoredWithoutSession = true
+            restoredItemId = item.id
             _miniPlayer.value = MiniPlayerUiState(
                 title = record.title,
                 subtitle = record.subtitle,
@@ -204,6 +231,46 @@ class AppSessionViewModel @Inject constructor(
                 progress = miniPlayerProgress(record.positionMs, record.runTimeMs),
                 hasNext = false,
             )
+        }
+    }
+
+    /**
+     * baseUrl 就绪后,给 [restoreLastPlayed] 恢复出来的迷你条补上封面(设计文档 §3.2)。
+     *
+     * **背景:** [restoreLastPlayed] 在 `init` 里跑,读 [baseUrl] 时它还是初始空串——
+     * [refreshBaseUrl] 是另一条独立异步,此刻多半还没跑完。于是 `posterUrl` 算出来是 `null`,
+     * 而 `_miniPlayer` 是一次性快照,`baseUrl` 后来解析出来了也没人重算。这里就是那个"重算"。
+     *
+     * **和 [observeMiniPlayer] 的边界(读者需要先确认再改这两个函数)：**
+     * 只要 [restoredWithoutSession] 还是 `true`——也就是真实播放会话还没接管 `_miniPlayer`——
+     * 这里就在 [baseUrl] 每次变化时尝试给"恢复出来的那个快照"补 `posterUrl`(不改
+     * `title`/`subtitle`/`progress` 等其余字段)。一旦 [observeMiniPlayer] 收到过一次非 `null`
+     * 的 `nowPlaying`([restoredWithoutSession] 因此永久置回 `false`),这个函数即便之后还会被
+     * [baseUrl] 的新值触发,也会在第一行直接短路退出——绝不再碰 `_miniPlayer`。单线程 dispatcher
+     * 下两条协程本就不会真的同时写同一个 `StateFlow`,但这不代表状态一定正确——见下一段。
+     *
+     * **必须核对身份,不能只信 [playQueue] 头部是"恢复出来的那个条目"。** 复审 Critical:
+     * 用户完全可能在 baseUrl 解析完成**之前**就点开了另一个条目 B——[play] 会先同步把
+     * [playQueue] 换成 B,直到 `audioPlaybackEngine.play(...)` 的网络往返落地、
+     * [observeMiniPlayer] 收到真实 `nowPlaying` 之前都不会碰 `_miniPlayer`/[restoredWithoutSession]。
+     * 那个窗口期里 `playQueue.current` 已经是 B,`_miniPlayer` 却还是 A 的快照;若这里直接拿
+     * `playQueue.current.value` 当"要补封面的条目",补出来的就是"A 的标题/副标题 + B 的封面"。
+     * 用 [restoredItemId] 核对 [playQueue] 头部条目的 id 是否仍是当初恢复出来的那一个,
+     * 不一致就放弃这次补写——宁可继续显示"没有封面",也不能显示"错的封面"。
+     *
+     * **不引入网络请求。** 只订阅已有的 [baseUrl] `StateFlow`,不主动触发选路——那是
+     * [refreshBaseUrl] 的职责,兜底顺序见其 KDoc,后两级都不联网。
+     */
+    private fun observeBaseUrlForRestoredPoster() {
+        viewModelScope.launch {
+            baseUrl.collect { url ->
+                if (!restoredWithoutSession) return@collect
+                if (url.isBlank()) return@collect
+                val restoredItem = playQueue.current.value ?: return@collect
+                if (restoredItem.id != restoredItemId) return@collect
+                val current = _miniPlayer.value ?: return@collect
+                _miniPlayer.value = current.copy(posterUrl = restoredItem.posterUrl(url))
+            }
         }
     }
 
@@ -273,6 +340,7 @@ class AppSessionViewModel @Inject constructor(
         _miniPlayer.value = null
         playQueue.setQueue(emptyList(), 0)
         restoredWithoutSession = false
+        restoredItemId = null
         viewModelScope.launch { lastPlayedStore.clear() }
     }
 
@@ -315,6 +383,10 @@ class AppSessionViewModel @Inject constructor(
      * 和 [dev.insua.jellycast.feature.player.PlayerViewModel.observePlaybackState] 同样的
      * "绑定 nowPlaying 生命周期的轻量轮询"模式:一旦 [PlayerConnection.nowPlaying] 变化(新条目/
      * 置空),[collectLatest] 自动取消上一个轮询协程,不会有多个轮询并存。
+     *
+     * **和 [observeBaseUrlForRestoredPoster] 的边界**见后者 KDoc:一旦这里收到过一次非 `null` 的
+     * `info`([restoredWithoutSession] 置回 `false`),`_miniPlayer` 之后只由这个函数写,
+     * [observeBaseUrlForRestoredPoster] 会自行短路退出,不会再插手。
      */
     private fun observeMiniPlayer() {
         viewModelScope.launch {

@@ -48,6 +48,26 @@ data class LastPlayed(
      * [MediaKind.EPISODE] 的名字,和这个字段引入前代码里硬编码的行为完全一致,老记录能照常解出来。
      */
     val kind: String = MediaKind.EPISODE.name,
+    /**
+     * 以下五个字段(Task 1,2026-08-06)是播放页实际读取的**结构化**季集信息——
+     * [title]/[subtitle] 只是拼好的显示字符串,播放页顶栏读的是 `MediaItem.seriesName`,
+     * 副标题的 "SxxExx" 由 `MediaItem.displaySubtitle` 从 `seriesName`/`seasonNumber`/
+     * `episodeNumber` 现拼(`:core:model` 的 `Media.kt`),记录里不存这些结构化字段的话,
+     * 冷启动恢复出来的条目顶栏剧名和 S01E02 副标题永远是空的。[seriesId]/[seasonId] 还有功能
+     * 用途:自动连播([AutoPlayNextController])与缓存预取([CachePrefetchController])都靠它们
+     * 找本剧集序,拿不到时会回退到一次网络查询——离线时那次兜底也失败,于是恢复出来再播放的
+     * 条目既不会自动连播也不会预取下一集。
+     *
+     * **必须带默认值,理由和 [kind] 完全一样。** 这五个字段引入之前写盘的旧记录 JSON 里没有
+     * 这些 key,没有默认值的话会在 [lastPlayed] 的 `runCatching` 里直接反序列化失败、
+     * 整条记录被静默丢弃——用户升级 App 后冷启动的迷你条会凭空消失一次。默认给 `null`,
+     * 和这些字段引入前"压根不存在"的效果一致:老记录照常解出来,只是这几项是空的。
+     */
+    val seriesName: String? = null,
+    val seasonNumber: Int? = null,
+    val episodeNumber: Int? = null,
+    val seriesId: String? = null,
+    val seasonId: String? = null,
 )
 
 private val KEY_LAST_PLAYED = stringPreferencesKey("last_played")

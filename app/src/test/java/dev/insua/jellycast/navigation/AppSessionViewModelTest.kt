@@ -6,6 +6,7 @@ import dev.insua.jellycast.datastore.LastPlayed
 import dev.insua.jellycast.datastore.LastPlayedStore
 import dev.insua.jellycast.datastore.ServerStore
 import dev.insua.jellycast.feature.player.PlayerConnection
+import dev.insua.jellycast.model.MediaItem
 import dev.insua.jellycast.model.MediaKind
 import dev.insua.jellycast.network.JellyfinApi
 import dev.insua.jellycast.network.session.JellyfinSession
@@ -75,6 +76,11 @@ class AppSessionViewModelTest {
         imageTag: String? = "tag-1",
         runTimeMs: Long? = 1_800_000L,
         kind: String = MediaKind.EPISODE.name,
+        seriesName: String? = "某剧",
+        seasonNumber: Int? = 1,
+        episodeNumber: Int? = 3,
+        seriesId: String? = "series-1",
+        seasonId: String? = "season-1",
     ) = LastPlayed(
         itemId = itemId,
         positionMs = positionMs,
@@ -84,6 +90,11 @@ class AppSessionViewModelTest {
         runTimeMs = runTimeMs,
         updatedAt = 0L,
         kind = kind,
+        seriesName = seriesName,
+        seasonNumber = seasonNumber,
+        episodeNumber = episodeNumber,
+        seriesId = seriesId,
+        seasonId = seasonId,
     )
 
     /** 默认没有激活服务器(相当于"退出登录"/冷启动还没连过):[refreshBaseUrl] 不会被触发,
@@ -270,6 +281,119 @@ class AppSessionViewModelTest {
         advanceUntilIdle()
 
         assertEquals(MediaKind.EPISODE, queue.current.value?.kind, "无法识别的 kind 应该静默降级,不影响冷启动")
+    }
+
+    // ---- Task 1(2026-08-06):恢复出来的 MediaItem 必须带着结构化季集字段 ----
+    // 之前 restoreLastPlayed 只从记录里读 title/subtitle 拼好的显示字符串,seriesName/
+    // seasonNumber/episodeNumber/seriesId/seasonId 全部漏填——播放页顶栏剧名、S01E02 副标题都是
+    // 空的,自动连播/缓存预取靠 seriesId/seasonId 找本剧集序,拿不到时的网络兜底离线还会失败。
+
+    @Test
+    fun `恢复出来的条目,结构化季集字段与记录一致`() = runTest(testDispatcher) {
+        val queue = PlayQueue()
+        val r = record(
+            seriesName = "某剧",
+            seasonNumber = 2,
+            episodeNumber = 5,
+            seriesId = "series-42",
+            seasonId = "season-7",
+        )
+        newViewModel(lastPlayed = r, playQueue = queue)
+
+        advanceUntilIdle()
+
+        val item = queue.current.value
+        assertNotNull(item, "前提:确实发生过一次恢复")
+        assertEquals("某剧", item!!.seriesName, "恢复出来的条目剧名应与记录一致,播放页顶栏才有内容")
+        assertEquals(2, item.seasonNumber, "恢复出来的条目季号应与记录一致")
+        assertEquals(5, item.episodeNumber, "恢复出来的条目集号应与记录一致")
+        assertEquals("series-42", item.seriesId, "seriesId 缺失会让离线时自动连播/缓存预取的兜底也失败")
+        assertEquals("season-7", item.seasonId, "seasonId 缺失会让离线时自动连播/缓存预取的兜底也失败")
+    }
+
+    // ---- Task 2(2026-08-06):baseUrl 就绪后补写恢复出来的封面 ----
+    // restoreLastPlayed 在 init 里跑,读 baseUrl 时它还是初始空串(refreshBaseUrl 是另一条独立
+    // 异步),posterUrl 因此永远算出 null;_miniPlayer 是一次性快照,baseUrl 后来解析出来了也没人
+    // 重算。这里钉住"当前行为"(第一条)和"必须补上"(第二条,核心断言)。
+
+    @Test
+    fun `恢复时baseUrl还是空串,迷你条posterUrl为null`() = runTest(testDispatcher) {
+        // 默认 fakeServerStore(activeServerId = null):refreshBaseUrl 不会被触发,baseUrl 一直是空串。
+        val viewModel = newViewModel()
+
+        advanceUntilIdle()
+
+        val state = viewModel.miniPlayer.value
+        assertNotNull(state, "前提:确实发生过一次恢复")
+        assertNull(state!!.posterUrl, "baseUrl 还没解析出来时,当前行为就是没有封面")
+    }
+
+    @Test
+    fun `baseUrl随后解析出值,恢复出来的迷你条posterUrl补上,指向恢复出来的那个条目`() = runTest(testDispatcher) {
+        val r = record(itemId = "item-42", imageTag = "tag-42")
+        // activeServerId 非空,init 里的 refreshBaseUrl 才会被触发;session.baseUrl() 模拟这一刻
+        // 选路失败(比如离线),落到 cachedBaseUrlOrNull() 这一级兜底 —— 本进程上次成功解析的地址,
+        // 不联网(brief 里的第二级兜底)。
+        val session = mockk<JellyfinSession>()
+        coEvery { session.baseUrl() } throws IllegalStateException("this-moment selection fails offline")
+        every { session.cachedBaseUrlOrNull() } returns "https://cached.example.com"
+
+        val viewModel = newViewModel(
+            lastPlayed = r,
+            serverStore = fakeServerStore(activeServerId = "server-1"),
+            session = session,
+        )
+
+        advanceUntilIdle()
+
+        val state = viewModel.miniPlayer.value
+        assertNotNull(state, "前提:确实发生过一次恢复")
+        assertNotNull(state!!.posterUrl, "baseUrl 就绪之后,恢复出来的迷你条封面必须补上")
+        assertEquals(
+            "https://cached.example.com/Items/item-42/Images/Primary?maxWidth=400&tag=tag-42",
+            state.posterUrl,
+            "补写的封面必须指向恢复出来的那个条目,不是别的什么 URL",
+        )
+    }
+
+    /**
+     * 复审 Critical:恢复出来的是 A,用户在 baseUrl 解析出来**之前**就点开了另一个条目 B。
+     * [play] 会先同步把 [PlayQueue] 换成 B,但要等真实 `nowPlaying` 落地才会碰 `_miniPlayer`,
+     * 这里模拟的正是那个窗口期——`playQueue.current` 已经是 B、`_miniPlayer` 还是 A 的快照,
+     * baseUrl 恰好在这一刻解析出来。之前的实现只按 `playQueue.current.value` 取条目去补封面,
+     * 会拼出"A 的标题/副标题 + B 的封面"这种缝合状态。
+     */
+    @Test
+    fun `恢复A后baseUrl解析出来之前点开B,迷你条不会变成A的标题拼B的封面`() = runTest(testDispatcher) {
+        val recordA = record(itemId = "item-A", title = "剧A", subtitle = "A 副标题", imageTag = "tag-A")
+        val itemB = MediaItem(id = "item-B", kind = MediaKind.MOVIE, name = "电影B", imageTag = "tag-B")
+
+        val session = mockk<JellyfinSession>()
+        coEvery { session.userId() } returns "user-1"
+        // baseUrl() 模拟"这一刻选路"还没成功(比如公网 HTTPS 探测尚在进行),落到 cachedBaseUrlOrNull()
+        // 这一级不联网的兜底 —— 和上一条用例同样的手法,不代表这条用例在断言"不联网",只是让
+        // baseUrl 能在 play(B) 之后才解析出来,复现窗口期。
+        coEvery { session.baseUrl() } throws IllegalStateException("this-moment selection not settled yet")
+        every { session.cachedBaseUrlOrNull() } returns "https://cached.example.com"
+        val engine = fakeEngine(currentItemId = null)
+
+        val viewModel = newViewModel(lastPlayed = recordA, session = session, engine = engine)
+        advanceUntilIdle()
+
+        val restoredState = viewModel.miniPlayer.value
+        assertNotNull(restoredState, "前提:确实发生过一次恢复")
+        assertEquals("剧A", restoredState!!.title, "前提:恢复出来的是 A")
+
+        // 用户点开了另一个条目 B(不是通过迷你条的续播按钮,是首页/媒体库正常点开一个新条目)。
+        viewModel.play(itemB, listOf(itemB))
+        advanceUntilIdle()
+
+        val state = viewModel.miniPlayer.value
+        assertNotNull(state, "前提:play(B) 之后迷你条仍然非空")
+        assertFalse(
+            state!!.title == recordA.title && state.posterUrl?.contains(itemB.id) == true,
+            "不能把 B 的封面拼到 A 的标题/副标题上,标题=${state.title},封面=${state.posterUrl}",
+        )
     }
 
     // ---- 复审 Task 5 Important 1:换服务器必须重置进程内已经装填好的迷你条/播放队列 ----
