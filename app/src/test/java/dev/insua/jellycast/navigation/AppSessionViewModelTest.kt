@@ -6,6 +6,7 @@ import dev.insua.jellycast.datastore.LastPlayed
 import dev.insua.jellycast.datastore.LastPlayedStore
 import dev.insua.jellycast.datastore.ServerStore
 import dev.insua.jellycast.feature.player.PlayerConnection
+import dev.insua.jellycast.model.MediaItem
 import dev.insua.jellycast.model.MediaKind
 import dev.insua.jellycast.network.JellyfinApi
 import dev.insua.jellycast.network.session.JellyfinSession
@@ -352,6 +353,46 @@ class AppSessionViewModelTest {
             "https://cached.example.com/Items/item-42/Images/Primary?maxWidth=400&tag=tag-42",
             state.posterUrl,
             "补写的封面必须指向恢复出来的那个条目,不是别的什么 URL",
+        )
+    }
+
+    /**
+     * 复审 Critical:恢复出来的是 A,用户在 baseUrl 解析出来**之前**就点开了另一个条目 B。
+     * [play] 会先同步把 [PlayQueue] 换成 B,但要等真实 `nowPlaying` 落地才会碰 `_miniPlayer`,
+     * 这里模拟的正是那个窗口期——`playQueue.current` 已经是 B、`_miniPlayer` 还是 A 的快照,
+     * baseUrl 恰好在这一刻解析出来。之前的实现只按 `playQueue.current.value` 取条目去补封面,
+     * 会拼出"A 的标题/副标题 + B 的封面"这种缝合状态。
+     */
+    @Test
+    fun `恢复A后baseUrl解析出来之前点开B,迷你条不会变成A的标题拼B的封面`() = runTest(testDispatcher) {
+        val recordA = record(itemId = "item-A", title = "剧A", subtitle = "A 副标题", imageTag = "tag-A")
+        val itemB = MediaItem(id = "item-B", kind = MediaKind.MOVIE, name = "电影B", imageTag = "tag-B")
+
+        val session = mockk<JellyfinSession>()
+        coEvery { session.userId() } returns "user-1"
+        // baseUrl() 模拟"这一刻选路"还没成功(比如公网 HTTPS 探测尚在进行),落到 cachedBaseUrlOrNull()
+        // 这一级不联网的兜底 —— 和上一条用例同样的手法,不代表这条用例在断言"不联网",只是让
+        // baseUrl 能在 play(B) 之后才解析出来,复现窗口期。
+        coEvery { session.baseUrl() } throws IllegalStateException("this-moment selection not settled yet")
+        every { session.cachedBaseUrlOrNull() } returns "https://cached.example.com"
+        val engine = fakeEngine(currentItemId = null)
+
+        val viewModel = newViewModel(lastPlayed = recordA, session = session, engine = engine)
+        advanceUntilIdle()
+
+        val restoredState = viewModel.miniPlayer.value
+        assertNotNull(restoredState, "前提:确实发生过一次恢复")
+        assertEquals("剧A", restoredState!!.title, "前提:恢复出来的是 A")
+
+        // 用户点开了另一个条目 B(不是通过迷你条的续播按钮,是首页/媒体库正常点开一个新条目)。
+        viewModel.play(itemB, listOf(itemB))
+        advanceUntilIdle()
+
+        val state = viewModel.miniPlayer.value
+        assertNotNull(state, "前提:play(B) 之后迷你条仍然非空")
+        assertFalse(
+            state!!.title == recordA.title && state.posterUrl?.contains(itemB.id) == true,
+            "不能把 B 的封面拼到 A 的标题/副标题上,标题=${state.title},封面=${state.posterUrl}",
         )
     }
 
