@@ -201,27 +201,78 @@ readTimeout     60s   ← 慢转码不是死服务器;覆盖实测最坏值 46.1
 而 `NavHost` 的 `composable{}` 目的地本来就有 `rememberSaveableStateHolder` 兜着。所以**滚动位置
 确实被保存了** —— 问题出在恢复的那一刻。
 
-### 7.3 首要嫌疑(需先复现确认)
+### 7.3 实测结论(替换掉最初的猜测)
 
-`LazyGrid`/`LazyList` 恢复索引之后,**第一次测量时如果列表是空的,索引会被夹到 0 并覆盖掉恢复值。**
-两条路径都可能造成"返回时列表暂时为空":
+**最初的猜测是错的,已被推翻:** §7.3 原来怀疑"`LazyGrid`/`LazyList` 恢复索引之后,第一次测量时
+如果列表是空的,索引会被夹到 0 并覆盖掉恢复值"。Task 5(复现)、Task 6 各轮修复期间反复用真机
+logcat 核对过多条路径(底部导航栏返回、`returnToHome`、进程回收/Activity 重建专项测试),**这个
+"恢复出索引 → 首次测量为空 → 被夹到 0"的机制在任何一条可达路径上都没有被观测到过**。凡是复现出
+`firstVisibleItemIndex=0` 的路径,观测到的都是"`LibraryViewModel` 被整个重建成一个全新实例,列表
+从未被滚动过",不是"曾经滚到 40、恢复出 40、又被夹回 0"。进程回收(`ListScrollProcessDeathTest`)
+这条本来最有希望观测到"恢复—夹紧"这一步的路径,认真尝试后确认无法复现(见
+`.superpowers/sdd/2026-08-15-high-bitrate-playback-and-scroll-restore/task-5-report.md` 的
+"候选 (i)"一节)。
 
-**(a) 从底部导航栏返回。** `BottomNavBar`(`JellyCastNavHost.kt:266`)用
-`popUpTo(Routes.HOME) { saveState = true }` + `restoreState = true`。`saveState` 保存的是
-`SavedStateHandle`,但被弹出的 `NavBackStackEntry` 会被销毁,**它的 `ViewModelStore` 随之清空** ——
-`LibraryViewModel` 被重建,已加载的分页数据全丢,重新拉第一页。这段时间列表是空的。
+**实测确定的真实成因是两类,都与"索引夹紧"无关:**
 
-**(b) 用返回手势。** 此路径下 `LIBRARY` 条目留在返回栈上,ViewModel 存活,理论上不该丢。
-若实测也丢,说明另有机制,以复现结果为准。
+**(a) `returnToHome` 把 library 这个导航条目彻底销毁,索引从未被存过。** 播放序列结束后触发的
+`navController.navigate(Routes.HOME) { popUpTo(Routes.HOME) { inclusive = true } }`
+**不带 `saveState`**——"library"连同它上面的"detail"被直接销毁、不写入 `backStackMap`,
+`ViewModelStore` 随之清空。用户再点『媒体库』得到的是一个从零加载的全新列表,`firstVisibleItemIndex`
+自然是 0——这不是"恢复错了",是压根没有恢复这回事。
 
-### 7.4 因此:先复现,再修
+**(b) 这个扁平导航图上的一整族"先存后取、取的正是刚存的那份"缺陷。** `NavController`
+(`androidx.navigation:navigation-compose:2.9.8`,经复审反编译 `NavControllerImpl
+.executePopOperations` 确认)在 `popUpTo(X) { saveState = true }` 时,会把被弹出的那一段**写进
+`backStackMap` 两次**:一次以"被弹出的最深的目的地"为键,一次以 `X`(pop 锚点自己)为键。
+只要后续任何一次 `navigate(Y) { restoreState = true }` 命中了这两个键中的一个,就会把当时存的那
+一整段原样恢复回来。本项目的底部导航是单张扁平图(不是每个 tab 一个嵌套 `NavGraph`),多个调用点
+共用 `Routes.HOME` 当 `popUpTo` 锚点,于是同一个"`HOME` 键"在不同调用点之间反复出现"存款人"和
+"取款人"错配,表现为一整族自我循环/自我覆盖的缺陷,在 Task 6 的五轮修复里逐一实测出来:
+- 从 library 的子页面点回『媒体库』图标本身,逐字复刻生产 `NavOptions` 后是彻底的 no-op——
+  `navigate()` 正常返回但返回栈字节级不变(Task 6 Round 0/1)。
+- 底部导航栏对"当前就在自己这个 tab"的点击,原始实现整段状态被销毁,回到自己 tab 时数据重新拉取
+  (Round 1 缺陷 A/Round 2 Critical 1)。
+- 点『在听』tab 退回首页时,若 `HOME` 是 `popUpTo` 锚点且目标也是 `HOME`,`navigate(HOME){
+  popUpTo(HOME){saveState=true}; restoreState=true}` 同一次调用里"存"和"取"互相抵消,点击没有
+  任何反应(Round 4)。
+- 点『在听』先把某段状态存进 `HOME` 键,`returnToHome` 随后作为这个键的取款人把它原样恢复出来,
+  播放结束后没有落在首页,而是落在了刚才存的那个子页面(Round 5,`TabNavInvariantSequenceTest`
+  在 161 条穷举可达序列里测出 3 条违规)。
 
-**这一条不预设修法。** 计划的第一个任务是写一个**能失败的** Compose UI/设备测试:
-列表滚到某个位置 → 进详情 → 返回 → 断言 `firstVisibleItemIndex` 仍在原处。
-拿到红色测试与真实机制之后再定修法,不允许照着 §7.3 的猜测直接改代码。
+真正命中"用户滚到 40 之后返回丢失滚动位置"这条用户可见 bug 的,是 (a)——`returnToHome` 销毁了
+`library` 这个导航条目。(b) 这一整族是同一批底部导航代码里并存的、更严重的独立缺陷(点了没反应/
+落错页面),不是"滚动位置丢失"的成因,但同样在这批修复里一并解决了。详细的实测日志、每一轮的
+候选写法为什么不成立,见
+`.superpowers/sdd/2026-08-15-high-bitrate-playback-and-scroll-restore/task-5-report.md` 与
+`task-6-report.md`。
 
-修法方向以「让列表在返回时**不为空**」为准(保住数据),而不是「把滚动索引再存一份」——
-后者是绕过症状:数据没回来的时候把索引强行设回去,只会滚到一个还没加载的位置。
+### 7.4 修法:实测结果(不再是"先复现,再定修法"的待办)
+
+原文这里写的是执行前的流程要求("先写能失败的测试,再定修法,不允许照 §7.3 的猜测直接改代码")——
+这条流程本身被完整执行了(Task 5 只复现不修,Task 6 才动代码),现按实测结果记录最终做法。
+
+**修法方向确实如原文所猜的"让数据不为空"(保住数据),但机制不是"重新拉数据更快",而是让承载
+数据的导航条目本身存活。** `app/src/main/java/dev/insua/jellycast/navigation/TabNavAction.kt`
+把"点某个 tab 该做什么""播放结束回首页时哪段状态值得保留"提成两个纯函数
+(`tabNavAction`、`restorableTabOwner`),配套两个执行体
+(`NavController.executeTabNavAction` / `executeReturnToHome`),取代原来散落在
+`JellyCastNavHost.kt` 里、各自手写 `NavOptions` 的写法。核心不变式写进了该文件顶部的 KDoc:
+
+> 凡是会被当成 `popUpTo`/`popBackStack` 锚点、且带 `saveState = true` 的目的地(本项目里只有
+> `Routes.HOME`),都不许成为 `navigate(…){ restoreState = true }` 的目标。
+
+修完之后,全项目带 `saveState`/`restoreState` 的 `NavOptions` 组合只剩一处
+(`TabNavAction.kt` 内部),`returnToHome`/底部导航栏/首页搜索入口统一改成调用同一批执行体。
+守卫这条不变式的是设备测试
+`app/src/androidTest/java/dev/insua/jellycast/navigation/TabNavInvariantSequenceTest.kt`
+(在真实 `NavController` 上穷举深度 ≤3 的可达动作序列)——JVM 单测测不到这条:
+`backStackMap` 的读写是 `NavController` 内部状态,不在两个纯函数的输入输出里。
+
+用户报的"滚动位置丢失"由 `LibraryScreenTest`/`ListScrollRestoreTest` 里
+`播放序列结束返回首页后再次进入媒体库滚动位置保持` 等用例守护——`library` 这个
+`NavBackStackEntry`(连同它的 `ViewModelStore`/`SaveableStateHolder`)存活是滚动位置保持的
+充分条件,全程没有触碰任何 `LazyGridState`,不是"把索引再存一份"这种绕过症状的做法。
 
 ### 7.5 范围
 
