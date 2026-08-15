@@ -471,4 +471,23 @@ class PlaybackSourceResolverTest {
             assertFalse(source.streamUrl.contains(param), "L1 URL 不该出现 $param:${source.streamUrl}")
         }
     }
+
+    /**
+     * `L3兜底URL带上视频降码率与音频转码参数` 只用了默认 resolver,而默认的 `audioBitRateBps`
+     * 恰好等于 `DEFAULT_AUDIO_BIT_RATE_BPS`(128 000)—— 所以就算 `buildVideoStreamUrl` 把
+     * `audioBitRate` 写死成 `128000` 而不是真正拼 `audioBitRateBps` 参数,那条测试也测不出来。
+     *
+     * 镜像 [L1 的 URL 携带 spike 验证过的参数](第 76 行)的写法:用非默认 `audioBitRateBps`
+     * 构造 resolver,断言这个值真的流进了 L3 URL,而不是默认值。
+     */
+    @Test
+    fun `L3的URL携带非默认audioBitRateBps`() = runTest {
+        val resolver = newResolver(probe(emptySet()), audioBitRateBps = 64_000)   // 走 L3
+
+        val source = resolver.resolve(TEST_ITEM_ID, TEST_USER_ID)
+
+        assertEquals(AudioDeliveryLevel.CLIENT_VIDEO_DISABLED, source.level)
+        assertTrue(source.streamUrl.contains("audioBitRate=64000"), source.streamUrl)
+        assertFalse(source.streamUrl.contains("audioBitRate=128000"), source.streamUrl)
+    }
 }
