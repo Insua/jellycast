@@ -269,9 +269,12 @@ private fun BottomNavBar(currentRoute: String?, navController: NavHostController
             NavigationBarItem(
                 selected = currentRoute == tab.route,
                 // 决策本身是纯函数(tabNavAction,见 TabNavAction.kt——离线可单测,项目铁律 6),
-                // 这里只负责执行它返回的结果。
+                // 这里只负责执行它返回的结果。栈里现有的路由要现取——子页面可以不经过 tab 根就被
+                // 直接推入栈(比如首页「我的媒体」库卡片直连 library/view/{id}),tabNavAction 得
+                // 知道根在不在栈上才能决定能不能退。
                 onClick = {
-                    when (val action = tabNavAction(currentRoute, tab.route)) {
+                    val stackRoutes = navController.currentBackStack.value.map { it.destination.route }
+                    when (val action = tabNavAction(currentRoute, tab.route, stackRoutes)) {
                         TabNavAction.None -> Unit
                         is TabNavAction.PopToTabRoot -> navController.popBackStack(action.route, inclusive = false)
                         is TabNavAction.SwitchTab -> navController.navigate(action.route) {

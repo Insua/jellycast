@@ -245,6 +245,69 @@ class ListScrollRestoreTest {
     }
 
     /**
+     * **Fix round 3 —— Critical 的回归用例。**
+     *
+     * Fix round 2 的 `tabNavAction` 只按路由前缀判断"当前路由是否属于这个 tab",不管
+     * `"library"` 根本身在不在返回栈上——首页「我的媒体」库卡片直连
+     * `Routes.libraryView(libraryId)`(`onLibraryClick`),从未 push 过 `"library"`。复审实测:
+     * 从这条路径点『媒体库』tab,`tabNavAction` 返回 `PopToTabRoot("library")`,执行方
+     * `navController.popBackStack("library", inclusive = false)` 找不到目标、返回 `false`、
+     * 不改动任何东西——**点了没反应**,和"点自己所在 tab 是 no-op"是同一种症状,只是换了条
+     * 触发路径。
+     *
+     * 修好之后:`tabNavAction` 多接一个 `stackRoutes` 参数,只有"根真的在栈上"才返回
+     * `PopToTabRoot`,否则退到 `SwitchTab`——一次全新 push,正常落地在列表上。
+     */
+    @Test
+    fun 从首页直接进按库浏览页点媒体库tab时能到达列表() {
+        var lastBackstack: List<BackStackEntrySnapshot> = emptyList()
+        composeTestRule.setContent {
+            TestNavRoot(onBackstackChanged = { lastBackstack = it })
+        }
+
+        composeTestRule.onNodeWithTag(HOME_OPEN_LIBRARY_VIEW_TAG).performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag(LIBRARY_VIEW_TAG).assertExists()
+        Log.i(TAG, "[库卡片直连→媒体库tab] 点击前 backstack=$lastBackstack")
+
+        composeTestRule.onNodeWithTag(BOTTOM_NAV_TAG).performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.waitForLibraryContentSettled()
+        Log.i(TAG, "[库卡片直连→媒体库tab] 点击后 backstack=$lastBackstack")
+
+        composeTestRule.onNodeWithTag(LIBRARY_VIEW_TAG).assertDoesNotExist()
+        val after = composeTestRule.firstVisibleItemIndex()
+        assert(after >= 0) {
+            "从首页直连按库浏览页后点『媒体库』tab,应当到达媒体库列表(firstVisibleItemIndex >= 0)," +
+                "实际 firstVisibleItemIndex=$after —— 说明点击没有产生任何效果。"
+        }
+    }
+
+    /** 同上,多钻一层(`library/view/{id}` → `library/series/{id}`)——`"library"` 依然不在栈上,
+     *  结论不变。 */
+    @Test
+    fun 从首页直接进按库浏览页再打开一集后点媒体库tab时能到达列表() {
+        composeTestRule.setContent { TestNavRoot() }
+
+        composeTestRule.onNodeWithTag(HOME_OPEN_LIBRARY_VIEW_TAG).performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag(LIBRARY_VIEW_OPEN_SERIES_TAG).performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag(DETAIL_TAG).assertExists()
+
+        composeTestRule.onNodeWithTag(BOTTOM_NAV_TAG).performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.waitForLibraryContentSettled()
+
+        composeTestRule.onNodeWithTag(DETAIL_TAG).assertDoesNotExist()
+        val after = composeTestRule.firstVisibleItemIndex()
+        assert(after >= 0) {
+            "从首页直连按库浏览页再打开一集后点『媒体库』tab,应当到达媒体库列表" +
+                "(firstVisibleItemIndex >= 0),实际 firstVisibleItemIndex=$after。"
+        }
+    }
+
+    /**
      * **Fix round 2 —— Important 4 的回归用例。**
      *
      * 设置 tab 下的「管理服务器」(`Routes.SERVERS`)不在 `"settings/"` 前缀下(它同时也是登录前
@@ -298,6 +361,7 @@ internal const val DETAIL_TAG = "test_detail_screen"
 internal const val HOME_TAG = "test_home_screen"
 internal const val HOME_OPEN_LIBRARY_VIEW_TAG = "test_home_open_library_view_button"
 internal const val LIBRARY_VIEW_TAG = "test_library_view_screen"
+internal const val LIBRARY_VIEW_OPEN_SERIES_TAG = "test_library_view_open_series_button"
 internal const val SETTINGS_TAG = "test_settings_screen"
 internal const val SETTINGS_MANAGE_SERVERS_TAG = "test_settings_manage_servers_button"
 internal const val SERVERS_TAG = "test_servers_screen"
@@ -418,11 +482,19 @@ internal fun SeriesDetailDestination(seriesId: String) {
 }
 
 /** [Routes.LIBRARY_VIEW_PATTERN] 目的地——首页「我的媒体」库卡片直连,中途不经过
- *  [Routes.LIBRARY]。 */
+ *  [Routes.LIBRARY]。多带一个"点条目进详情"按钮,逐字复刻生产
+ *  `LibraryContentsScreen` 的 `onSeriesClick = { seriesId -> navController.navigate(Routes.seriesDetail(seriesId)) }`
+ *  ——用来复现"从这条路径再往下钻一层"的场景(`"library"` 依然不在栈上)。 */
 @Composable
-internal fun LibraryViewDestination(libraryId: String) {
+internal fun LibraryViewDestination(navController: NavHostController, libraryId: String) {
     val vm: FakeLibraryViewViewModel = viewModel()
-    Text("按库浏览 $libraryId (vm#${vm.instanceId})", modifier = Modifier.testTag(LIBRARY_VIEW_TAG))
+    Column {
+        Text("按库浏览 $libraryId (vm#${vm.instanceId})", modifier = Modifier.testTag(LIBRARY_VIEW_TAG))
+        Button(
+            onClick = { navController.navigate(Routes.seriesDetail("s1")) },
+            modifier = Modifier.testTag(LIBRARY_VIEW_OPEN_SERIES_TAG),
+        ) { Text("打开一集") }
+    }
 }
 
 /** [Routes.HOME] 目的地——多带一个「我的媒体」库卡片按钮,逐字复刻生产
@@ -513,7 +585,9 @@ internal fun TestNavRoot(onBackstackChanged: (List<BackStackEntrySnapshot>) -> U
                         // 版本)——直接调用生产纯函数 tabNavAction,不是重新手写一份"像"它的逻辑。
                         Button(
                             onClick = {
-                                when (val action = tabNavAction(currentRoute, route)) {
+                                val stackRoutes =
+                                    navController.currentBackStack.value.map { it.destination.route }
+                                when (val action = tabNavAction(currentRoute, route, stackRoutes)) {
                                     TabNavAction.None -> Unit
                                     is TabNavAction.PopToTabRoot ->
                                         navController.popBackStack(action.route, inclusive = false)
@@ -544,7 +618,7 @@ internal fun TestNavRoot(onBackstackChanged: (List<BackStackEntrySnapshot>) -> U
             }
             composable(Routes.LIBRARY_VIEW_PATTERN) { entry ->
                 val libraryId = entry.arguments?.getString("libraryId").orEmpty()
-                LibraryViewDestination(libraryId = libraryId)
+                LibraryViewDestination(navController = navController, libraryId = libraryId)
             }
             composable(Routes.SETTINGS) { SettingsDestination(navController = navController) }
             composable(Routes.SERVERS) { ServersDestination() }

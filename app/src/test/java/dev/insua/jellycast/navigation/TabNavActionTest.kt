@@ -5,34 +5,90 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Test
 
 /**
- * `tabNavAction` / `restorableTabOwner` 是纯函数,离线可单测(项目铁律 6)——这是 Fix round 2
- * 对复审 Important 5("变异证据只证明了镜像,没证明生产函数")的直接回应:这里测的、下面
+ * `tabNavAction` / `restorableTabOwner` 是纯函数,离线可单测(项目铁律 6)——这里测的、下面
  * mutation 验证要打的,都是 `TabNavAction.kt` 里的**生产代码本身**,不是 Compose 测试里搭的镜像。
  *
  * 表驱动覆盖三个 tab 根(`home`/`library`/`settings`)、`library` 的三种子路由模式
- * (`series`/`collection`/`view`)、非 CHROME_ROUTES 的 `servers`,以及 `null`(导航还没就绪时
- * `currentRoute` 的取值)。
+ * (`series`/`collection`/`view`)、非 CHROME_ROUTES 的 `servers`、`null`(导航还没就绪时
+ * `currentRoute` 的取值),以及"子页面所属的 tab 根不在返回栈上"(首页库卡片直连场景)。
  */
 class TabNavActionTest {
 
     @Test fun `已经站在tab根上什么都不做`() {
-        assertEquals(TabNavAction.None, tabNavAction(currentRoute = Routes.HOME, tabRoute = Routes.HOME))
-        assertEquals(TabNavAction.None, tabNavAction(currentRoute = Routes.LIBRARY, tabRoute = Routes.LIBRARY))
-        assertEquals(TabNavAction.None, tabNavAction(currentRoute = Routes.SETTINGS, tabRoute = Routes.SETTINGS))
+        assertEquals(
+            TabNavAction.None,
+            tabNavAction(currentRoute = Routes.HOME, tabRoute = Routes.HOME, stackRoutes = listOf(Routes.HOME)),
+        )
+        assertEquals(
+            TabNavAction.None,
+            tabNavAction(
+                currentRoute = Routes.LIBRARY,
+                tabRoute = Routes.LIBRARY,
+                stackRoutes = listOf(Routes.HOME, Routes.LIBRARY),
+            ),
+        )
+        assertEquals(
+            TabNavAction.None,
+            tabNavAction(
+                currentRoute = Routes.SETTINGS,
+                tabRoute = Routes.SETTINGS,
+                stackRoutes = listOf(Routes.HOME, Routes.SETTINGS),
+            ),
+        )
     }
 
-    @Test fun `子页面点回自己所在tab退回根`() {
+    /** 正常路径:先进了「媒体库」tab 根,再点进子页面——根还在栈上,点回 tab 退回它。 */
+    @Test fun `子页面点回自己所在tab时根在栈上就退回根`() {
+        val stackViaLibraryRoot = listOf(Routes.HOME, Routes.LIBRARY, Routes.SERIES_DETAIL_PATTERN)
         assertEquals(
             TabNavAction.PopToTabRoot(Routes.LIBRARY),
-            tabNavAction(currentRoute = Routes.SERIES_DETAIL_PATTERN, tabRoute = Routes.LIBRARY),
+            tabNavAction(Routes.SERIES_DETAIL_PATTERN, Routes.LIBRARY, stackViaLibraryRoot),
         )
         assertEquals(
             TabNavAction.PopToTabRoot(Routes.LIBRARY),
-            tabNavAction(currentRoute = Routes.COLLECTION_DETAIL_PATTERN, tabRoute = Routes.LIBRARY),
+            tabNavAction(
+                Routes.COLLECTION_DETAIL_PATTERN,
+                Routes.LIBRARY,
+                listOf(Routes.HOME, Routes.LIBRARY, Routes.COLLECTION_DETAIL_PATTERN),
+            ),
         )
         assertEquals(
             TabNavAction.PopToTabRoot(Routes.LIBRARY),
-            tabNavAction(currentRoute = Routes.LIBRARY_VIEW_PATTERN, tabRoute = Routes.LIBRARY),
+            tabNavAction(
+                Routes.LIBRARY_VIEW_PATTERN,
+                Routes.LIBRARY,
+                listOf(Routes.HOME, Routes.LIBRARY, Routes.LIBRARY_VIEW_PATTERN),
+            ),
+        )
+    }
+
+    /**
+     * **Fix round 3 的回归用例。** 首页「我的媒体」库卡片直连 `Routes.libraryView(id)`
+     * (`JellyCastNavHost.kt` 的 `onLibraryClick`),从未 push 过 `"library"` 本身——这条路径上
+     * `"library"` 根本不在栈里。点『媒体库』tab 必须走 [TabNavAction.SwitchTab](一次全新
+     * push,能正常落地在列表上),不能返回 [TabNavAction.PopToTabRoot]——那样执行方
+     * `popBackStack("library", inclusive = false)` 会找不到目标、返回 `false`、不改动任何东西,
+     * 点了没反应,和"点自己所在 tab 是 no-op"是同一种症状。
+     *
+     * 同时覆盖从 `library/view/{id}` 再往下钻进 `library/series/{id}` 的情形——`"library"`
+     * 依然不在栈里,结论不变。
+     */
+    @Test fun `子页面所属tab根不在栈上时跨tab切换而不是退回根`() {
+        assertEquals(
+            TabNavAction.SwitchTab(Routes.LIBRARY),
+            tabNavAction(
+                currentRoute = Routes.LIBRARY_VIEW_PATTERN,
+                tabRoute = Routes.LIBRARY,
+                stackRoutes = listOf(Routes.HOME, Routes.LIBRARY_VIEW_PATTERN),
+            ),
+        )
+        assertEquals(
+            TabNavAction.SwitchTab(Routes.LIBRARY),
+            tabNavAction(
+                currentRoute = Routes.SERIES_DETAIL_PATTERN,
+                tabRoute = Routes.LIBRARY,
+                stackRoutes = listOf(Routes.HOME, Routes.LIBRARY_VIEW_PATTERN, Routes.SERIES_DETAIL_PATTERN),
+            ),
         )
     }
 
@@ -43,46 +99,55 @@ class TabNavActionTest {
      * 归属关系。
      */
     @Test fun `在库详情页点在听是跨tab切换不是退回home根`() {
+        val stack = listOf(Routes.HOME, Routes.LIBRARY, Routes.SERIES_DETAIL_PATTERN)
+        assertEquals(TabNavAction.SwitchTab(Routes.HOME), tabNavAction(Routes.SERIES_DETAIL_PATTERN, Routes.HOME, stack))
         assertEquals(
             TabNavAction.SwitchTab(Routes.HOME),
-            tabNavAction(currentRoute = Routes.SERIES_DETAIL_PATTERN, tabRoute = Routes.HOME),
-        )
-        assertEquals(
-            TabNavAction.SwitchTab(Routes.HOME),
-            tabNavAction(currentRoute = Routes.LIBRARY_VIEW_PATTERN, tabRoute = Routes.HOME),
+            tabNavAction(
+                currentRoute = Routes.LIBRARY_VIEW_PATTERN,
+                tabRoute = Routes.HOME,
+                stackRoutes = listOf(Routes.HOME, Routes.LIBRARY_VIEW_PATTERN),
+            ),
         )
     }
 
     @Test fun `library的子页面点设置或在听都是跨tab切换`() {
+        val stack = listOf(Routes.HOME, Routes.LIBRARY, Routes.SERIES_DETAIL_PATTERN)
         assertEquals(
             TabNavAction.SwitchTab(Routes.SETTINGS),
-            tabNavAction(currentRoute = Routes.SERIES_DETAIL_PATTERN, tabRoute = Routes.SETTINGS),
+            tabNavAction(Routes.SERIES_DETAIL_PATTERN, Routes.SETTINGS, stack),
         )
     }
 
     /** `servers` 不挂在 `"settings/"` 前缀下(它同时也是登录前的顶层路由),不算「设置」的子页面。 */
     @Test fun `servers不算settings的子页面`() {
+        val stack = listOf(Routes.HOME, Routes.SETTINGS, Routes.SERVERS)
+        assertEquals(TabNavAction.SwitchTab(Routes.SETTINGS), tabNavAction(Routes.SERVERS, Routes.SETTINGS, stack))
         assertEquals(
             TabNavAction.SwitchTab(Routes.SETTINGS),
-            tabNavAction(currentRoute = Routes.SERVERS, tabRoute = Routes.SETTINGS),
-        )
-        assertEquals(
-            TabNavAction.SwitchTab(Routes.SETTINGS),
-            tabNavAction(currentRoute = Routes.SERVERS_ADD, tabRoute = Routes.SETTINGS),
+            tabNavAction(Routes.SERVERS_ADD, Routes.SETTINGS, stack + Routes.SERVERS_ADD),
         )
     }
 
-    /** 前缀匹配必须带上分隔符——不能因为字符串"长得像"就误判归属(比如假想的 `libraryx` 路由)。 */
+    /** 前缀匹配必须带上分隔符——不能因为字符串"长得像"就误判归属(比如假想的 `libraryx` 路由),
+     *  即便栈里真的有 `"library"`。 */
     @Test fun `前缀匹配不能没有分隔符就命中`() {
         assertEquals(
             TabNavAction.SwitchTab(Routes.LIBRARY),
-            tabNavAction(currentRoute = "libraryx", tabRoute = Routes.LIBRARY),
+            tabNavAction(
+                currentRoute = "libraryx",
+                tabRoute = Routes.LIBRARY,
+                stackRoutes = listOf(Routes.HOME, Routes.LIBRARY, "libraryx"),
+            ),
         )
     }
 
     /** 导航还没就绪时 `currentBackStackEntryAsState()` 可能给出 `null`——不能崩,按"跨 tab 切换"处理。 */
     @Test fun `currentRoute为null时按跨tab切换处理`() {
-        assertEquals(TabNavAction.SwitchTab(Routes.HOME), tabNavAction(currentRoute = null, tabRoute = Routes.HOME))
+        assertEquals(
+            TabNavAction.SwitchTab(Routes.HOME),
+            tabNavAction(currentRoute = null, tabRoute = Routes.HOME, stackRoutes = emptyList()),
+        )
     }
 
     // ---- restorableTabOwner ----
