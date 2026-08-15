@@ -1,6 +1,8 @@
 package dev.insua.jellycast.navigation
 
 import android.util.Log
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
@@ -50,41 +52,33 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * 复现任务(Task 5,只复现不修,详见
- * `.superpowers/sdd/2026-08-15-high-bitrate-playback-and-scroll-restore/task-5-brief.md`),
- * **Fix round 1 之后的版本**——上一轮复审(Critical 1/2/3)推翻了 round 0 的"从底部导航栏返回"
- * 用例:那个红是靠去掉 `restoreState = true` 造出来的,用户实际走不到那个状态(详见下方
- * [从详情页点回自己所在tab时navigate是no_op_已确认缺陷] 和 `task-5-report.md` 的 fix round 1 节)。
+ * 复现/回归任务(Task 5 起,详见 `.superpowers/sdd/2026-08-15-high-bitrate-playback-and-scroll-restore/`
+ * 下 task-5/task-6 的 brief 与 report)。**Fix round 2 之后的版本。**
  *
  * 已排除"忘了用 rememberSaveable"——四个列表用的都是 saveable 支撑的滚动状态
  * ([dev.insua.jellycast.feature.library.LibraryScreen] 的 `gridState`)。这里手搭一个最小
- * `NavHost`,这一轮起**三个** `navigate` 调用全部逐字复刻生产代码,不再有任何 navOptions 层面
- * 的裁剪:
+ * `NavHost`,尽量贴近生产的真实结构:
  *
- * - 底部导航栏(`JellyCastNavHost.kt:266`):`popUpTo(HOME){saveState=true} + launchSingleTop
- *   + restoreState=true`。
- * - 播放序列结束回首页(`JellyCastNavHost.kt:105-108`,`AppSessionViewModel.returnToHome`
- *   触发):`popUpTo(HOME){inclusive=true} + launchSingleTop`,**没有** `saveState`。
- * - 剧集条目点进详情(`JellyCastNavHost.kt:190`):无特殊 `NavOptions`。
+ * - **三个 tab**(在听/媒体库/设置),路由字符串直接复用 [Routes] 里的常量/工厂函数——不是
+ *   照着敲一遍长得像的字符串,是同一份真值来源。
+ * - **底部导航栏的决策**直接调用生产纯函数 [tabNavAction](`TabNavAction.kt`),不再手写一份
+ *   `when` 分支去"模拟"它——Fix round 2 复审的 Important 5 明确指出:round 1 的变异验证只打在
+ *   测试镜像上,生产代码从来没被验证过。现在镜像和生产用的是**同一个函数**,不存在"镜像跟生产
+ *   代码不同步"的问题。
+ * - **`returnToHome` 的决策**同样调用生产纯函数 [restorableTabOwner],只有 `popBackStack`/
+ *   `navigate` 这两行必须触碰真实 `NavController` 的部分留在这里手写(无法抽成纯函数)。
+ * - **子路由用真实的模式**:`library/series/{seriesId}`、`library/view/{libraryId}`、
+ *   `settings` 下挂一个不带 `"settings/"` 前缀的 `servers`——round 1 的镜像只有一个
+ *   `detail/{seriesId}`,和生产的路由表形状不一样,所以看不见 Critical 2(`library/view` 从
+ *   首页直连,中途不经过 `"library"`)和 Important 4(`servers` 不该被当成 `settings` 的一部分
+ *   存起来)。
+ * - **`returnToHome` 触发按钮是顶层常驻的**,不再塞在某个具体子页面里——生产里它是
+ *   `JellyCastNavHost` 顶层的 `LaunchedEffect(returnToHome)`,不依赖当前站在哪个目的地上,
+ *   这样才能从"库详情页"以外的地方(比如 `library/view`、`servers`)也触发它。
  *
- * **这一轮验证出的两件事:**
- *
- * 1. **底部导航栏那个 no-op 是确认缺陷,不是待查疑点。** 见
- *    [从详情页点回自己所在tab时navigate是no_op_已确认缺陷]——从 "library" 的子页面点回
- *    "library" 自己的 tab 图标,`navController.navigate(...)` 正常返回、不抛异常,但返回栈
- *    (entry id、当前路由)真的一次都没变,用户仍然停在详情页。这与用户报的"回到了列表但滚动
- *    到顶部"是**不同的症状**,所以不能拿它当"滚动丢失"的复现,但它本身是一个真实、可达的缺陷。
- * 2. **一条可达的路径,真的复现出滚动丢失:** 播放序列结束 → 自动回首页
- *    (`popUpTo(HOME){inclusive=true}`,没有 `saveState`,"library" 连同它上面的 "detail" 被
- *    彻底销毁,不留任何可恢复的痕迹)→ 用户再次点『媒体库』tab。此时 "library" 已经不在返回栈
- *    上,`popUpTo(HOME)` 找不到东西可弹,`restoreState=true` 在 `backStackMap` 里也找不到
- *    "library" 的 id(它从来没有被 `saveState=true` 保存过)——于是这是一次彻头彻尾的全新
- *    push:全新 `NavBackStackEntry`、全新 `ViewModelStore`、全新 `LazyGridState`。见
- *    [播放序列结束返回首页后再次进入媒体库滚动位置丢失]。
- *
- * `FakeLibraryViewModel` 的数据**异步**到货(模拟真实 [LibraryViewModel.loadLibrary] 要走一次
- * 网络往返这件事),`instanceId` + [Log] 把"ViewModel 有没有被重建"直接打进 logcat,不是从代码
- * 读出来的推测。
+ * `FakeLibraryViewModel` / `FakeLibraryViewViewModel` 的数据**异步**到货(模拟真实 ViewModel 要
+ * 走一次网络往返这件事),`instanceId` + [Log] 把"ViewModel 有没有被重建/清除"直接打进 logcat,
+ * 不是从代码读出来的推测。
  */
 @RunWith(AndroidJUnit4::class)
 class ListScrollRestoreTest {
@@ -111,17 +105,10 @@ class ListScrollRestoreTest {
     }
 
     /**
-     * **Task 6 —— 缺陷 A 修好之后,把这条用例的语义从"确认缺陷存在"翻转成"确认修好了"。**
-     *
-     * 修复前:`navigate(tab.route){popUpTo(HOME){saveState=true};launchSingleTop;restoreState=true}`
-     * 在这个扁平图里是彻底的 no-op(见本文件顶部 KDoc 和 `task-6-brief.md` 的分析)——从详情页点
-     * 「媒体库」tab,界面停在原地。
-     *
-     * 修好之后(`BottomNavBar` 改用 `navController.popBackStack(tab.route, inclusive = false)`
-     * 兜底):同样的点击应该**退回该 tab 的根**——detail 被弹出,当前路由变回 "library"——而且
-     * `popBackStack` 保住的是**同一个** `NavBackStackEntry`,所以 "library" 的 entry id 点击前后
-     * 必须一致(证明保住的是原来那个条目、连同它的 `ViewModelStore`/`SaveableStateHolder`,不是
-     * 重新 push 出来的新条目)。
+     * 缺陷 A(详情页点回自己所在 tab 是 no-op)修好之后的正确行为:退回 tab 根,`popBackStack`
+     * 保住的是**同一个** `NavBackStackEntry`,`library` 的 entry id 点击前后必须一致——证明保住
+     * 的是原来那个条目、连同它的 `ViewModelStore`/`SaveableStateHolder`,不是重新 push 出来的
+     * 新条目。
      */
     @Test
     fun 从详情页点回自己所在tab时退回tab根且保住同一个条目() {
@@ -133,7 +120,7 @@ class ListScrollRestoreTest {
         composeTestRule.enterLibraryAndOpenDetailAt(SCROLL_TARGET_INDEX)
         val beforeClick = lastBackstack
         Log.i(TAG, "[退回 tab 根探测] 点击前 backstack=$beforeClick")
-        val libraryIdBefore = beforeClick.single { it.route == "library" }.id
+        val libraryIdBefore = beforeClick.single { it.route == Routes.LIBRARY }.id
 
         composeTestRule.onNodeWithTag(BOTTOM_NAV_TAG).performClick()
         composeTestRule.waitForIdle()
@@ -141,14 +128,12 @@ class ListScrollRestoreTest {
         val afterClick = lastBackstack
         Log.i(TAG, "[退回 tab 根探测] 点击后 backstack=$afterClick")
 
-        // 退回了 tab 根:detail 被弹出,当前落在 "library"。
-        assert(afterClick.last().route == "library") {
+        assert(afterClick.last().route == Routes.LIBRARY) {
             "点『媒体库』tab 后应当退回它的根(library),实际最终路由=${afterClick.last().route}"
         }
         composeTestRule.onNodeWithTag(DETAIL_TAG).assertDoesNotExist()
 
-        // 保住的是同一个条目,不是重新 push 出来的新条目——entry id 必须不变。
-        val libraryIdAfter = afterClick.single { it.route == "library" }.id
+        val libraryIdAfter = afterClick.single { it.route == Routes.LIBRARY }.id
         assert(libraryIdAfter == libraryIdBefore) {
             "退回「媒体库」应保住同一个 NavBackStackEntry(id 不变),实际点击前 id=$libraryIdBefore," +
                 "点击后 id=$libraryIdAfter —— 说明这是重新 push 的新条目,ViewModelStore/滚动状态会丢。"
@@ -156,34 +141,66 @@ class ListScrollRestoreTest {
     }
 
     /**
-     * **Fix round 1 —— 复审指出的可达路径 (ii)。**
+     * **Fix round 2 —— Critical 1 的回归用例。**
      *
-     * `JellyCastNavHost.kt:105-108`:播放序列结束(整部剧播完/电影播完)时,
-     * `AppSessionViewModel.returnToHome` 变 true,触发
-     * `navigate(HOME){ popUpTo(HOME){inclusive=true}; launchSingleTop=true }`——**没有
-     * `saveState`**,"library" 连同它上面的 "detail" 被彻底销毁,不留任何 `backStackMap` 记录。
+     * Fix round 1 里 `BottomNavBar` 对"在听"(`HOME`)tab 无条件走
+     * `navController.popBackStack(tab.route, inclusive = false)` 的返回值当条件——`HOME` 是起始
+     * 目的地,永远在栈底,这个调用对**任何**当前路由都会"成功"(把它上面的一切弹光,不带
+     * `saveState`)。从库详情页点「在听」会被误判成"退回 HOME 的根",把「媒体库」的整段状态
+     * (`library` + `library/series/{id}`)直接销毁——复审实测:滚动到 40 → 点「在听」→ 点
+     * 「媒体库」→ `firstVisibleItemIndex=0`,`ViewModelStore` 被清空,列表从第一页重新拉取。
      *
-     * 用户流程:滚动媒体库列表 → 点进一部剧的详情(模拟"看了一集,期间播放序列结束") →
-     * 触发这次 `returnToHome` → 回到首页 → 再点一次『媒体库』tab。此时 "library" 已经不在
-     * 返回栈上,第二次点『媒体库』的 `popUpTo(HOME)` 找不到东西可弹、`restoreState=true` 在
-     * `backStackMap` 里也找不到 "library" 的 id——是一次彻底全新的 push,全新 `ViewModelStore`、
-     * 全新 `LazyGridState`。
-     *
-     * 断言:`firstVisibleItemIndex` 应该 `>= MIN_ACCEPTABLE_INDEX`(不应该丢),实测应为红。
+     * 修好之后(`tabNavAction` 按路由前缀判断归属,`HOME` 没有任何 `"home/"` 前缀的子路由):
+     * 从库详情页点「在听」落在 [TabNavAction.SwitchTab] 分支,带 `saveState=true`,「媒体库」的
+     * 状态被保留。切回「媒体库」时,`restoreState` 恢复的是离开时那一整段(`library` +
+     * `library/series/{id}`),**先落在详情页**——这是正常的跨 tab 切换语义(复审明确认可:
+     * "Landing first on the detail screen they were on, with the grid beneath it intact,
+     * satisfies this — that is normal tab behaviour"),退一步才看得到列表本身,验证滚动位置
+     * 没丢。
      */
     @Test
-    fun 播放序列结束返回首页后再次进入媒体库滚动位置丢失() {
+    fun 从库详情页切到别的tab再切回媒体库时状态不丢() {
         composeTestRule.setContent { TestNavRoot() }
 
         composeTestRule.enterLibraryAndOpenDetailAt(SCROLL_TARGET_INDEX)
 
-        // 逐字复刻 JellyCastNavHost.kt:105-108 的 returnToHome 效应。
+        composeTestRule.onNodeWithTag(BOTTOM_NAV_HOME_TAG).performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag(HOME_TAG).assertExists()
+
+        composeTestRule.onNodeWithTag(BOTTOM_NAV_TAG).performClick()
+        composeTestRule.waitForIdle()
+        // 正常的跨 tab 恢复语义:落在离开时所在的子页面(详情页),不是列表本身。
+        composeTestRule.onNodeWithTag(DETAIL_TAG).assertExists()
+
+        Espresso.pressBack()
+        composeTestRule.waitForIdle()
+        composeTestRule.waitForLibraryContentSettled()
+
+        val after = composeTestRule.firstVisibleItemIndex()
+        Log.i(TAG, "[Critical1 回归] afterIndex=$after")
+        assert(after >= MIN_ACCEPTABLE_INDEX) {
+            "从库详情页切到别的 tab 再切回来,详情页底下的媒体库列表滚动位置应保持" +
+                "(firstVisibleItemIndex >= $MIN_ACCEPTABLE_INDEX),实际 firstVisibleItemIndex=$after"
+        }
+    }
+
+    /**
+     * `returnToHome`(播放序列结束回首页)修好之后的正确行为:从库详情页触发,先退到「媒体库」
+     * 根(子页面被丢弃,不 `saveState`——它已经播完了,不需要以后自动弹回那一集的详情页),再对
+     * 「媒体库」根做 `popUpTo(HOME){saveState=true}`。之后再点『媒体库』tab,恢复出来的是列表
+     * 本身,滚动位置保持。
+     */
+    @Test
+    fun 播放序列结束返回首页后再次进入媒体库滚动位置保持() {
+        composeTestRule.setContent { TestNavRoot() }
+
+        composeTestRule.enterLibraryAndOpenDetailAt(SCROLL_TARGET_INDEX)
+
         composeTestRule.onNodeWithTag(END_PLAYBACK_TAG).performClick()
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag(HOME_TAG).assertExists()
 
-        // 再次点『媒体库』——这次 "library" 已经完全不在返回栈上了,不是 no-op 那条自我指涉的
-        // 边界情况(见上面那条用例),navigate 会正常发生。
         composeTestRule.onNodeWithTag(BOTTOM_NAV_TAG).performClick()
         composeTestRule.waitForIdle()
         composeTestRule.waitForLibraryContentSettled()
@@ -194,6 +211,74 @@ class ListScrollRestoreTest {
             "播放序列结束回首页、再次进入媒体库后,滚动位置应保持(firstVisibleItemIndex >= " +
                 "$MIN_ACCEPTABLE_INDEX),实际 firstVisibleItemIndex=$after"
         }
+    }
+
+    /**
+     * **Fix round 2 —— Critical 2 / Important 3 的回归用例。**
+     *
+     * 首页「我的媒体」库卡片直接跳 `Routes.libraryView(libraryId)`(`JellyCastNavHost.kt` 的
+     * `onLibraryClick`),中途从来没有把 `"library"` 本身压过栈。Fix round 1 的 `returnToHome`
+     * 写的是 `navController.popBackStack(Routes.LIBRARY, inclusive = false)`——在这条路径上
+     * `"library"` 根本不在栈里,这一行返回 `false`、不改动任何东西,后续
+     * `navigate(HOME){popUpTo(HOME){saveState=true};restoreState=true}` 的 `restoreState` 又把
+     * `library/view/{libraryId}` 命中的那一段原样恢复——复审实测:点击前后 `stack=[null, home,
+     * library/view/{libraryId}]` 逐字节不变,界面停在原地,`returnToHome` 变成彻底的 no-op。
+     *
+     * 修好之后:`restorableTabOwner` 在栈里找不到 `LIBRARY`/`SETTINGS`,老实退到 `HOME` 自己,
+     * `popBackStack(HOME, inclusive = false)` 把 `library/view/{libraryId}` 干净弹掉(默认不
+     * `saveState`)——不会变成一段以后没有任何 `navigate()` 会去恢复、`ViewModelStore` 永远出
+     * 不来的僵尸状态(Important 3),而且这次真的落地在首页。
+     */
+    @Test
+    fun 从首页直接进按库浏览页播放结束返回首页时正确落地() {
+        composeTestRule.setContent { TestNavRoot() }
+
+        composeTestRule.onNodeWithTag(HOME_OPEN_LIBRARY_VIEW_TAG).performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag(LIBRARY_VIEW_TAG).assertExists()
+
+        composeTestRule.onNodeWithTag(END_PLAYBACK_TAG).performClick()
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag(HOME_TAG).assertExists()
+        composeTestRule.onNodeWithTag(LIBRARY_VIEW_TAG).assertDoesNotExist()
+    }
+
+    /**
+     * **Fix round 2 —— Important 4 的回归用例。**
+     *
+     * 设置 tab 下的「管理服务器」(`Routes.SERVERS`)不在 `"settings/"` 前缀下(它同时也是登录前
+     * 的顶层路由),也不在 `Routes.CHROME_ROUTES` 里。Fix round 1 的 `returnToHome` 对
+     * `library` 之外的分支不做任何"退到根"的处理,直接对当前路由(`servers`)做
+     * `popUpTo(HOME){saveState=true}`——弹出的 `[settings, servers]` 整段被存成一个整体,之后点
+     * 「设置」tab、`restoreState` 命中同一个 key,恢复出来的是**整段**,用户看见的是服务器
+     * 列表,不是设置页,底部 tab 栏也跟着消失(`servers ∉ CHROME_ROUTES`)。
+     *
+     * 修好之后:`restorableTabOwner` 从栈顶往栈底找,`settings` 比栈底的 `home` 更靠近栈顶,
+     * 先命中 `settings`,`popBackStack(settings, inclusive = false)` 把 `servers` 弹掉(默认不
+     * `saveState`),不会混进被保留的那一段里。
+     */
+    @Test
+    fun 设置管理服务器播放结束返回首页后点设置回到设置页() {
+        composeTestRule.setContent { TestNavRoot() }
+
+        composeTestRule.onNodeWithTag(BOTTOM_NAV_SETTINGS_TAG).performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag(SETTINGS_TAG).assertExists()
+
+        composeTestRule.onNodeWithTag(SETTINGS_MANAGE_SERVERS_TAG).performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag(SERVERS_TAG).assertExists()
+
+        composeTestRule.onNodeWithTag(END_PLAYBACK_TAG).performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag(HOME_TAG).assertExists()
+
+        composeTestRule.onNodeWithTag(BOTTOM_NAV_SETTINGS_TAG).performClick()
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag(SETTINGS_TAG).assertExists()
+        composeTestRule.onNodeWithTag(SERVERS_TAG).assertDoesNotExist()
     }
 }
 
@@ -206,16 +291,27 @@ internal const val MIN_ACCEPTABLE_INDEX = 35
  *  数据不会在 ViewModel 构造的同一帧就绪。 */
 internal const val LOAD_DELAY_MS = 50L
 
+internal const val BOTTOM_NAV_HOME_TAG = "test_bottom_nav_home"
 internal const val BOTTOM_NAV_TAG = "test_bottom_nav_library"
+internal const val BOTTOM_NAV_SETTINGS_TAG = "test_bottom_nav_settings"
 internal const val DETAIL_TAG = "test_detail_screen"
 internal const val HOME_TAG = "test_home_screen"
+internal const val HOME_OPEN_LIBRARY_VIEW_TAG = "test_home_open_library_view_button"
+internal const val LIBRARY_VIEW_TAG = "test_library_view_screen"
+internal const val SETTINGS_TAG = "test_settings_screen"
+internal const val SETTINGS_MANAGE_SERVERS_TAG = "test_settings_manage_servers_button"
+internal const val SERVERS_TAG = "test_servers_screen"
 internal const val END_PLAYBACK_TAG = "test_end_playback_return_home"
+
+/** 三个 tab 根,和生产 `BOTTOM_TABS`(`JellyCastNavHost.kt`,file-private,同包也拿不到)
+ *  代表同一组路由——生产那份没法从这里引用,但值本身来自同一个 [Routes]。 */
+internal val TAB_ROUTES = listOf(Routes.HOME, Routes.LIBRARY, Routes.SETTINGS)
 
 internal fun fakeItems(): List<MediaItem> =
     (1..ITEM_COUNT).map { i -> MediaItem(id = "s$i", kind = MediaKind.SERIES, name = "剧集$i") }
 
 /**
- * 复现用的假 ViewModel。挂在 "library" 这个 `NavBackStackEntry` 上——真实
+ * 复现用的假 ViewModel。挂在 [Routes.LIBRARY] 这个 `NavBackStackEntry` 上——真实
  * [dev.insua.jellycast.feature.library.LibraryViewModel] 的分页数据也是这样持有的。
  *
  * `instanceId` + [Log] 是本任务要求的"验证机制,而不是断言机制"的具体做法:报告里贴的
@@ -262,7 +358,32 @@ class FakeLibraryViewModel : ViewModel() {
     }
 }
 
-/** "library" 目的地:真正的 [LibraryScreenContent](纯函数入口),数据来自挂在这个
+/**
+ * 挂在 [Routes.LIBRARY_VIEW_PATTERN] 这个 `NavBackStackEntry` 上的假 ViewModel——只需要证明
+ * "活着 / 被清了",不需要完整的分页 UI。用来验证 Critical 2/Important 3:从首页直接进这个页面
+ * (中途不经过 `"library"`)时,`returnToHome` 必须让它被正常 `cleared`(销毁),不能把它悬在
+ * `backStackMap` 里出不来。
+ */
+class FakeLibraryViewViewModel : ViewModel() {
+
+    val instanceId: Int = INSTANCE_COUNTER++
+
+    init {
+        Log.i(TAG, "FakeLibraryViewViewModel#$instanceId created")
+    }
+
+    override fun onCleared() {
+        Log.i(TAG, "FakeLibraryViewViewModel#$instanceId cleared")
+        super.onCleared()
+    }
+
+    companion object {
+        @Volatile
+        private var INSTANCE_COUNTER = 1
+    }
+}
+
+/** [Routes.LIBRARY] 目的地:真正的 [LibraryScreenContent](纯函数入口),数据来自挂在这个
  *  `NavBackStackEntry` 上的 [FakeLibraryViewModel]。 */
 @Composable
 internal fun LibraryDestination(navController: NavHostController) {
@@ -285,30 +406,68 @@ internal fun LibraryDestination(navController: NavHostController) {
         onSelectTab = {},
         onLoadNextPage = {},
         onRetry = {},
-        onSeriesClick = { seriesId -> navController.navigate("detail/$seriesId") },
+        onSeriesClick = { seriesId -> navController.navigate(Routes.seriesDetail(seriesId)) },
         onPlay = {},
     )
 }
 
-/**
- * 手搭的最小 `NavHost`。**Fix round 1 起,三个 `navigate` 调用全部逐字复刻生产代码**,不再有
- * 任何裁剪:
- *
- * - "home" → "library"(底部导航栏,对应 [JellyCastNavHost.kt] 第 266 行):
- *   `popUpTo(Routes.HOME){saveState=true} + launchSingleTop=true + restoreState=true`。
- * - "library"/"detail" → "home"(播放序列结束回首页,对应 [JellyCastNavHost.kt] 第 105-108 行):
- *   `popUpTo(Routes.HOME){inclusive=true} + launchSingleTop=true`,**没有** `saveState`。
- * - "library" → "detail/{id}"(对应 [JellyCastNavHost.kt] 第 190 行的 `onSeriesClick`):
- *   无特殊 `NavOptions`。
- *
- * [onBackstackChanged] 是测试专用的观测口——不是生产代码的一部分,只用来在断言里核实
- * "这次 navigate 到底有没有真的改变返回栈"([ListScrollRestoreTest.从详情页点回自己所在tab时navigate是no_op_已确认缺陷]
- * 需要这个信号来区分"no-op"和"真的导航了但滚动位置凑巧一样"这两种情况)。
- */
+/** [Routes.SERIES_DETAIL_PATTERN] 目的地。 */
+@Composable
+internal fun SeriesDetailDestination(seriesId: String) {
+    Text("详情 $seriesId", modifier = Modifier.testTag(DETAIL_TAG))
+}
+
+/** [Routes.LIBRARY_VIEW_PATTERN] 目的地——首页「我的媒体」库卡片直连,中途不经过
+ *  [Routes.LIBRARY]。 */
+@Composable
+internal fun LibraryViewDestination(libraryId: String) {
+    val vm: FakeLibraryViewViewModel = viewModel()
+    Text("按库浏览 $libraryId (vm#${vm.instanceId})", modifier = Modifier.testTag(LIBRARY_VIEW_TAG))
+}
+
+/** [Routes.HOME] 目的地——多带一个「我的媒体」库卡片按钮,逐字复刻生产
+ *  `onLibraryClick = { libraryId -> navController.navigate(Routes.libraryView(libraryId)) }`。 */
+@Composable
+internal fun HomeDestination(navController: NavHostController) {
+    Column {
+        Text("首页", modifier = Modifier.testTag(HOME_TAG))
+        Button(
+            onClick = { navController.navigate(Routes.libraryView("lib1")) },
+            modifier = Modifier.testTag(HOME_OPEN_LIBRARY_VIEW_TAG),
+        ) { Text("我的媒体") }
+    }
+}
+
+/** [Routes.SETTINGS] 目的地——多带一个「管理服务器」按钮,逐字复刻生产
+ *  `onManageServers = { navController.navigate(Routes.SERVERS) }`。 */
+@Composable
+internal fun SettingsDestination(navController: NavHostController) {
+    Column {
+        Text("设置", modifier = Modifier.testTag(SETTINGS_TAG))
+        Button(
+            onClick = { navController.navigate(Routes.SERVERS) },
+            modifier = Modifier.testTag(SETTINGS_MANAGE_SERVERS_TAG),
+        ) { Text("管理服务器") }
+    }
+}
+
+/** [Routes.SERVERS] 目的地——不在 `"settings/"` 前缀下,也不在 [Routes.CHROME_ROUTES] 里。 */
+@Composable
+internal fun ServersDestination() {
+    Text("服务器列表", modifier = Modifier.testTag(SERVERS_TAG))
+}
+
 /** 一次返回栈快照里的一条记录——路由 + entry id,用来区分"内容看着一样但其实是全新条目"
- *  和"真的是同一个条目"(Step 5 需要靠 id 判断,不能只看路由字符串)。 */
+ *  和"真的是同一个条目"。 */
 internal data class BackStackEntrySnapshot(val route: String?, val id: String)
 
+/**
+ * 手搭的最小 `NavHost`,路由结构、决策函数都直接复用生产的 [Routes] / [tabNavAction] /
+ * [restorableTabOwner]——见本文件顶部类 KDoc 的说明。
+ *
+ * [onBackstackChanged] 是测试专用的观测口——不是生产代码的一部分,只用来在断言里核实返回栈的
+ * 真实内容(路由 + entry id)。
+ */
 @Composable
 internal fun TestNavRoot(onBackstackChanged: (List<BackStackEntrySnapshot>) -> Unit = {}) {
     val navController = rememberNavController()
@@ -325,65 +484,77 @@ internal fun TestNavRoot(onBackstackChanged: (List<BackStackEntrySnapshot>) -> U
 
     Scaffold(
         bottomBar = {
-            Button(
-                onClick = {
-                    Log.i(TAG, "bottom nav clicked, currentRoute=$currentRoute")
-                    // 逐字复刻 JellyCastNavHost.kt 里 BottomNavBar 的 onClick(修好之后的版本)。
-                    when {
-                        currentRoute == "library" -> Unit
-                        navController.popBackStack("library", inclusive = false) -> Unit
-                        else -> navController.navigate("library") {
-                            popUpTo("home") { saveState = true }
-                            launchSingleTop = true
-                            restoreState = true
-                        }
-                    }
-                },
-                modifier = Modifier.testTag(BOTTOM_NAV_TAG),
-            ) { Text("媒体库") }
-        },
-    ) { padding ->
-        NavHost(
-            navController = navController,
-            startDestination = "home",
-            modifier = Modifier.fillMaxSize().padding(padding),
-        ) {
-            composable("home") { Text("首页", modifier = Modifier.testTag(HOME_TAG)) }
-            composable("library") { LibraryDestination(navController = navController) }
-            composable("detail/{seriesId}") { entry ->
-                val id = entry.arguments?.getString("seriesId").orEmpty()
-                Text("详情 $id", modifier = Modifier.testTag(DETAIL_TAG))
-                // 生产里 `returnToHome` 效应挂在 JellyCastNavHost 顶层(不依赖当前具体目的地,
-                // 见 JellyCastNavHost.kt:101-110 的 LaunchedEffect(returnToHome))——这里放一个
-                // 按钮在 "detail" 目的地上代替"播放序列结束"这个真实触发条件(整部剧/电影播完),
-                // 但 navigate 调用本身逐字复刻,与从哪个目的地触发无关。
+            Column {
+                // 逐字复刻 JellyCastNavHost.kt 里 `LaunchedEffect(returnToHome)`(修好之后的
+                // 版本)——生产里这是顶层效应,不依赖当前具体目的地,所以这里也放在顶层常驻可点,
+                // 不塞进某个具体子页面,这样才能从"库详情页"以外的地方也触发它
+                // (比如 library/view、servers)。
                 Button(
                     onClick = {
-                        // 逐字复刻 JellyCastNavHost.kt:105-121(修好之后的版本)。
-                        //
-                        // 只加 `popUpTo(home){saveState=true}` 不够:那样弹出的是
-                        // [library, detail] 整段,按"最深的目的地"(library)存成一个整体,
-                        // 之后点『媒体库』tab 恢复出来的是**整段**,落地在 detail 上,不是
-                        // library 列表本身(实测过,firstVisibleItemIndex=-1)。所以先把
-                        // "library" 之上的子页面永久弹掉(不 saveState),只留 "library" 自己
-                        // 进 backStackMap。
-                        navController.popBackStack("library", inclusive = false)
-                        navController.navigate("home") {
-                            popUpTo("home") { saveState = true }
+                        val stackRoutes = navController.currentBackStack.value.map { it.destination.route }
+                        val owner = restorableTabOwner(stackRoutes, TAB_ROUTES)
+                        if (owner != null) navController.popBackStack(owner, inclusive = false)
+                        navController.navigate(Routes.HOME) {
+                            popUpTo(Routes.HOME) { saveState = true }
                             launchSingleTop = true
                             restoreState = true
                         }
                     },
                     modifier = Modifier.testTag(END_PLAYBACK_TAG),
                 ) { Text("结束播放返回首页") }
+
+                Row {
+                    listOf(
+                        Triple(Routes.HOME, BOTTOM_NAV_HOME_TAG, "在听"),
+                        Triple(Routes.LIBRARY, BOTTOM_NAV_TAG, "媒体库"),
+                        Triple(Routes.SETTINGS, BOTTOM_NAV_SETTINGS_TAG, "设置"),
+                    ).forEach { (route, tag, label) ->
+                        // 逐字复刻 JellyCastNavHost.kt 里 `BottomNavBar` 的 onClick(修好之后的
+                        // 版本)——直接调用生产纯函数 tabNavAction,不是重新手写一份"像"它的逻辑。
+                        Button(
+                            onClick = {
+                                when (val action = tabNavAction(currentRoute, route)) {
+                                    TabNavAction.None -> Unit
+                                    is TabNavAction.PopToTabRoot ->
+                                        navController.popBackStack(action.route, inclusive = false)
+                                    is TabNavAction.SwitchTab -> navController.navigate(action.route) {
+                                        popUpTo(Routes.HOME) { saveState = true }
+                                        launchSingleTop = true
+                                        restoreState = true
+                                    }
+                                }
+                            },
+                            modifier = Modifier.testTag(tag),
+                        ) { Text(label) }
+                    }
+                }
             }
+        },
+    ) { padding ->
+        NavHost(
+            navController = navController,
+            startDestination = Routes.HOME,
+            modifier = Modifier.fillMaxSize().padding(padding),
+        ) {
+            composable(Routes.HOME) { HomeDestination(navController = navController) }
+            composable(Routes.LIBRARY) { LibraryDestination(navController = navController) }
+            composable(Routes.SERIES_DETAIL_PATTERN) { entry ->
+                val seriesId = entry.arguments?.getString("seriesId").orEmpty()
+                SeriesDetailDestination(seriesId = seriesId)
+            }
+            composable(Routes.LIBRARY_VIEW_PATTERN) { entry ->
+                val libraryId = entry.arguments?.getString("libraryId").orEmpty()
+                LibraryViewDestination(libraryId = libraryId)
+            }
+            composable(Routes.SETTINGS) { SettingsDestination(navController = navController) }
+            composable(Routes.SERVERS) { ServersDestination() }
         }
     }
 }
 
 /**
- * 共用的测试驱动:从 "home" 点底部导航栏第一次进入 "library"(与真实首次进 tab 同一条路径)
- * → 等数据到货 → 滚到 [targetIndex] → 点该处的条目进详情页。
+ * 共用的测试驱动:从 [Routes.HOME] 点底部导航栏第一次进入 [Routes.LIBRARY](与真实首次进 tab
+ * 同一条路径)→ 等数据到货 → 滚到 [targetIndex] → 点该处的条目进详情页。
  */
 internal fun ComposeTestRule.enterLibraryAndOpenDetailAt(targetIndex: Int) {
     onNodeWithTag(BOTTOM_NAV_TAG).performClick()
