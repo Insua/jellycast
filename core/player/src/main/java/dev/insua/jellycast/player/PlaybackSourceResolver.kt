@@ -109,7 +109,7 @@ class PlaybackSourceResolver(
         }
 
         // ---- L3:兜底,拉完整流由客户端禁用视频轨(GET /Videos/{itemId}/stream.mkv,见 buildVideoStreamUrl)----
-        val l3 = buildVideoStreamUrl(base, itemId, token, ms.id, startTimeTicks, info.playSessionId)
+        val l3 = buildVideoStreamUrl(base, itemId, token, ms.id, startTimeTicks, info.playSessionId, audioBitRateBps)
         return PlaybackSource(
             itemId = itemId,
             mediaSourceId = ms.id,
@@ -256,6 +256,22 @@ class PlaybackSourceResolver(
      *
      * 起始位置为 0 时形态完全一样 —— 一条 L3 流只有一种形态,免得 seek 前后在
      * "可字节 range 的整文件"和"chunked 流"两种语义之间来回切。
+     *
+     * ## 🔴 之四:为什么必须显式把视频压到最低
+     *
+     * 不带码率/尺寸/帧率参数时,服务端对视频做**流拷贝**。客户端虽然用
+     * [audioOnlyTrackSelectionParameters] 禁用了视频轨(铁律 1 不受影响),但混流的字节
+     * **必须整条下载**才能取出音频 —— 于是"只听音频"要付整条视频流的带宽。
+     *
+     * 实测(2026-08-15,4K HEVC 50fps 37.4 Mbps 的 `.ts` 片源,20/60 秒采样):
+     *
+     * | | 实际码率 | 相对实时 |
+     * |---|---|---|
+     * | 流拷贝(修复前) | **54.5 Mbps** | 播不了 |
+     * | 加上限之后 | **0.51 Mbps** | **2.2 倍实时** |
+     *
+     * 代价是服务端要真转码,实测起播 25.7 秒(流拷贝时 5.8 秒)。接受:L3 是罕见兜底,
+     * 而"起播慢一点"和"根本播不了"之间没什么好权衡的。
      */
     private fun buildVideoStreamUrl(
         base: String,
@@ -264,6 +280,7 @@ class PlaybackSourceResolver(
         mediaSourceId: String,
         startTimeTicks: Long?,
         playSessionId: String?,
+        audioBitRateBps: Int,
     ): String = buildString {
         append(base).append("/Videos/").append(itemId).append("/stream.").append(L3_CONTAINER)
         append("?api_key=").append(token)
@@ -271,6 +288,14 @@ class PlaybackSourceResolver(
         // 见 KDoc 之三:少了它,服务端会把上一次转码任务的产物原样递回来,startTimeTicks 形同虚设。
         if (!playSessionId.isNullOrBlank()) append("&playSessionId=").append(playSessionId)
         if (startTimeTicks != null) append("&startTimeTicks=").append(startTimeTicks)
+        // 见本函数 KDoc「之四」:不加这些参数服务端对视频做流拷贝,4K 片源实测 54.5 Mbps。
+        append("&videoCodec=").append(L3_VIDEO_CODEC)
+        append("&videoBitRate=").append(L3_VIDEO_BIT_RATE_BPS)
+        append("&maxWidth=").append(L3_MAX_WIDTH)
+        append("&maxFramerate=").append(L3_MAX_FRAMERATE)
+        append("&audioCodec=aac")
+        append("&audioBitRate=").append(audioBitRateBps)
+        append("&maxAudioChannels=2")
     }
 
     private companion object {
@@ -279,5 +304,17 @@ class PlaybackSourceResolver(
 
         /** L3 强制输出的容器,见 [buildVideoStreamUrl]:Matroska 天生可流式,MP4 remux 的 moov 在文件末尾。 */
         const val L3_CONTAINER = "mkv"
+
+        /** 见 [buildVideoStreamUrl] 之四:L3 强制转出的视频编码,h264 是兼容性最好的。 */
+        const val L3_VIDEO_CODEC = "h264"
+
+        /** 见 [buildVideoStreamUrl] 之四:100 kbps —— 视频反正不渲染,只要流能成立即可。 */
+        const val L3_VIDEO_BIT_RATE_BPS = 100_000
+
+        /** 见 [buildVideoStreamUrl] 之四:320 px 宽,让服务端的缩放/编码代价尽量低。 */
+        const val L3_MAX_WIDTH = 320
+
+        /** 见 [buildVideoStreamUrl] 之四:15 fps,源可能是 50fps,不降帧率编码代价白白翻三倍。 */
+        const val L3_MAX_FRAMERATE = 15
     }
 }
