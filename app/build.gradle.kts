@@ -248,6 +248,7 @@ dependencies {
     androidTestImplementation(libs.navigation.compose)
     androidTestImplementation(libs.androidx.lifecycle.viewmodel.compose)
     androidTestImplementation(libs.androidx.test.espresso.core)
+    androidTestImplementation(libs.androidx.test.uiautomator)
     androidTestImplementation(libs.hilt.android.testing)
     kspAndroidTest(libs.hilt.compiler)
     // 端到端测试直接注入 @Singleton 的 ExoPlayer(和 PlaybackService 用的是同一个实例),

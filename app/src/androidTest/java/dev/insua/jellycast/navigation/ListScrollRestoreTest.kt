@@ -51,42 +51,40 @@ import org.junit.runner.RunWith
 
 /**
  * 复现任务(Task 5,只复现不修,详见
- * `.superpowers/sdd/2026-08-15-high-bitrate-playback-and-scroll-restore/task-5-brief.md`):
- * 滚动到列表中部 → 进详情页 → 返回,滚动位置丢失、列表回到顶部。
+ * `.superpowers/sdd/2026-08-15-high-bitrate-playback-and-scroll-restore/task-5-brief.md`),
+ * **Fix round 1 之后的版本**——上一轮复审(Critical 1/2/3)推翻了 round 0 的"从底部导航栏返回"
+ * 用例:那个红是靠去掉 `restoreState = true` 造出来的,用户实际走不到那个状态(详见下方
+ * [从详情页点回自己所在tab时navigate是no_op_已确认缺陷] 和 `task-5-report.md` 的 fix round 1 节)。
  *
  * 已排除"忘了用 rememberSaveable"——四个列表用的都是 saveable 支撑的滚动状态
  * ([dev.insua.jellycast.feature.library.LibraryScreen] 的 `gridState`)。这里手搭一个最小
- * `NavHost`,尽量贴近 [JellyCastNavHost] 的 `navigate` 选项,逐一核验首要嫌疑:
+ * `NavHost`,这一轮起**三个** `navigate` 调用全部逐字复刻生产代码,不再有任何 navOptions 层面
+ * 的裁剪:
  *
- * (a) 从底部导航栏返回:`popUpTo(HOME) { saveState = true }` 会把 "library" 这个
- *     `NavBackStackEntry` 连同它的 `ViewModelStore` 一起弹出销毁——**已用日志证实**(见
- *     `FakeLibraryViewModel` 的 create/cleared 日志):重新进入 "library" 会拿到一个全新的
- *     ViewModel 实例(instanceId 递增),分页数据全部丢失、重新走一次(模拟的)网络加载;
- *     `LazyGrid` 恢复出保存的滚动索引后,第一次真正测量时列表还是空的(数据还没到),索引被
- *     夹到 0,且这次夹紧是"破坏性"的——数据到达后不会自愈回原来的位置。
- * (b) 用返回手势:"library" 这个条目留在返回栈上,ViewModel 不会被销毁,滚动位置保持——
- *     **已验证成立**(见 [返回手势回到列表时滚动位置保持],全程只有一个 ViewModel 实例)。
+ * - 底部导航栏(`JellyCastNavHost.kt:266`):`popUpTo(HOME){saveState=true} + launchSingleTop
+ *   + restoreState=true`。
+ * - 播放序列结束回首页(`JellyCastNavHost.kt:105-108`,`AppSessionViewModel.returnToHome`
+ *   触发):`popUpTo(HOME){inclusive=true} + launchSingleTop`,**没有** `saveState`。
+ * - 剧集条目点进详情(`JellyCastNavHost.kt:190`):无特殊 `NavOptions`。
  *
- * **一个意外发现(与逐字复刻的偏差,已在 [TestNavRoot] 里说明并记录):**
- * [JellyCastNavHost.kt] 第 266 行底部导航栏用的是
- * `popUpTo(Routes.HOME) { saveState = true } + launchSingleTop = true + restoreState = true`
- * 三者同时出现。逐字复刻这三者、从 "detail" 点回 "library" 时,实测是**彻底的 no-op**——
- * `navController.navigate(...)` 正常返回、不抛异常,但 `currentBackStack` 真的一次都没变
- * (用 `LaunchedEffect(currentRoute)` 订阅确认过,不是读到了一次性的 stale 值)。只要去掉
- * `restoreState = true`(保留 `popUpTo(saveState=true)` + `launchSingleTop`),就会正常导航并
- * 复现出 (a) 描述的 ViewModel 重建 + 滚动清零。也就是说 `saveState=true` 和 `restoreState=true`
- * 同时作用在"当前正在被弹出的那个目的地本身"(不是在切换到另一个 tab,而是从它自己的子页面
- * 点同一个 tab 的图标)这个场景,在这次实测的 Navigation Compose 版本上,可能是另一个独立缺陷
- * ——本任务的测试为了能测到"滚动丢失"这件事,采用了去掉 `restoreState` 的版本,详情见报告。
+ * **这一轮验证出的两件事:**
  *
- * 为了让 (a) 的"首次测量为空"这个环节真的有机会发生,[FakeLibraryViewModel] 的数据**异步**
- * 到货(模拟真实 [LibraryViewModel.loadLibrary] 要走一次网络往返这件事)——如果直接把 60 条
- * 数据同步写进 ViewModel 的构造函数,即使 ViewModel 真的被重建,`LazyGrid` 第一次测量时也已经
- * 有全量数据,复现不出"首次测量为空"这个环节。
+ * 1. **底部导航栏那个 no-op 是确认缺陷,不是待查疑点。** 见
+ *    [从详情页点回自己所在tab时navigate是no_op_已确认缺陷]——从 "library" 的子页面点回
+ *    "library" 自己的 tab 图标,`navController.navigate(...)` 正常返回、不抛异常,但返回栈
+ *    (entry id、当前路由)真的一次都没变,用户仍然停在详情页。这与用户报的"回到了列表但滚动
+ *    到顶部"是**不同的症状**,所以不能拿它当"滚动丢失"的复现,但它本身是一个真实、可达的缺陷。
+ * 2. **一条可达的路径,真的复现出滚动丢失:** 播放序列结束 → 自动回首页
+ *    (`popUpTo(HOME){inclusive=true}`,没有 `saveState`,"library" 连同它上面的 "detail" 被
+ *    彻底销毁,不留任何可恢复的痕迹)→ 用户再次点『媒体库』tab。此时 "library" 已经不在返回栈
+ *    上,`popUpTo(HOME)` 找不到东西可弹,`restoreState=true` 在 `backStackMap` 里也找不到
+ *    "library" 的 id(它从来没有被 `saveState=true` 保存过)——于是这是一次彻头彻尾的全新
+ *    push:全新 `NavBackStackEntry`、全新 `ViewModelStore`、全新 `LazyGridState`。见
+ *    [播放序列结束返回首页后再次进入媒体库滚动位置丢失]。
  *
- * 用真正的 [ViewModel]([FakeLibraryViewModel] 挂在 "library" 这个 `NavBackStackEntry` 上,
- * 而不是把数据直接写死在 composable 里)是复现 (a) 的关键——数据写死在 composable 里根本不存在
- * "可能丢"的状态,那条路径永远复现不出来。
+ * `FakeLibraryViewModel` 的数据**异步**到货(模拟真实 [LibraryViewModel.loadLibrary] 要走一次
+ * 网络往返这件事),`instanceId` + [Log] 把"ViewModel 有没有被重建"直接打进 logcat,不是从代码
+ * 读出来的推测。
  */
 @RunWith(AndroidJUnit4::class)
 class ListScrollRestoreTest {
@@ -112,46 +110,107 @@ class ListScrollRestoreTest {
         }
     }
 
+    /**
+     * **Fix round 1 —— 取代 round 0 里那个靠裁剪 navOptions 造红的"从底部导航栏返回"用例。**
+     *
+     * 复审用一个更小的探针在真实路由表上实测确认:生产代码原样的三个 `navOptions`
+     * (`saveState=true` + `launchSingleTop=true` + `restoreState=true`)同时出现,且这次
+     * `popUpTo` 弹出、`restoreState` 要恢复的目的地是**同一个**("library" 自己,不是切到另一个
+     * tab)时,`navController.navigate(...)` 是彻底的 no-op——正常返回、不抛异常,但返回栈的
+     * entry id、当前路由一个都没变(Probe A)。这不是本测试模型的产物,是 Navigation-Compose
+     * 2.9.8 的真实行为,也是一个真实、用户可达的缺陷:**从剧集详情页点『媒体库』tab 图标,
+     * 界面停在原地,什么反应都没有**。
+     *
+     * 这与用户原始报告的"滚动丢失"是不同症状,所以这里断言的是 no-op 本身(backstack 没变、
+     * 仍在详情页),不再断言滚动位置——那条路径上滚动位置从来没有被检验的机会。
+     */
     @Test
-    fun 从底部导航栏回到列表时滚动位置保持() {
+    fun 从详情页点回自己所在tab时navigate是no_op_已确认缺陷() {
+        var lastBackstack: List<String?> = emptyList()
+        composeTestRule.setContent {
+            TestNavRoot(onBackstackChanged = { lastBackstack = it })
+        }
+
+        composeTestRule.enterLibraryAndOpenDetailAt(SCROLL_TARGET_INDEX)
+        val beforeClick = lastBackstack
+        Log.i(TAG, "[no-op 探测] 点击前 backstack=$beforeClick")
+
+        composeTestRule.onNodeWithTag(BOTTOM_NAV_TAG).performClick()
+        composeTestRule.waitForIdle()
+        // 给它一个正常导航/过渡动画绰绰有余的窗口——如果这段时间里 backstack 真的变了,
+        // lastBackstack 一定会被上面那个回调更新到。
+        Thread.sleep(1_000)
+        composeTestRule.waitForIdle()
+
+        val afterClick = lastBackstack
+        Log.i(TAG, "[no-op 探测] 点击后 backstack=$afterClick")
+
+        assert(afterClick == beforeClick) {
+            "预期是已确认的 no-op 缺陷(backstack 不变),但这次 backstack 变了:" +
+                "点击前=$beforeClick,点击后=$afterClick —— 说明这条路径在这次环境下不是 no-op," +
+                "需要重新核对复审的探针结论。"
+        }
+        // no-op 意味着仍然停在详情页,没有回到列表——这正是缺陷本身。
+        composeTestRule.onNodeWithTag(DETAIL_TAG).assertExists()
+    }
+
+    /**
+     * **Fix round 1 —— 复审指出的可达路径 (ii)。**
+     *
+     * `JellyCastNavHost.kt:105-108`:播放序列结束(整部剧播完/电影播完)时,
+     * `AppSessionViewModel.returnToHome` 变 true,触发
+     * `navigate(HOME){ popUpTo(HOME){inclusive=true}; launchSingleTop=true }`——**没有
+     * `saveState`**,"library" 连同它上面的 "detail" 被彻底销毁,不留任何 `backStackMap` 记录。
+     *
+     * 用户流程:滚动媒体库列表 → 点进一部剧的详情(模拟"看了一集,期间播放序列结束") →
+     * 触发这次 `returnToHome` → 回到首页 → 再点一次『媒体库』tab。此时 "library" 已经不在
+     * 返回栈上,第二次点『媒体库』的 `popUpTo(HOME)` 找不到东西可弹、`restoreState=true` 在
+     * `backStackMap` 里也找不到 "library" 的 id——是一次彻底全新的 push,全新 `ViewModelStore`、
+     * 全新 `LazyGridState`。
+     *
+     * 断言:`firstVisibleItemIndex` 应该 `>= MIN_ACCEPTABLE_INDEX`(不应该丢),实测应为红。
+     */
+    @Test
+    fun 播放序列结束返回首页后再次进入媒体库滚动位置丢失() {
         composeTestRule.setContent { TestNavRoot() }
 
         composeTestRule.enterLibraryAndOpenDetailAt(SCROLL_TARGET_INDEX)
 
+        // 逐字复刻 JellyCastNavHost.kt:105-108 的 returnToHome 效应。
+        composeTestRule.onNodeWithTag(END_PLAYBACK_TAG).performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag(HOME_TAG).assertExists()
+
+        // 再次点『媒体库』——这次 "library" 已经完全不在返回栈上了,不是 no-op 那条自我指涉的
+        // 边界情况(见上面那条用例),navigate 会正常发生。
         composeTestRule.onNodeWithTag(BOTTOM_NAV_TAG).performClick()
         composeTestRule.waitForIdle()
         composeTestRule.waitForLibraryContentSettled()
-        // NavHost 切目的地带默认的 AnimatedContent 过渡:detail 淡出、library 淡入。测量必须等
-        // 这次过渡真正落定(detail 的节点从语义树上消失)之后再做,否则可能在两屏同时挂在树上
-        // 的过渡中间帧量出一个没有意义的瞬时值(实测踩到过:量出 firstVisibleItemIndex=-1,
-        // 比"真的被重置到 0"更极端——那是量早了,不是真的没有任何条目可见)。
-        composeTestRule.waitUntil(timeoutMillis = 5_000) {
-            composeTestRule.onAllNodesWithTagCount(DETAIL_TAG) == 0
-        }
-        composeTestRule.waitForIdle()
 
         val after = composeTestRule.firstVisibleItemIndex()
-        Log.i(TAG, "[底部导航栏] afterIndex=$after")
+        Log.i(TAG, "[播放结束返回首页] afterIndex=$after")
         assert(after >= MIN_ACCEPTABLE_INDEX) {
-            "从底部导航栏回到列表后,滚动位置应保持(firstVisibleItemIndex >= $MIN_ACCEPTABLE_INDEX)," +
-                "实际 firstVisibleItemIndex=$after"
+            "播放序列结束回首页、再次进入媒体库后,滚动位置应保持(firstVisibleItemIndex >= " +
+                "$MIN_ACCEPTABLE_INDEX),实际 firstVisibleItemIndex=$after"
         }
     }
 }
 
-private const val TAG = "ListScrollRestoreTest"
-private const val ITEM_COUNT = 60
-private const val SCROLL_TARGET_INDEX = 40
-private const val MIN_ACCEPTABLE_INDEX = 35
+internal const val TAG = "ListScrollRestoreTest"
+internal const val ITEM_COUNT = 60
+internal const val SCROLL_TARGET_INDEX = 40
+internal const val MIN_ACCEPTABLE_INDEX = 35
 
 /** 模拟真实 [dev.insua.jellycast.feature.library.LibraryViewModel] 要走一次网络往返——
  *  数据不会在 ViewModel 构造的同一帧就绪。 */
-private const val LOAD_DELAY_MS = 50L
+internal const val LOAD_DELAY_MS = 50L
 
-private const val BOTTOM_NAV_TAG = "test_bottom_nav_library"
-private const val DETAIL_TAG = "test_detail_screen"
+internal const val BOTTOM_NAV_TAG = "test_bottom_nav_library"
+internal const val DETAIL_TAG = "test_detail_screen"
+internal const val HOME_TAG = "test_home_screen"
+internal const val END_PLAYBACK_TAG = "test_end_playback_return_home"
 
-private fun fakeItems(): List<MediaItem> =
+internal fun fakeItems(): List<MediaItem> =
     (1..ITEM_COUNT).map { i -> MediaItem(id = "s$i", kind = MediaKind.SERIES, name = "剧集$i") }
 
 /**
@@ -160,8 +219,11 @@ private fun fakeItems(): List<MediaItem> =
  *
  * `instanceId` + [Log] 是本任务要求的"验证机制,而不是断言机制"的具体做法:报告里贴的
  * create/cleared 日志行,就是"ViewModel 是否被重建"这件事的直接证据,不是从代码读出来的推测。
+ *
+ * `internal`(不是 private)——同包的 [ListScrollProcessDeathTest]([android]androidTest 里)复用
+ * 这个假 ViewModel 去验证复审提出的候选 (i)(进程回收 / Activity 重建)。
  */
-// public(不是 private/internal)——androidx.lifecycle 的 ViewModelProvider 用反射
+// public(不是 private)——androidx.lifecycle 的 ViewModelProvider 用反射
 // `Constructor.newInstance()` 构造它,反射调用方在另一个包(androidx.lifecycle.viewmodel.internal)
 // 里,访问不了包内私有可见度的类。
 class FakeLibraryViewModel : ViewModel() {
@@ -202,7 +264,7 @@ class FakeLibraryViewModel : ViewModel() {
 /** "library" 目的地:真正的 [LibraryScreenContent](纯函数入口),数据来自挂在这个
  *  `NavBackStackEntry` 上的 [FakeLibraryViewModel]。 */
 @Composable
-private fun LibraryDestination(navController: NavHostController) {
+internal fun LibraryDestination(navController: NavHostController) {
     val vm: FakeLibraryViewModel = viewModel()
     val uiState by vm.uiState.collectAsState()
 
@@ -228,36 +290,30 @@ private fun LibraryDestination(navController: NavHostController) {
 }
 
 /**
- * 手搭的最小 `NavHost`,尽量贴近 [JellyCastNavHost] 的导航选项:
- * - "home" → "library":`popUpTo` 的目标固定是起点 "home"(对应生产环境的 `Routes.HOME`),
- *   不是目标 tab 自己——这一点必须原样复刻,否则 `popUpTo` 找不到目标、整个复现的前提
- *   (entry 被弹出销毁)就不成立。
- * - "library" → "detail/{id}":与 [JellyCastNavHost.kt] 第 190 行的 `onSeriesClick` 完全一样,
- *   不带任何特殊 `NavOptions`。
+ * 手搭的最小 `NavHost`。**Fix round 1 起,三个 `navigate` 调用全部逐字复刻生产代码**,不再有
+ * 任何裁剪:
  *
- * **与 [JellyCastNavHost.kt] 第 266 行的唯一差异:少了 `restoreState = true`。**
- * [JellyCastNavHost.kt] 原文是
- * `popUpTo(Routes.HOME) { saveState = true } + launchSingleTop = true + restoreState = true`。
- * 逐字复刻这三者、在"从 library 的子页面(detail)点回 library 自己"这个场景下实测触发
- * `navController.navigate(...)` 的一个彻底 no-op(不抛异常,`currentBackStack` 真的不变,
- * 用 `LaunchedEffect(currentRoute)` 订阅验证过)——这本身很可能是另一个独立缺陷,细节见
- * `task-5-report.md`,不在本任务范围内处理。为了仍然能测到"返回后滚动位置"这件事,这里去掉了
- * `restoreState = true`,保留 `popUpTo(saveState=true)` + `launchSingleTop`——这仍然完整保留了
- * 首要嫌疑 (a) 的核心机制:弹出并重建 "library" 这个 `NavBackStackEntry`(其 `ViewModelStore`
- * 随之清空)。
+ * - "home" → "library"(底部导航栏,对应 [JellyCastNavHost.kt] 第 266 行):
+ *   `popUpTo(Routes.HOME){saveState=true} + launchSingleTop=true + restoreState=true`。
+ * - "library"/"detail" → "home"(播放序列结束回首页,对应 [JellyCastNavHost.kt] 第 105-108 行):
+ *   `popUpTo(Routes.HOME){inclusive=true} + launchSingleTop=true`,**没有** `saveState`。
+ * - "library" → "detail/{id}"(对应 [JellyCastNavHost.kt] 第 190 行的 `onSeriesClick`):
+ *   无特殊 `NavOptions`。
+ *
+ * [onBackstackChanged] 是测试专用的观测口——不是生产代码的一部分,只用来在断言里核实
+ * "这次 navigate 到底有没有真的改变返回栈"([ListScrollRestoreTest.从详情页点回自己所在tab时navigate是no_op_已确认缺陷]
+ * 需要这个信号来区分"no-op"和"真的导航了但滚动位置凑巧一样"这两种情况)。
  */
 @Composable
-private fun TestNavRoot() {
+internal fun TestNavRoot(onBackstackChanged: (List<String?>) -> Unit = {}) {
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
 
     LaunchedEffect(currentRoute) {
-        Log.i(
-            TAG,
-            "backstack changed: currentRoute=$currentRoute stack=" +
-                navController.currentBackStack.value.map { it.destination.route },
-        )
+        val stack = navController.currentBackStack.value.map { it.destination.route }
+        Log.i(TAG, "backstack changed: currentRoute=$currentRoute stack=$stack")
+        onBackstackChanged(stack)
     }
 
     Scaffold(
@@ -266,11 +322,11 @@ private fun TestNavRoot() {
                 onClick = {
                     Log.i(TAG, "bottom nav clicked, currentRoute=$currentRoute")
                     if (currentRoute != "library") {
-                        // 与 JellyCastNavHost.kt:266 相同,唯一差异是没有 restoreState = true——
-                        // 见本文件顶部 KDoc 和 TestNavRoot 的 KDoc 里对这处偏差的说明。
+                        // 逐字复刻 JellyCastNavHost.kt:266。
                         navController.navigate("library") {
                             popUpTo("home") { saveState = true }
                             launchSingleTop = true
+                            restoreState = true
                         }
                     }
                 },
@@ -283,11 +339,25 @@ private fun TestNavRoot() {
             startDestination = "home",
             modifier = Modifier.fillMaxSize().padding(padding),
         ) {
-            composable("home") { Text("首页", modifier = Modifier.testTag("test_home_screen")) }
+            composable("home") { Text("首页", modifier = Modifier.testTag(HOME_TAG)) }
             composable("library") { LibraryDestination(navController = navController) }
             composable("detail/{seriesId}") { entry ->
                 val id = entry.arguments?.getString("seriesId").orEmpty()
                 Text("详情 $id", modifier = Modifier.testTag(DETAIL_TAG))
+                // 生产里 `returnToHome` 效应挂在 JellyCastNavHost 顶层(不依赖当前具体目的地,
+                // 见 JellyCastNavHost.kt:101-110 的 LaunchedEffect(returnToHome))——这里放一个
+                // 按钮在 "detail" 目的地上代替"播放序列结束"这个真实触发条件(整部剧/电影播完),
+                // 但 navigate 调用本身逐字复刻,与从哪个目的地触发无关。
+                Button(
+                    onClick = {
+                        // 逐字复刻 JellyCastNavHost.kt:105-108。
+                        navController.navigate("home") {
+                            popUpTo("home") { inclusive = true }
+                            launchSingleTop = true
+                        }
+                    },
+                    modifier = Modifier.testTag(END_PLAYBACK_TAG),
+                ) { Text("结束播放返回首页") }
             }
         }
     }
@@ -297,7 +367,7 @@ private fun TestNavRoot() {
  * 共用的测试驱动:从 "home" 点底部导航栏第一次进入 "library"(与真实首次进 tab 同一条路径)
  * → 等数据到货 → 滚到 [targetIndex] → 点该处的条目进详情页。
  */
-private fun ComposeTestRule.enterLibraryAndOpenDetailAt(targetIndex: Int) {
+internal fun ComposeTestRule.enterLibraryAndOpenDetailAt(targetIndex: Int) {
     onNodeWithTag(BOTTOM_NAV_TAG).performClick()
     waitForIdle()
     waitForLibraryContentSettled()
@@ -319,14 +389,14 @@ private fun ComposeTestRule.enterLibraryAndOpenDetailAt(targetIndex: Int) {
 
 /** 等到"首屏转圈"消失、且"空态文案"不存在——用生产代码本来就有的两个 testTag 判定内容真的
  *  到货了,不依赖任何具体某一条 item 是否可见(返回后滚动位置可能仍在中部,"s1" 未必可见)。 */
-private fun ComposeTestRule.waitForLibraryContentSettled() {
+internal fun ComposeTestRule.waitForLibraryContentSettled() {
     waitUntil(timeoutMillis = 5_000) {
         onAllNodesWithTagCount(LibraryScreenTestTags.LOADING_INITIAL) == 0 &&
             onAllNodesWithTagCount(LibraryScreenTestTags.EMPTY_STATE) == 0
     }
 }
 
-private fun ComposeTestRule.onAllNodesWithTagCount(tag: String): Int =
+internal fun ComposeTestRule.onAllNodesWithTagCount(tag: String): Int =
     onAllNodesWithTag(tag).fetchSemanticsNodes(atLeastOneRootRequired = false).size
 
 /**
@@ -339,7 +409,7 @@ private fun ComposeTestRule.onAllNodesWithTagCount(tag: String): Int =
  * "第一个可见项"——这与 `LazyGridState.firstVisibleItemIndex` 想回答的是同一个问题
  * (哪个是当前视口里最靠前的条目),而且更贴近用户真实感知到的"列表有没有滚回顶部"。
  */
-private fun ComposeTestRule.firstVisibleItemIndex(count: Int = ITEM_COUNT): Int {
+internal fun ComposeTestRule.firstVisibleItemIndex(count: Int = ITEM_COUNT): Int {
     for (i in 1..count) {
         val displayed = try {
             onNodeWithTag(LibraryScreenTestTags.item("s$i")).assertIsDisplayed()
