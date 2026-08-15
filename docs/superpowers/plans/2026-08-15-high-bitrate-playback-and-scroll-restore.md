@@ -781,6 +781,27 @@ git commit -m "✅ (navigation): add failing test reproducing list scroll reset 
 
 ## Task 6: 修复两个导航缺陷
 
+> ## ⚠️⚠️⚠️ 本任务的实现方案已被推翻,不要照抄下面的 Steps ⚠️⚠️⚠️
+>
+> **这里写的是 round 1 的方案,后续 5 轮修复证明它是 Critical。不要复制 Step 3 / Step 4 的代码。**
+>
+> - Step 3 的 `popBackStack(tab.route, inclusive = false)` 分支在 tab 根不在返回栈上时(比如从
+>   首页「我的媒体」卡片直连 `library/view/{id}`)会返回 `false` 且不改动任何东西,点『在听』
+>   变成销毁媒体库条目、落错页的死键。
+> - Step 4 的 `popBackStack(HOME, inclusive = true, saveState = true) / navigate(HOME){…
+>   restoreState = true}` 写法,正是 `TabNavAction.kt` 文件顶部那条铁律明确禁止的形状——
+>   `HOME` 不许同时是 `saveState` 的 pop 锚点又是 `navigate(){restoreState}` 的目标,否则存和取
+>   在同一次调用里互相抵消。
+>
+> **真正的实现在 `app/src/main/java/dev/insua/jellycast/navigation/TabNavAction.kt`**(`tabNavAction`
+> / `restorableTabOwner` / `executeTabNavAction` / `executeReturnToHome` 这几个纯函数 + 执行体,
+> 全部离线可单测),机制解释见该文件顶部的铁律 KDoc,以及设计文档
+> `docs/superpowers/specs/2026-08-15-high-bitrate-playback-and-scroll-restore-design.md` §7.4
+> (已重写,记录的是实测过的最终方案,不是这里的 round 1 草稿)。
+>
+> 保留这个 Task 6 原文不删——它是"第一次怎么错的"的完整记录,后续四轮 fix round 的 progress
+> ledger 都是对着这个错误方案纠偏,删掉会让那段历史失去上下文。**只是不要把它当施工图。**
+
 **本任务由编排者在 Task 5 交付之后补全(2026-08-15)。** 下面每一条都由 Task 5 的实测与复审的独立探针**观测**支撑,不是推断。
 
 **Files:**

@@ -29,15 +29,28 @@ import androidx.navigation.NavController
  * 把它取出来——人被"送回"那个库浏览页,而不是首页。审查新写的导航调用要问的是
  * **"这个键会不会有别的调用点来取"**,不是"这一次调用里 X 是否等于 Y"。
  *
- * ## 当前四个导航调用点按这条铁律的归类(`JellyCastNavHost.kt`;底部栏按两条分支拆开写)
+ * ## `JellyCastNavHost.kt` 里全部 13 个 `navigate(…)` / executor 调用点按这条铁律的归类
  *
- * | 调用点 | 存(`saveState`)| 取(`restoreState`)| 结论 |
- * |---|---|---|---|
- * | 底部栏 [TabNavAction.PopToTabRoot] | `HOME` 键 + 最深被弹目的地键(仅 `saveState=true` 时)| 无 | 合规:只存不取 |
- * | 底部栏 [TabNavAction.SwitchTab] | 同上 | 目标 tab 根的键 | 合规:目标恒不为 `HOME`(见 [tabNavAction]) |
- * | `returnToHome` → [NavController.executeReturnToHome] | 同上 | 无 | 合规:已改成纯 `popBackStack`,不再取 `HOME` 的键 |
- * | 首页 `onSearchClick` | 同上 | `LIBRARY` 键 | 合规:它就是 [TabNavAction.SwitchTab]`(LIBRARY)`,目标是 `LIBRARY`,不是锚点 `HOME` |
- * | 首页 `onLibraryClick` | 无 | 无 | 合规:一次普通 `navigate`,不碰 `backStackMap` |
+ * (这里第一次数错过:曾经写「当前四个调用点」只列了 5 行,漏掉的正是下表第 2、第 4 行那两个
+ * `popUpTo(0)`——而漏掉的恰好是已知缺陷藏身的地方,见那两行的结论列。这不是巧合:
+ * 「审查时自认为表是穷举的」本身就是本文件顶部那条铁律反复被漏掉的同一种框架错误,
+ * 所以这次改成对着 `grep -n 'navController\.\(navigate\|execute\)'` 的真实输出逐行核对。)
+ *
+ * | # | 调用点(行号) | 存(`saveState`)| 取(`restoreState`)| 结论 |
+ * |---|---|---|---|---|
+ * | 1 | `returnToHome` 的 `LaunchedEffect`(:109,→ [NavController.executeReturnToHome]) | `HOME` 键 | 无 | 合规:已改成纯 `popBackStack`,只存不取 |
+ * | 2 | `ServerListScreen.onServerReady`(:145)`navigate(HOME){popUpTo(0)}` | 无(`popUpTo(0)` 未带 `saveState`) | 无 | **清空目的地栈,但不清 `backStackMap`/`backStackStates`**——此前别的调用点(比如底部栏切 tab)存下的项不会被这次清空带走。已知后果(不在本轮修复范围,见文件顶部铁律的『已知的潜在缺陷』分类和任务 progress 里的 deferred 记录):媒体库 → 剧集 → 设置 → 管理服务器 → 切到另一台服务器后,再点『媒体库』tab 会把切服务器前存的旧条目当键取出来,显示前一台服务器的数据 |
+ * | 3 | `ServerListScreen.onAddServer`(:147)`navigate(SERVERS_ADD)` | 无 | 无 | 合规:普通 `navigate`,不碰 `backStackMap` |
+ * | 4 | `AddServerScreen.onDone`(:154)`navigate(HOME){popUpTo(0)}` | 无 | 无 | 同第 2 行,同一个已知后果 |
+ * | 5 | `HomeScreen.onLibraryClick`(:169)`navigate(libraryView(id))` | 无 | 无 | 合规:普通 `navigate` |
+ * | 6 | `HomeScreen.onSearchClick`(:176,→ [TabNavAction.SwitchTab]`(LIBRARY)`) | `HOME` 键 + 最深被弹目的地键(仅该次决策出的 `saveState=true` 时) | `LIBRARY` 键 | 合规:目标是 `LIBRARY`,不是锚点 `HOME`——和"站在首页点『媒体库』tab"是同一次调用、同一份 `NavOptions` |
+ * | 7 | `HomeScreen.onAccountClick`(:179)`navigate(SETTINGS)` | 无 | 无 | 合规:普通 `navigate` |
+ * | 8 | `LibraryScreen.onSeriesClick`(:190)`navigate(seriesDetail(id))` | 无 | 无 | 合规:普通 `navigate` |
+ * | 9 | `LibraryScreen.onCollectionClick`(:196)`navigate(collectionDetail(id))` | 无 | 无 | 合规:普通 `navigate` |
+ * | 10 | `CollectionDetailScreen.onSeriesClick`(:216)`navigate(seriesDetail(id))` | 无 | 无 | 合规:普通 `navigate` |
+ * | 11 | `LibraryContentsScreen.onSeriesClick`(:228)`navigate(seriesDetail(id))` | 无 | 无 | 合规:普通 `navigate` |
+ * | 12 | `SettingsScreen.onManageServers`(:237)`navigate(SERVERS)` | 无 | 无 | 合规:普通 `navigate` |
+ * | 13 | `BottomNavBar.onClick`(:272,→ [tabNavAction] + [NavController.executeTabNavAction]) | 视决策而定:`None`→无;`PopToTabRoot`→`HOME` 键或当前 tab 键(仅 `saveState=true` 时);`SwitchTab`→`HOME` 键 + 最深被弹目的地键 | 视决策而定:`None`/`PopToTabRoot`→无;`SwitchTab`→目标 tab 根键 | 合规:[tabNavAction] 现在无条件把 `tabRoute == HOME` 分流到 `PopToTabRoot`(见其 KDoc),`SwitchTab` 的目标恒不为 `HOME`——这是函数构造上的保证(对任意输入都成立),不再是「目前可达数据恰好如此」这种关于数据的断言 |
  *
  * 底部导航栏点击某个 tab 时应该采取的动作。[tabNavAction] / [restorableTabOwner] 只看字符串/列表
  * (当前路由、被点的 tab 根路由、返回栈里现有的路由),不碰 `NavController` 本身——可以在 JVM 上
@@ -102,13 +115,23 @@ sealed interface TabNavAction {
  * `popBackStack(..., saveState = true)` 不经过 `navigate()`/`restoreState`,天然不会有这个问题
  * ——已经用 `TestNavRoot` 在真实场景上逐条测过(见 `ListScrollRestoreTest`)。
  *
+ * ⚠️ **Finding 1(已闭合)**:这条 HOME 分支曾经写成 `tabRoute == Routes.HOME && tabRoute in
+ * stackRoutes`,多带了一个 `stackRoutes` 检查——`stackRoutes` 不包含 `HOME` 时(比如
+ * `stackRoutes = emptyList()`,导航还没就绪的瞬时状态)会漏到最后的 `else`,返回
+ * [TabNavAction.SwitchTab]`(HOME)`,而 [NavController.executeTabNavAction] 会把它执行成
+ * `navigate(HOME){popUpTo(HOME){saveState=true};restoreState=true}`——正是本文件顶部那条铁律
+ * 禁止的形状。这条件在生产上"恰好没触发",纯粹是因为真实 `NavController` 的返回栈里 `HOME`
+ * 作为起始目的地永远存在;一旦这个"数据事实"被打破(比如未来 `stackRoutes` 的取法变了),
+ * `tabNavAction` 会在没人注意到的情况下悄悄违反铁律。现在去掉这个检查,让"目标不为 HOME"
+ * 变成这个函数对**任意输入**都成立的构造性质,不再依赖"HOME 恰好总在栈上"这条外部事实。
+ *
  * 其余情形(目标不是 `HOME`)按路由字符串前缀判断"属于"关系(等于 tab 根,或以
  * `"$tabRoute/"` 为前缀),用 [stackRoutes] 判断"根实际在不在、能不能退"——两者都满足才走
  * [TabNavAction.PopToTabRoot]`(saveState = false)`(同一个 tab 内部退到根,不需要存)。
  */
 fun tabNavAction(currentRoute: String?, tabRoute: String, stackRoutes: List<String?>): TabNavAction = when {
     currentRoute == tabRoute -> TabNavAction.None
-    tabRoute == Routes.HOME && tabRoute in stackRoutes -> TabNavAction.PopToTabRoot(tabRoute, saveState = true)
+    tabRoute == Routes.HOME -> TabNavAction.PopToTabRoot(tabRoute, saveState = true)
     currentRoute != null && currentRoute.startsWith("$tabRoute/") && tabRoute in stackRoutes ->
         TabNavAction.PopToTabRoot(tabRoute, saveState = false)
     else -> TabNavAction.SwitchTab(tabRoute)
@@ -154,8 +177,9 @@ fun NavController.executeTabNavAction(action: TabNavAction) {
         TabNavAction.None -> Unit
         is TabNavAction.PopToTabRoot ->
             popBackStack(action.route, inclusive = false, saveState = action.saveState)
-        // 目标恒不为 Routes.HOME(tabNavAction 已经把 HOME 分流到 PopToTabRoot),
-        // 因此不违反顶部那条铁律。
+        // 目标恒不为 Routes.HOME:tabNavAction 的 HOME 分支现在不看 stackRoutes,对任意输入都会
+        // 命中 PopToTabRoot(见 tabNavAction 的 Finding 1 KDoc)——这是那个纯函数的构造性质,
+        // 不是"当前可达数据恰好如此"的运气,因此不违反顶部那条铁律。
         is TabNavAction.SwitchTab -> navigate(action.route) {
             popUpTo(Routes.HOME) { saveState = true }
             launchSingleTop = true

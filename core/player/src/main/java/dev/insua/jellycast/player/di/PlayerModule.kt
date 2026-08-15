@@ -31,6 +31,7 @@ import dev.insua.jellycast.player.PlaybackSourceProvider
 import dev.insua.jellycast.player.PlaybackSourceResolver
 import dev.insua.jellycast.player.PlayQueue
 import dev.insua.jellycast.player.ProgressReporter
+import dev.insua.jellycast.player.STREAM_READ_TIMEOUT_MS
 import dev.insua.jellycast.player.StreamProbe
 import dev.insua.jellycast.player.asProvider
 import dev.insua.jellycast.player.createAudioOnlyPlayer
@@ -38,6 +39,7 @@ import dev.insua.jellycast.player.toPlaybackDisplayMetadata
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
 import javax.inject.Singleton
 
 /**
@@ -102,9 +104,22 @@ object PlayerModule {
     }
 
     /**
-     * [AudioCacheStore] 复用 [provideStreamProbe] 那份带证书信任策略的 [TrustAwareHttpClient]——
-     * 缓存下载和 L1 探测打的是同一个可能自签证书的 endpoint,不新增第二套证书处理逻辑。
-     * `dao` 取自下面 [provideJellyCastDatabase] 提供的同一个单例数据库实例。
+     * ⚠️ Finding 2(已闭合):[AudioCacheStore] 复用 [provideStreamProbe] 那份带证书信任策略的
+     * [TrustAwareHttpClient]——缓存下载和 L1 探测打的是**同一条** `/Audio/{id}/universal` URL,
+     * 不新增第二套证书处理逻辑。但信任策略只是这条 URL 需要的一半:它还需要
+     * [STREAM_READ_TIMEOUT_MS] 那份长读超时——共享的 `@TrustAwareHttpClient` 保留 okhttp 默认的
+     * 10 秒读超时(那 10 秒是给封面图/字幕这类应该快速失败的小请求用的,见 [provideStreamProbe]
+     * 的 KDoc)。4K HEVC `.ts` 这类源服务端要 6–46 秒才吐出响应头,这条 URL 之前**只有**
+     * [provideStreamProbe]([HttpStreamProbe])和 ExoPlayer 自己的 HTTP 数据源
+     * ([dev.insua.jellycast.player.JellyCastPlayerFactory])两处抬了读超时,`AudioCacheDownloader`
+     * 一直接的是没抬过的共享 client——后台预缓存对这类源会稳定命中 10 秒读超时、删掉
+     * `.part` 文件、返回 `false`,`CachePrefetchController` 因此对高码率剧集永远预缓存不成功,
+     * 且每次都静默重试(不向上抛错,行为上和"没在跑"没区别)。
+     *
+     * 派生逻辑抽成 [cacheDownloadHttpClient],不内联在这里——见其 KDoc:抽出来是为了能在
+     * [PlayerModuleTest] 里直接单测这条派生本身,不必经过需要 `Context`/Room 的完整
+     * `AudioCacheStore` 装配。`dao` 取自下面 [provideJellyCastDatabase] 提供的同一个单例数据库
+     * 实例。
      */
     @Provides
     @Singleton
@@ -115,8 +130,16 @@ object PlayerModule {
     ): AudioCacheStore = AudioCacheStore(
         context = context,
         dao = database.cachedAudioDao(),
-        downloader = AudioCacheDownloader(client),
+        downloader = AudioCacheDownloader(cacheDownloadHttpClient(client)),
     )
+
+    /**
+     * 见 [provideAudioCacheStore] 的 KDoc。用 `newBuilder()` 派生(而不是 `OkHttpClient.Builder()`
+     * 新建)保留连接池、以及按 host 白名单的自签证书信任(铁律 5)——和 [HttpStreamProbe] 内部
+     * 那次派生是同一个理由,同一个坑。
+     */
+    private fun cacheDownloadHttpClient(client: OkHttpClient): OkHttpClient =
+        client.newBuilder().readTimeout(STREAM_READ_TIMEOUT_MS.toLong(), TimeUnit.MILLISECONDS).build()
 
     /**
      * 生产环境的 [PlaybackSourceProvider] 是 [CacheAwareSourceProvider] 包一层 [PlaybackSourceResolver]

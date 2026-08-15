@@ -463,8 +463,14 @@ internal fun fakeItems(): List<MediaItem> =
  * `instanceId` + [Log] 是本任务要求的"验证机制,而不是断言机制"的具体做法:报告里贴的
  * create/cleared 日志行,就是"ViewModel 是否被重建"这件事的直接证据,不是从代码读出来的推测。
  *
- * `internal`(不是 private)——同包的 [ListScrollProcessDeathTest]([android]androidTest 里)复用
- * 这个假 ViewModel 去验证复审提出的候选 (i)(进程回收 / Activity 重建)。
+ * **历史注记(Finding 3,已闭合)**:这个类原本还被同包的 `ListScrollProcessDeathTest` 复用,
+ * 用来验证复审提出的候选 (i)(进程回收 / Activity 重建)——但那个用例名字叫"滚动位置丢失",
+ * 断言的却是"滚动位置保持"(`ActivityScenario` 管理的裸壳 `ComponentActivity` 从未被真正销毁,
+ * 所谓的"进程回收"路径根本没跑到),且 `@Before`/`@After` 会翻转全局开发者选项
+ * `always_finish_activities`,一旦 instrumentation 进程中途被杀(adb 断连、Ctrl-C),会把模拟器
+ * 卡在"不保留活动"状态、污染后面所有设备测试。已删除——它想验证的那个负面结论(候选 (i) 在任何
+ * 可达路径上都没能复现)已经如实记录在 `task-5-report.md` 与设计文档 §7.3,不需要一条长期挂在
+ * CI 里、名不副实又有副作用的测试来"守住"一个从来没被真正验证过的路径。
  */
 // public(不是 private)——androidx.lifecycle 的 ViewModelProvider 用反射
 // `Constructor.newInstance()` 构造它,反射调用方在另一个包(androidx.lifecycle.viewmodel.internal)

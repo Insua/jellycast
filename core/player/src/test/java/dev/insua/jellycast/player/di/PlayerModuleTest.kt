@@ -2,7 +2,9 @@ package dev.insua.jellycast.player.di
 
 import dev.insua.jellycast.network.di.TrustAwareHttpClient
 import dev.insua.jellycast.player.HttpStreamProbe
+import dev.insua.jellycast.player.STREAM_READ_TIMEOUT_MS
 import okhttp3.OkHttpClient
+import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -60,6 +62,50 @@ class PlayerModuleTest {
             trustAwareClient.hostnameVerifier,
             derivedClient.hostnameVerifier,
             "派生出的 client hostnameVerifier 不是原始 trust-aware client 的——自签证书信任丢了",
+        )
+    }
+
+    /**
+     * Finding 2(已闭合):[PlayerModule.provideAudioCacheStore] 把共享的 `@TrustAwareHttpClient`
+     * 原样传给 [AudioCacheDownloader],那份共享 client 保留 okhttp 默认的 10 秒读超时——
+     * 4K HEVC `.ts` 这类源服务端要 6–46 秒才吐响应头,后台预缓存对这类源会稳定命中超时、删掉
+     * `.part` 文件、悄悄失败,`CachePrefetchController` 永远预缓存不成功。
+     *
+     * 派生逻辑抽成了 [PlayerModule.cacheDownloadHttpClient](private),这里反射调用它本身——不
+     * 经过需要 `Context`/Room 的完整 `provideAudioCacheStore`,直接验证"派生出的 client 读超时
+     * 确实是 [STREAM_READ_TIMEOUT_MS]"。
+     *
+     * 变异验证:把 `cacheDownloadHttpClient` 的实现改回 `return client`(即撤销这次修复,让
+     * `AudioCacheDownloader` 继续接未修改的共享 client)——这条用例断言的
+     * `derived.readTimeoutMillis == STREAM_READ_TIMEOUT_MS` 会失败(读到的是 okhttp 默认的
+     * 10_000,不是 60_000),证明它确实在守卫这次修复,不是摆设。
+     */
+    @Test fun `cacheDownloadHttpClient 派生出的client读超时是STREAM_READ_TIMEOUT_MS而不是共享client的默认10秒`() {
+        val sharedClient = OkHttpClient()
+        check(sharedClient.readTimeoutMillis != STREAM_READ_TIMEOUT_MS) {
+            "前置条件失败:共享 client 的默认读超时本来就等于 STREAM_READ_TIMEOUT_MS,这条用例测不出区别"
+        }
+
+        val method = PlayerModule::class.java
+            .getDeclaredMethod("cacheDownloadHttpClient", OkHttpClient::class.java)
+            .apply { isAccessible = true }
+        val derived = method.invoke(PlayerModule, sharedClient) as OkHttpClient
+
+        assertEquals(
+            STREAM_READ_TIMEOUT_MS,
+            derived.readTimeoutMillis,
+            "AudioCacheDownloader 派生出的 client 读超时不是 STREAM_READ_TIMEOUT_MS——" +
+                "高码率 MPEG-TS 源的后台预缓存会在服务端吐响应头之前就被 okhttp 默认的 10 秒读超时打断",
+        )
+        assertSame(
+            sharedClient.connectionPool,
+            derived.connectionPool,
+            "派生出的 client 连接池不是原始共享 client 的——像是另起了一个新 client",
+        )
+        assertSame(
+            sharedClient.sslSocketFactory,
+            derived.sslSocketFactory,
+            "派生出的 client sslSocketFactory 不是原始共享 client 的——自签证书信任丢了",
         )
     }
 }

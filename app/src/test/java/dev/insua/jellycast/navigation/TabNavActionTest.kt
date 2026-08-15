@@ -174,10 +174,20 @@ class TabNavActionTest {
         )
     }
 
-    /** 导航还没就绪时 `currentBackStackEntryAsState()` 可能给出 `null`——不能崩,按"跨 tab 切换"处理。 */
-    @Test fun `currentRoute为null时按跨tab切换处理`() {
+    /**
+     * **Finding 1 的回归用例(改写前叫 `currentRoute为null时按跨tab切换处理`,断言的是
+     * [TabNavAction.SwitchTab]`(HOME)`)。** 导航还没就绪时 `currentBackStackEntryAsState()`
+     * 可能给出 `null`,`stackRoutes` 也可能是空列表(还没有任何 entry)——这条输入曾经会漏过
+     * `tabRoute == Routes.HOME` 分支(因为那时该分支还带着 `tabRoute in stackRoutes` 检查),
+     * 落进 `else`,返回 `SwitchTab(HOME)`。执行体会把它变成
+     * `navigate(HOME){popUpTo(HOME){saveState=true};restoreState=true}`——本文件顶部那条铁律
+     * 禁止的形状。修复后 `tabRoute == Routes.HOME` 分支不再看 `stackRoutes`,对这条输入也必须
+     * 得到 [TabNavAction.PopToTabRoot]`(HOME, saveState = true)`,和"HOME 已经在栈上"时同一个
+     * 结论——不能崩,也不能违反铁律。
+     */
+    @Test fun `导航还没就绪currentRoute为null时点在听仍然走PopToTabRoot而不是SwitchTab`() {
         assertEquals(
-            TabNavAction.SwitchTab(Routes.HOME),
+            TabNavAction.PopToTabRoot(Routes.HOME, saveState = true),
             tabNavAction(currentRoute = null, tabRoute = Routes.HOME, stackRoutes = emptyList()),
         )
     }

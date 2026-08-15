@@ -62,6 +62,17 @@ import javax.inject.Inject
  *    这就是 R1 的回归点,修复前这里会是 `CLIENT_VIDEO_DISABLED`。
  * 2. 走生产路径 `engine.play()` 之后,`absolutePositionMs` 必须**真的前进**,不是停在原地。
  *
+ * ## ⚠️ 不验证分辨率/码率——`MediaStreamDto` 拿不到这两样
+ *
+ * 类名叫「高码率 MPEGTS」,但这条用例**不验证挑中的片源真的是高码率**,也不验证分辨率:
+ * `dev.insua.jellycast.network.dto.MediaStreamDto` 没有 `Width`/`Height`/码率这几个字段(只有
+ * `Type`/`Index`/`Codec`/`Language`/`DisplayTitle`/`IsTextSubtitleStream`/`IsExternal`)——不是
+ * 疏漏,是 Jellyfin `PlaybackInfo` 响应本身这几个字段就没往 DTO 里映射。日志里能报的只有容器
+ * (`mediaSourceContainer`,如 `"mpegts"`)和视频编码(`videoCodec`,如 `"hevc"`),这两个不足以
+ * 区分"高码率 4K HEVC"和"随便一个 mpegts 封装的低码率 480p"——低码率的 `.ts` 一样会让这条用例
+ * 通过。名字里的「高码率」描述的是这条回归**本来针对**的那类片源(见上面「为什么必须存在」),
+ * 不是这条用例**实际验证过**的属性。
+ *
  * ## ⚠️ 这条用例目前是冒烟,不是回归护栏——如实记录
  *
  * 按简报 Step 3 做过变异验证:把 [dev.insua.jellycast.player.HttpStreamProbe] 的超时派生临时改回
@@ -163,9 +174,11 @@ class HighBitrateSourceE2eTest {
             "resolve() 结果:level=${source.level},容器=$mediaSourceContainer,视频编码=${videoCodec ?: "未知"}",
         )
         assertTrue(
-            "高码率 MPEG-TS 片源没有走 L1:level=${source.level}(容器=$mediaSourceContainer," +
-                "视频编码=${videoCodec ?: "未知"})。这正是 R1 要防住的回归——L1 探测的读超时如果又被" +
-                "改回默认的 10s,大文件的响应头等不到就会被误判成'不是纯音频',从而错误降级到 L3。",
+            "MPEG-TS 片源没有走 L1:level=${source.level}(容器=$mediaSourceContainer," +
+                "视频编码=${videoCodec ?: "未知"})。注意:这条用例是冒烟测试,不是 R1(L1 探测读超时" +
+                "不足导致误降级到 L3)的回归护栏——见类 KDoc 里的变异验证记录,这台服务器上探测" +
+                "响应目前落在 okhttp 默认 10s 超时线以内,问不出'读超时抬高前后'的差别。真正守 R1 的" +
+                "是 core/player 的 HttpStreamProbeTimeoutTest。这条断言只说明:今天这个源没能走上 L1。",
             source.level == AudioDeliveryLevel.SERVER_AUDIO_ONLY,
         )
 
@@ -311,7 +324,12 @@ class HighBitrateSourceE2eTest {
         const val TAG = "HighBitrateSourceE2e"
         const val E2E_SERVER_ID = "e2e-server"
 
-        /** 候选扫描上限,和 `PlaybackE2eTest.pickPlayableItems` 一致——见 [pickMpegTsEpisode] 的 KDoc。 */
+        /**
+         * 候选扫描上限。**和 `PlaybackE2eTest.pickPlayableItems` 的 `limit=50` 不一致,故意的**——
+         * 起初照抄了那个 50,实测这台服务器按 `SortName` 排到的第一个 MPEG-TS 容器剧集是第 56 个,
+         * 50 扫不到、测试直接失败,改成了 100。别为了"看齐"把这个值改回 50。详见
+         * [pickMpegTsEpisode] 的 KDoc。
+         */
         const val CANDIDATE_SCAN_LIMIT = 100
 
         /** 拿到第一条流并出声的宽限。4K `.ts` 片源实测响应头要 6–46s,留足余量。 */

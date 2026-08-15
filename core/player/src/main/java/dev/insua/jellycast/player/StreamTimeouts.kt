@@ -1,8 +1,17 @@
 package dev.insua.jellycast.player
 
 /**
- * L1/L3 流(探测与播放两处)共用的 HTTP 超时。见
- * `docs/superpowers/specs/2026-08-15-high-bitrate-playback-and-scroll-restore-design.md` §5.1/§5.2。
+ * L1/L3 流共用的 HTTP 超时,一共三处消费方(Finding 2 复审补全:之前这里写「探测与播放两处」,
+ * 漏了缓存下载):
+ * 1. **探测** —— [HttpStreamProbe]。
+ * 2. **播放** —— ExoPlayer 自己的 HTTP 数据源(`JellyCastPlayerFactory`)。
+ * 3. **缓存下载** —— `AudioCacheDownloader`(经 `PlayerModule.cacheDownloadHttpClient` 派生;
+ *    `:core:cache` 模块本身不认识这两个常量,派生逻辑放在能同时看到两边的 `:core:player`)。
+ *
+ * 三处打的是同一条 `/Audio/{id}/universal` URL,同一台服务器上遇到的响应头延迟是同一个分布,
+ * 因此共用同一组常量——不是巧合,是同一个根因在三个不同调用路径上分别复现。
+ *
+ * 见 `docs/superpowers/specs/2026-08-15-high-bitrate-playback-and-scroll-restore-design.md` §5.1/§5.2。
  *
  * ## 为什么必须是两个值而不是一个
  *
