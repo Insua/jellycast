@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- MockWebServer 在设备本机监听回环端口,SlowResponsePlaybackDeviceTest 也要走 socket:测试 APK 需要 INTERNET。 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- MockWebServer 是明文 http://localhost:port;仅测试 APK 放开明文,不影响 :app。 -->
+    <application android:usesCleartextTraffic="true" />
+</manifest>

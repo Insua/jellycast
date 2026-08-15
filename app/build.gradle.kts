@@ -239,6 +239,16 @@ dependencies {
     androidTestUtil(libs.androidx.test.orchestrator)
     androidTestUtil(libs.androidx.test.services)
     androidTestImplementation(libs.androidx.test.ext.junit)
+    // ListScrollRestoreTest(Task 5:列表滚动位置复现)手搭一个 NavHost 直接驱动
+    // LibraryScreenContent/LibraryUiState——这两个依赖在 :app 的 main 源码集里只是
+    // `implementation`,不会传递到 androidTest 的编译期 classpath(同上面 core-ktx 那条注释
+    // 的道理),需要单独声明一次。
+    androidTestImplementation(project(":core:model"))
+    androidTestImplementation(project(":feature:library"))
+    androidTestImplementation(libs.navigation.compose)
+    androidTestImplementation(libs.androidx.lifecycle.viewmodel.compose)
+    androidTestImplementation(libs.androidx.test.espresso.core)
+    androidTestImplementation(libs.androidx.test.uiautomator)
     androidTestImplementation(libs.hilt.android.testing)
     kspAndroidTest(libs.hilt.compiler)
     // 端到端测试直接注入 @Singleton 的 ExoPlayer(和 PlaybackService 用的是同一个实例),

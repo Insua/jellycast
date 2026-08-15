@@ -429,4 +429,65 @@ class PlaybackSourceResolverTest {
         val src = newResolver(probe(emptySet())).resolve(TEST_ITEM_ID, TEST_USER_ID)
         assertEquals("session-1", src.playSessionId)
     }
+
+    /**
+     * L3 兜底必须把视频压到最低(设计文档 §3.3/§5.3)。
+     *
+     * 不加这些参数时服务端对视频做**流拷贝**:4K HEVC 片源实测 54.5 Mbps,客户端即使禁用了
+     * 视频轨,混流的字节也必须整条下载才能取出音频 —— 家宽上行不可能,表现就是"一直卡死"。
+     * 加上限后实测 0.51 Mbps、2.2 倍实时。
+     *
+     * 音频参数是顺带补的:L3 原来一个音频参数都不带,服务端给什么是什么。
+     */
+    @Test
+    fun `L3兜底URL带上视频降码率与音频转码参数`() = runTest {
+        val resolver = newResolver(probe(emptySet()))   // 探测说"不是纯音频" → 走 L3
+
+        val source = resolver.resolve(TEST_ITEM_ID, TEST_USER_ID)
+
+        assertEquals(AudioDeliveryLevel.CLIENT_VIDEO_DISABLED, source.level)
+        listOf(
+            "videoCodec=h264",
+            "videoBitRate=100000",
+            "maxWidth=320",
+            "maxFramerate=15",
+            "audioCodec=aac",
+            "audioBitRate=128000",
+            "maxAudioChannels=2",
+        ).forEach { param ->
+            assertTrue(source.streamUrl.contains(param), "L3 URL 缺少 $param:${source.streamUrl}")
+        }
+    }
+
+    /** 这次改动不许污染 L1:L1 是纯音频接口,加视频参数没有意义还可能改变服务端行为。 */
+    @Test
+    fun `L1的URL不含任何视频参数`() = runTest {
+        val resolver = newResolver(probe(setOf("/Audio/")))
+
+        val source = resolver.resolve(TEST_ITEM_ID, TEST_USER_ID)
+
+        assertEquals(AudioDeliveryLevel.SERVER_AUDIO_ONLY, source.level)
+        listOf("videoCodec", "videoBitRate", "maxWidth", "maxFramerate").forEach { param ->
+            assertFalse(source.streamUrl.contains(param), "L1 URL 不该出现 $param:${source.streamUrl}")
+        }
+    }
+
+    /**
+     * `L3兜底URL带上视频降码率与音频转码参数` 只用了默认 resolver,而默认的 `audioBitRateBps`
+     * 恰好等于 `DEFAULT_AUDIO_BIT_RATE_BPS`(128 000)—— 所以就算 `buildVideoStreamUrl` 把
+     * `audioBitRate` 写死成 `128000` 而不是真正拼 `audioBitRateBps` 参数,那条测试也测不出来。
+     *
+     * 镜像 [L1 的 URL 携带 spike 验证过的参数](第 76 行)的写法:用非默认 `audioBitRateBps`
+     * 构造 resolver,断言这个值真的流进了 L3 URL,而不是默认值。
+     */
+    @Test
+    fun `L3的URL携带非默认audioBitRateBps`() = runTest {
+        val resolver = newResolver(probe(emptySet()), audioBitRateBps = 64_000)   // 走 L3
+
+        val source = resolver.resolve(TEST_ITEM_ID, TEST_USER_ID)
+
+        assertEquals(AudioDeliveryLevel.CLIENT_VIDEO_DISABLED, source.level)
+        assertTrue(source.streamUrl.contains("audioBitRate=64000"), source.streamUrl)
+        assertFalse(source.streamUrl.contains("audioBitRate=128000"), source.streamUrl)
+    }
 }
