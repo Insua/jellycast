@@ -12,6 +12,15 @@ import org.junit.jupiter.api.Test
  * (`series`/`collection`/`view`)、非 CHROME_ROUTES 的 `servers`、`null`(导航还没就绪时
  * `currentRoute` 的取值)、"子页面所属的 tab 根不在返回栈上"(首页库卡片直连场景),以及
  * "点『在听』时 `HOME` 作为 `popUpTo` 锚点自身"这个 fix round 4 才发现的自我循环场景。
+ *
+ * ## 这里守不住什么(别在这个文件里假装守住它)
+ *
+ * `TabNavAction.kt` 顶部那条铁律(**`HOME` 不许当 `navigate(…){restoreState = true}` 的目标**)
+ * **无法**在这个文件里被守卫:它约束的是 `backStackMap` 里"谁存、谁取"的配对,而 `backStackMap`
+ * 既不是 [tabNavAction] 的输入也不是 [restorableTabOwner] 的输入——存和取还可能发生在**两个不同的
+ * 调用点、相隔一段时间**(点『在听』时存,播放序列结束时取)。在这里写一条"看起来在守它"的用例
+ * 只会制造虚假的安全感:那条用例断言的仍然只是纯函数的返回值,而缺陷根本不在返回值里。
+ * 真正的守卫是设备测试 `TabNavInvariantSequenceTest`(穷举可达序列,直接看落地在哪个目的地)。
  */
 class TabNavActionTest {
 

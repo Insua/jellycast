@@ -102,17 +102,11 @@ fun JellyCastNavHost(
     LaunchedEffect(returnToHome) {
         if (!returnToHome) return@LaunchedEffect
         playerExpanded = false
-        // 先退到"当前站着的这个 tab 的根"(找不到就是 HOME 自己,见 restorableTabOwner 的
-        // KDoc——Fix round 2 修的 Critical 2/Important 3/Important 4 都在那份 KDoc 里讲清楚了),
-        // 只留根在栈上,再统一走 popUpTo(HOME){saveState=true} 把"根"存进 backStackMap。
-        val stackRoutes = navController.currentBackStack.value.map { it.destination.route }
-        val owner = restorableTabOwner(stackRoutes, BOTTOM_TABS.map { it.route })
-        if (owner != null) navController.popBackStack(owner, inclusive = false)
-        navController.navigate(Routes.HOME) {
-            popUpTo(Routes.HOME) { saveState = true }
-            launchSingleTop = true
-            restoreState = true
-        }
+        // 执行体在 TabNavAction.kt 的 executeReturnToHome——那份 KDoc 讲清楚了这里为什么必须用
+        // popBackStack(HOME, saveState = true) 而**不能**用
+        // navigate(HOME){popUpTo(HOME){saveState};restoreState},以及 TabNavAction.kt 顶部那条
+        // 「HOME 不许当 navigate + restoreState 的目标」的铁律。改这一行之前先读那两段。
+        navController.executeReturnToHome(BOTTOM_TABS.map { it.route })
         sessionViewModel.onReturnToHomeHandled()
     }
 
@@ -175,12 +169,11 @@ fun JellyCastNavHost(
                     onLibraryClick = { libraryId -> navController.navigate(Routes.libraryView(libraryId)) },
                     // 搜索入口跳进媒体库页——搜索框本来就长在那里(见 LibraryScreen 的
                     // LibraryScreenTestTags.SEARCH_FIELD),顶部栏这里不重新实现一遍搜索。
+                    // 走和底部栏「媒体库」tab **同一个**执行体:从首页点搜索,本来就等价于切到
+                    // 媒体库 tab。这样全项目带 saveState/restoreState 的 NavOptions 只剩
+                    // TabNavAction.kt 里那一份,不会有人在这里手抄出第二份、再撞上那条铁律。
                     onSearchClick = {
-                        navController.navigate(Routes.LIBRARY) {
-                            popUpTo(Routes.HOME) { saveState = true }
-                            launchSingleTop = true
-                            restoreState = true
-                        }
+                        navController.executeTabNavAction(TabNavAction.SwitchTab(Routes.LIBRARY))
                     },
                     // 账户入口跳进设置页——服务器管理(登录态/账号切换)本来就在那里。
                     onAccountClick = { navController.navigate(Routes.SETTINGS) },
@@ -269,21 +262,14 @@ private fun BottomNavBar(currentRoute: String?, navController: NavHostController
             NavigationBarItem(
                 selected = currentRoute == tab.route,
                 // 决策本身是纯函数(tabNavAction,见 TabNavAction.kt——离线可单测,项目铁律 6),
-                // 这里只负责执行它返回的结果。栈里现有的路由要现取——子页面可以不经过 tab 根就被
+                // 执行体(executeTabNavAction)也在那个文件里,和它要遵守的那条
+                // 「HOME 不许当 navigate + restoreState 的目标」铁律放在一起。
+                // 栈里现有的路由要现取——子页面可以不经过 tab 根就被
                 // 直接推入栈(比如首页「我的媒体」库卡片直连 library/view/{id}),tabNavAction 得
                 // 知道根在不在栈上才能决定能不能退。
                 onClick = {
                     val stackRoutes = navController.currentBackStack.value.map { it.destination.route }
-                    when (val action = tabNavAction(currentRoute, tab.route, stackRoutes)) {
-                        TabNavAction.None -> Unit
-                        is TabNavAction.PopToTabRoot ->
-                            navController.popBackStack(action.route, inclusive = false, saveState = action.saveState)
-                        is TabNavAction.SwitchTab -> navController.navigate(action.route) {
-                            popUpTo(Routes.HOME) { saveState = true }
-                            launchSingleTop = true
-                            restoreState = true
-                        }
-                    }
+                    navController.executeTabNavAction(tabNavAction(currentRoute, tab.route, stackRoutes))
                 },
                 icon = { Icon(tab.icon, contentDescription = tab.label) },
                 label = { Text(tab.label) },

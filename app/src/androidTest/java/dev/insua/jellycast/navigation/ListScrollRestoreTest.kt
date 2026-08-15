@@ -61,12 +61,13 @@ import org.junit.runner.RunWith
  *
  * - **三个 tab**(在听/媒体库/设置),路由字符串直接复用 [Routes] 里的常量/工厂函数——不是
  *   照着敲一遍长得像的字符串,是同一份真值来源。
- * - **底部导航栏的决策**直接调用生产纯函数 [tabNavAction](`TabNavAction.kt`),不再手写一份
- *   `when` 分支去"模拟"它——Fix round 2 复审的 Important 5 明确指出:round 1 的变异验证只打在
- *   测试镜像上,生产代码从来没被验证过。现在镜像和生产用的是**同一个函数**,不存在"镜像跟生产
- *   代码不同步"的问题。
- * - **`returnToHome` 的决策**同样调用生产纯函数 [restorableTabOwner],只有 `popBackStack`/
- *   `navigate` 这两行必须触碰真实 `NavController` 的部分留在这里手写(无法抽成纯函数)。
+ * - **底部导航栏**的决策([tabNavAction])**和执行**([executeTabNavAction])都直接调用生产代码
+ *   (`TabNavAction.kt`),不再手写一份 `when` 分支或一份 `NavOptions` 去"模拟"它——Fix round 2
+ *   复审的 Important 5 明确指出:round 1 的变异验证只打在测试镜像上,生产代码从来没被验证过。
+ *   现在镜像和生产用的是**同一份代码**,连 `navigate` 的 `NavOptions` 都是同一份。
+ * - **`returnToHome`** 同样直接调用生产的 [executeReturnToHome](Fix round 5 起——在那之前
+ *   `popBackStack`/`navigate` 那两行是在这里手抄的,而 Critical 恰恰就藏在被手抄的
+ *   `NavOptions` 里)。
  * - **子路由用真实的模式**:`library/series/{seriesId}`、`library/view/{libraryId}`、
  *   `settings` 下挂一个不带 `"settings/"` 前缀的 `servers`——round 1 的镜像只有一个
  *   `detail/{seriesId}`,和生产的路由表形状不一样,所以看不见 Critical 2(`library/view` 从
@@ -188,9 +189,10 @@ class ListScrollRestoreTest {
 
     /**
      * `returnToHome`(播放序列结束回首页)修好之后的正确行为:从库详情页触发,先退到「媒体库」
-     * 根(子页面被丢弃,不 `saveState`——它已经播完了,不需要以后自动弹回那一集的详情页),再对
-     * 「媒体库」根做 `popUpTo(HOME){saveState=true}`。之后再点『媒体库』tab,恢复出来的是列表
-     * 本身,滚动位置保持。
+     * 根(子页面被丢弃,不 `saveState`——它已经播完了,不需要以后自动弹回那一集的详情页),再
+     * `popBackStack(HOME, inclusive = false, saveState = true)` 把「媒体库」根存起来
+     * (Fix round 5 起不再走 `navigate(HOME){…restoreState}`,原因见 [executeReturnToHome])。
+     * 之后再点『媒体库』tab,恢复出来的是列表本身,滚动位置保持。
      */
     @Test
     fun 播放序列结束返回首页后再次进入媒体库滚动位置保持() {
@@ -642,16 +644,7 @@ internal fun TestNavRoot(onBackstackChanged: (List<BackStackEntrySnapshot>) -> U
                 // 不塞进某个具体子页面,这样才能从"库详情页"以外的地方也触发它
                 // (比如 library/view、servers)。
                 Button(
-                    onClick = {
-                        val stackRoutes = navController.currentBackStack.value.map { it.destination.route }
-                        val owner = restorableTabOwner(stackRoutes, TAB_ROUTES)
-                        if (owner != null) navController.popBackStack(owner, inclusive = false)
-                        navController.navigate(Routes.HOME) {
-                            popUpTo(Routes.HOME) { saveState = true }
-                            launchSingleTop = true
-                            restoreState = true
-                        }
-                    },
+                    onClick = { navController.executeReturnToHome(TAB_ROUTES) },
                     modifier = Modifier.testTag(END_PLAYBACK_TAG),
                 ) { Text("结束播放返回首页") }
 
@@ -661,25 +654,17 @@ internal fun TestNavRoot(onBackstackChanged: (List<BackStackEntrySnapshot>) -> U
                         Triple(Routes.LIBRARY, BOTTOM_NAV_TAG, "媒体库"),
                         Triple(Routes.SETTINGS, BOTTOM_NAV_SETTINGS_TAG, "设置"),
                     ).forEach { (route, tag, label) ->
-                        // 逐字复刻 JellyCastNavHost.kt 里 `BottomNavBar` 的 onClick(修好之后的
-                        // 版本)——直接调用生产纯函数 tabNavAction,不是重新手写一份"像"它的逻辑。
+                        // 和 JellyCastNavHost.kt 的 `BottomNavBar.onClick` 走的是**同一份**
+                        // 生产代码:决策 tabNavAction + 执行 executeTabNavAction,连
+                        // `navigate` 的 NavOptions 都不再在测试里手抄一份——那几行 NavOptions 正是
+                        // saveState/restoreState 配对关系的所在,手抄一份就等于变异验证打不到生产。
                         Button(
                             onClick = {
                                 val stackRoutes =
                                     navController.currentBackStack.value.map { it.destination.route }
-                                when (val action = tabNavAction(currentRoute, route, stackRoutes)) {
-                                    TabNavAction.None -> Unit
-                                    is TabNavAction.PopToTabRoot -> navController.popBackStack(
-                                        action.route,
-                                        inclusive = false,
-                                        saveState = action.saveState,
-                                    )
-                                    is TabNavAction.SwitchTab -> navController.navigate(action.route) {
-                                        popUpTo(Routes.HOME) { saveState = true }
-                                        launchSingleTop = true
-                                        restoreState = true
-                                    }
-                                }
+                                navController.executeTabNavAction(
+                                    tabNavAction(currentRoute, route, stackRoutes),
+                                )
                             },
                             modifier = Modifier.testTag(tag),
                         ) { Text(label) }
