@@ -16,8 +16,14 @@ import org.junit.jupiter.api.Test
  * 这里不连真实 TLS 握手(离线单测拿不到自签证书服务器),只验证"接线"本身:
  * 1. [PlayerModule.provideStreamProbe] 的唯一参数必须标注 [TrustAwareHttpClient],而不是接受一个
  *    不带 qualifier、来源不明的 `OkHttpClient`。
- * 2. 传入 provider 的 client 就是最终塞进 [HttpStreamProbe] 内部的那个实例(证明没有在中途另起
- *    一个新 client、或者把参数吞掉不用)。
+ * 2. 传入 provider 的 client 的信任配置(连接池 + TLS 信任链)被原样带进了 [HttpStreamProbe] 内部
+ *    ——证明没有在中途另起一个不认自签证书的裸 client、或者把参数吞掉不用。
+ *
+ *    2026-08-15 起,[HttpStreamProbe] 为了给 L1 探测单独配一条长读超时(见其 KDoc/
+ *    `StreamTimeouts.kt`),会用 `client.newBuilder()...build()` 派生出一个新的 `OkHttpClient`
+ *    实例——所以这里不能再用 `assertSame(trustAwareClient, ...)` 判断"同一个实例",
+ *    newBuilder() 产出的必然是不同对象。但它必须**复制**而不是**丢弃**连接池与证书信任配置,
+ *    于是改为分别断言这几个字段与原始 client 是同一个引用。
  */
 class PlayerModuleTest {
 
@@ -32,12 +38,28 @@ class PlayerModuleTest {
         )
     }
 
-    @Test fun `provideStreamProbe 把传入的 trust-aware client 原样交给 HttpStreamProbe,不是另起一个`() {
+    @Test fun `provideStreamProbe 把传入的 trust-aware client 的信任配置原样带进 HttpStreamProbe,不是另起一个裸 client`() {
         val trustAwareClient = OkHttpClient()
 
         val probe = PlayerModule.provideStreamProbe(trustAwareClient) as HttpStreamProbe
 
         val clientField = HttpStreamProbe::class.java.getDeclaredField("client").apply { isAccessible = true }
-        assertSame(trustAwareClient, clientField.get(probe))
+        val derivedClient = clientField.get(probe) as OkHttpClient
+
+        assertSame(
+            trustAwareClient.connectionPool,
+            derivedClient.connectionPool,
+            "派生出的 client 连接池不是原始 trust-aware client 的——像是另起了一个新 client",
+        )
+        assertSame(
+            trustAwareClient.sslSocketFactory,
+            derivedClient.sslSocketFactory,
+            "派生出的 client sslSocketFactory 不是原始 trust-aware client 的——自签证书信任丢了",
+        )
+        assertSame(
+            trustAwareClient.hostnameVerifier,
+            derivedClient.hostnameVerifier,
+            "派生出的 client hostnameVerifier 不是原始 trust-aware client 的——自签证书信任丢了",
+        )
     }
 }
