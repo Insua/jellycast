@@ -102,9 +102,35 @@ fun JellyCastNavHost(
     LaunchedEffect(returnToHome) {
         if (!returnToHome) return@LaunchedEffect
         playerExpanded = false
+        // 播放序列结束时可能正停在「媒体库」tab 的子页面上(剧集详情/合集详情/按库浏览)——
+        // 这一集/这部剧已经看完了,以后回到「媒体库」tab 不需要自动弹回那个子页面,只需要保住
+        // "媒体库"这个列表本身的浏览位置。所以先把子页面永久弹掉(不 saveState,它们不该被
+        // 恢复),只留 tab 根在栈上,再统一走 popUpTo(HOME){saveState=true} 把"根"存进
+        // backStackMap。
+        //
+        // 🔴 为什么不能只调整下面 navigate 的 NavOptions 了事(brief 给的两种写法都实测跑不通):
+        // - `popUpTo(HOME){inclusive=true; saveState=true}`:inclusive 把 HOME 自己也弹出、也
+        //   存进 backStackMap,这时 HOME 是"被弹出的这段里最深的那个目的地",于是 restoreState
+        //   命中的不是空首页,而是**连同它上面的 library/detail 一起原样恢复**——从详情页触发
+        //   这次跳转后,界面停在原地的详情页,`home` 目的地根本没出现过(实测:连
+        //   `test_home_screen` 都找不到)。这比"首页没重置"更糟,是彻底的导航失败。
+        // - `popUpTo(HOME){saveState=true}`(不带 inclusive,brief 给的备选):HOME 确实正常
+        //   落地了,但 popUpTo(HOME) 弹出的是 [library, detail] **整段**,按"这段里最深的目的地"
+        //   (library)存成一个整体。下次点『媒体库』tab、`restoreState` 命中这个 key 时,恢复的
+        //   是**整段**,落地在 detail 上,不是 library 列表——实测 logcat:
+        //   `backstack changed: currentRoute=detail/{seriesId} stack=[..., library#fbc5, detail#2370]`,
+        //   entry id 与销毁前逐字相同,列表网格根本没显示,`firstVisibleItemIndex=-1`。
+        // 只有先把子页面单独弹掉(不存)、只留 library 自己进 backStackMap,才能保证以后恢复出来
+        // 的正是列表本身。
+        navController.popBackStack(Routes.LIBRARY, inclusive = false)
         navController.navigate(Routes.HOME) {
-            popUpTo(Routes.HOME) { inclusive = true }
+            // saveState:播放序列结束回首页,不该把用户在「媒体库」里的浏览位置一并销毁。
+            // 少了它,library 条目连同它的 ViewModelStore / SaveableStateHolder 槽位被整个销毁,
+            // 下次进媒体库是一次全新 push,列表从第一页重拉、滚动回到顶部(实测)。
+            // 不带 inclusive:HOME 自己不需要参与 save/restore,原因见上面那段注释。
+            popUpTo(Routes.HOME) { saveState = true }
             launchSingleTop = true
+            restoreState = true
         }
         sessionViewModel.onReturnToHomeHandled()
     }
@@ -262,8 +288,27 @@ private fun BottomNavBar(currentRoute: String?, navController: NavHostController
             NavigationBarItem(
                 selected = currentRoute == tab.route,
                 onClick = {
-                    if (currentRoute != tab.route) {
-                        navController.navigate(tab.route) {
+                    when {
+                        // 已经站在这个 tab 的根上:什么都不做。
+                        currentRoute == tab.route -> Unit
+
+                        // 已经在这个 tab 的子页面里(该 tab 的根还在返回栈上):退回它的根。
+                        //
+                        // 🔴 这里**不能**走下面那条 navigate 分支。Navigation-Compose 2.9.8 的
+                        // navigate 先做 popBackStackInternal(saveState = true),把弹出的那段按
+                        // 「最深被弹出的目的地」为键存起来——在这个扁平图里那个键就是 tab 自己——
+                        // 然后 restoreState 又把它原样恢复回来,净效果是零。实测:详情页上点
+                        // 「媒体库」,返回栈逐字节不变,entry id 都没变。
+                        //
+                        // popBackStack 保住的是**同一个** NavBackStackEntry,因此
+                        // ViewModelStore 和 SaveableStateHolder 槽位都还在,滚动位置随之保住——
+                        // 这正是我们要的。目的地不在栈上时它返回 false 且**不改动栈**,所以可以
+                        // 安全地当条件用。
+                        navController.popBackStack(tab.route, inclusive = false) -> Unit
+
+                        // 真正的跨 tab 切换:保留原有的 save/restore 语义(切走再切回来,回到你
+                        // 离开时的位置)。
+                        else -> navController.navigate(tab.route) {
                             popUpTo(Routes.HOME) { saveState = true }
                             launchSingleTop = true
                             restoreState = true

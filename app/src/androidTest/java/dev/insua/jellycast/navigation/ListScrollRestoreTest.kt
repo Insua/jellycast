@@ -111,47 +111,48 @@ class ListScrollRestoreTest {
     }
 
     /**
-     * **Fix round 1 —— 取代 round 0 里那个靠裁剪 navOptions 造红的"从底部导航栏返回"用例。**
+     * **Task 6 —— 缺陷 A 修好之后,把这条用例的语义从"确认缺陷存在"翻转成"确认修好了"。**
      *
-     * 复审用一个更小的探针在真实路由表上实测确认:生产代码原样的三个 `navOptions`
-     * (`saveState=true` + `launchSingleTop=true` + `restoreState=true`)同时出现,且这次
-     * `popUpTo` 弹出、`restoreState` 要恢复的目的地是**同一个**("library" 自己,不是切到另一个
-     * tab)时,`navController.navigate(...)` 是彻底的 no-op——正常返回、不抛异常,但返回栈的
-     * entry id、当前路由一个都没变(Probe A)。这不是本测试模型的产物,是 Navigation-Compose
-     * 2.9.8 的真实行为,也是一个真实、用户可达的缺陷:**从剧集详情页点『媒体库』tab 图标,
-     * 界面停在原地,什么反应都没有**。
+     * 修复前:`navigate(tab.route){popUpTo(HOME){saveState=true};launchSingleTop;restoreState=true}`
+     * 在这个扁平图里是彻底的 no-op(见本文件顶部 KDoc 和 `task-6-brief.md` 的分析)——从详情页点
+     * 「媒体库」tab,界面停在原地。
      *
-     * 这与用户原始报告的"滚动丢失"是不同症状,所以这里断言的是 no-op 本身(backstack 没变、
-     * 仍在详情页),不再断言滚动位置——那条路径上滚动位置从来没有被检验的机会。
+     * 修好之后(`BottomNavBar` 改用 `navController.popBackStack(tab.route, inclusive = false)`
+     * 兜底):同样的点击应该**退回该 tab 的根**——detail 被弹出,当前路由变回 "library"——而且
+     * `popBackStack` 保住的是**同一个** `NavBackStackEntry`,所以 "library" 的 entry id 点击前后
+     * 必须一致(证明保住的是原来那个条目、连同它的 `ViewModelStore`/`SaveableStateHolder`,不是
+     * 重新 push 出来的新条目)。
      */
     @Test
-    fun 从详情页点回自己所在tab时navigate是no_op_已确认缺陷() {
-        var lastBackstack: List<String?> = emptyList()
+    fun 从详情页点回自己所在tab时退回tab根且保住同一个条目() {
+        var lastBackstack: List<BackStackEntrySnapshot> = emptyList()
         composeTestRule.setContent {
             TestNavRoot(onBackstackChanged = { lastBackstack = it })
         }
 
         composeTestRule.enterLibraryAndOpenDetailAt(SCROLL_TARGET_INDEX)
         val beforeClick = lastBackstack
-        Log.i(TAG, "[no-op 探测] 点击前 backstack=$beforeClick")
+        Log.i(TAG, "[退回 tab 根探测] 点击前 backstack=$beforeClick")
+        val libraryIdBefore = beforeClick.single { it.route == "library" }.id
 
         composeTestRule.onNodeWithTag(BOTTOM_NAV_TAG).performClick()
         composeTestRule.waitForIdle()
-        // 给它一个正常导航/过渡动画绰绰有余的窗口——如果这段时间里 backstack 真的变了,
-        // lastBackstack 一定会被上面那个回调更新到。
-        Thread.sleep(1_000)
-        composeTestRule.waitForIdle()
 
         val afterClick = lastBackstack
-        Log.i(TAG, "[no-op 探测] 点击后 backstack=$afterClick")
+        Log.i(TAG, "[退回 tab 根探测] 点击后 backstack=$afterClick")
 
-        assert(afterClick == beforeClick) {
-            "预期是已确认的 no-op 缺陷(backstack 不变),但这次 backstack 变了:" +
-                "点击前=$beforeClick,点击后=$afterClick —— 说明这条路径在这次环境下不是 no-op," +
-                "需要重新核对复审的探针结论。"
+        // 退回了 tab 根:detail 被弹出,当前落在 "library"。
+        assert(afterClick.last().route == "library") {
+            "点『媒体库』tab 后应当退回它的根(library),实际最终路由=${afterClick.last().route}"
         }
-        // no-op 意味着仍然停在详情页,没有回到列表——这正是缺陷本身。
-        composeTestRule.onNodeWithTag(DETAIL_TAG).assertExists()
+        composeTestRule.onNodeWithTag(DETAIL_TAG).assertDoesNotExist()
+
+        // 保住的是同一个条目,不是重新 push 出来的新条目——entry id 必须不变。
+        val libraryIdAfter = afterClick.single { it.route == "library" }.id
+        assert(libraryIdAfter == libraryIdBefore) {
+            "退回「媒体库」应保住同一个 NavBackStackEntry(id 不变),实际点击前 id=$libraryIdBefore," +
+                "点击后 id=$libraryIdAfter —— 说明这是重新 push 的新条目,ViewModelStore/滚动状态会丢。"
+        }
     }
 
     /**
@@ -304,14 +305,20 @@ internal fun LibraryDestination(navController: NavHostController) {
  * "这次 navigate 到底有没有真的改变返回栈"([ListScrollRestoreTest.从详情页点回自己所在tab时navigate是no_op_已确认缺陷]
  * 需要这个信号来区分"no-op"和"真的导航了但滚动位置凑巧一样"这两种情况)。
  */
+/** 一次返回栈快照里的一条记录——路由 + entry id,用来区分"内容看着一样但其实是全新条目"
+ *  和"真的是同一个条目"(Step 5 需要靠 id 判断,不能只看路由字符串)。 */
+internal data class BackStackEntrySnapshot(val route: String?, val id: String)
+
 @Composable
-internal fun TestNavRoot(onBackstackChanged: (List<String?>) -> Unit = {}) {
+internal fun TestNavRoot(onBackstackChanged: (List<BackStackEntrySnapshot>) -> Unit = {}) {
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
 
     LaunchedEffect(currentRoute) {
-        val stack = navController.currentBackStack.value.map { it.destination.route }
+        val stack = navController.currentBackStack.value.map {
+            BackStackEntrySnapshot(it.destination.route, it.id)
+        }
         Log.i(TAG, "backstack changed: currentRoute=$currentRoute stack=$stack")
         onBackstackChanged(stack)
     }
@@ -321,9 +328,11 @@ internal fun TestNavRoot(onBackstackChanged: (List<String?>) -> Unit = {}) {
             Button(
                 onClick = {
                     Log.i(TAG, "bottom nav clicked, currentRoute=$currentRoute")
-                    if (currentRoute != "library") {
-                        // 逐字复刻 JellyCastNavHost.kt:266。
-                        navController.navigate("library") {
+                    // 逐字复刻 JellyCastNavHost.kt 里 BottomNavBar 的 onClick(修好之后的版本)。
+                    when {
+                        currentRoute == "library" -> Unit
+                        navController.popBackStack("library", inclusive = false) -> Unit
+                        else -> navController.navigate("library") {
                             popUpTo("home") { saveState = true }
                             launchSingleTop = true
                             restoreState = true
@@ -350,10 +359,19 @@ internal fun TestNavRoot(onBackstackChanged: (List<String?>) -> Unit = {}) {
                 // 但 navigate 调用本身逐字复刻,与从哪个目的地触发无关。
                 Button(
                     onClick = {
-                        // 逐字复刻 JellyCastNavHost.kt:105-108。
+                        // 逐字复刻 JellyCastNavHost.kt:105-121(修好之后的版本)。
+                        //
+                        // 只加 `popUpTo(home){saveState=true}` 不够:那样弹出的是
+                        // [library, detail] 整段,按"最深的目的地"(library)存成一个整体,
+                        // 之后点『媒体库』tab 恢复出来的是**整段**,落地在 detail 上,不是
+                        // library 列表本身(实测过,firstVisibleItemIndex=-1)。所以先把
+                        // "library" 之上的子页面永久弹掉(不 saveState),只留 "library" 自己
+                        // 进 backStackMap。
+                        navController.popBackStack("library", inclusive = false)
                         navController.navigate("home") {
-                            popUpTo("home") { inclusive = true }
+                            popUpTo("home") { saveState = true }
                             launchSingleTop = true
+                            restoreState = true
                         }
                     },
                     modifier = Modifier.testTag(END_PLAYBACK_TAG),
