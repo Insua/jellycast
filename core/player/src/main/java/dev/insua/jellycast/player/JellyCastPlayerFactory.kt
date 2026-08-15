@@ -4,6 +4,9 @@ import android.content.Context
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.TrackSelectionParameters
+import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -93,6 +96,30 @@ private const val BUFFER_FOR_PLAYBACK_MS = 5_000
 private const val BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS = 20_000
 
 /**
+ * L1/L3 远端流专用的 HTTP 数据源工厂。
+ *
+ * media3 1.10.1 的 `DefaultHttpDataSource` 默认 connect/read 各 8 秒
+ * (`DEFAULT_CONNECT_TIMEOUT_MILLIS` / `DEFAULT_READ_TIMEOUT_MILLIS`)。而 Jellyfin 为大文件
+ * 起转码要多久,取决于源容器 —— MPEG-TS 没有全局索引,ffmpeg 必须先扫描:实测同一台服务器上
+ * 1080p h264 mkv 的首字节 1.2–2.4 秒,4K HEVC 50fps 的 `.ts` 要 6.3–46.1 秒。
+ * **8 秒比 [HttpStreamProbe] 那边的坑还浅**:探测判定"可以走 L1"之后,播放器自己在同一条 URL
+ * 上超时,表现是 `Source error`,一秒都没播出来。
+ *
+ * 超时与探测取**同一组常量**([STREAM_CONNECT_TIMEOUT_MS] / [STREAM_READ_TIMEOUT_MS]):
+ * 两处面对的是同一个服务端行为,分别取值只会在下次调整时漏掉一处。
+ *
+ * 本地缓存文件不走 HTTP,不受这里影响。
+ */
+fun audioOnlyDataSourceFactory(context: Context): DataSource.Factory =
+    DefaultDataSource.Factory(
+        context,
+        DefaultHttpDataSource.Factory()
+            .setConnectTimeoutMs(STREAM_CONNECT_TIMEOUT_MS)
+            .setReadTimeoutMs(STREAM_READ_TIMEOUT_MS)
+            .setAllowCrossProtocolRedirects(true),
+    )
+
+/**
  * 音频缓存(L1,`Content-Type: audio/aac`,裸 ADTS,无容器)专用的媒体源工厂。
  *
  * ## Critical 复审:缓存文件其实不能 seek
@@ -122,10 +149,13 @@ private const val BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS = 20_000
  * 走的是"重新 resolve 一条新 URL 再 prepare"这条完全不同的路径(见该类类注释),这个开关只决定
  * `isCurrentMediaItemSeekable` 上报什么、`seekTo()` 是否可靠,不改变 buffering/下载行为,因此对
  * 远端流的既有 200+ 条测试没有任何影响。
+ *
+ * 数据源换成了 [audioOnlyDataSourceFactory](见该函数 KDoc:media3 默认 8 秒超时扛不住大文件转码的
+ * 首字节延迟),恒定码率 seek 的行为不受影响。
  */
 fun audioOnlyMediaSourceFactory(context: Context): DefaultMediaSourceFactory =
     DefaultMediaSourceFactory(
-        context,
+        audioOnlyDataSourceFactory(context),
         DefaultExtractorsFactory().setConstantBitrateSeekingEnabled(true),
     )
 

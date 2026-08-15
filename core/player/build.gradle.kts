@@ -63,6 +63,8 @@ dependencies {
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.junit4)
+    // SlowResponsePlaybackDeviceTest:用本地 HTTP server 模拟"服务端起转码要十几秒才吐响应头"。
+    androidTestImplementation(libs.okhttp.mockwebserver)
 }
 
 // AGP library 模块下 tasks.test 访问器不可用(它是 DefaultTask 聚合器),
