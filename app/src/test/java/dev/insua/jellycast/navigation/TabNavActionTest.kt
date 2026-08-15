@@ -10,7 +10,8 @@ import org.junit.jupiter.api.Test
  *
  * 表驱动覆盖三个 tab 根(`home`/`library`/`settings`)、`library` 的三种子路由模式
  * (`series`/`collection`/`view`)、非 CHROME_ROUTES 的 `servers`、`null`(导航还没就绪时
- * `currentRoute` 的取值),以及"子页面所属的 tab 根不在返回栈上"(首页库卡片直连场景)。
+ * `currentRoute` 的取值)、"子页面所属的 tab 根不在返回栈上"(首页库卡片直连场景),以及
+ * "点『在听』时 `HOME` 作为 `popUpTo` 锚点自身"这个 fix round 4 才发现的自我循环场景。
  */
 class TabNavActionTest {
 
@@ -37,15 +38,16 @@ class TabNavActionTest {
         )
     }
 
-    /** 正常路径:先进了「媒体库」tab 根,再点进子页面——根还在栈上,点回 tab 退回它。 */
+    /** 正常路径:先进了「媒体库」tab 根,再点进子页面——根还在栈上,点回 tab 退回它。同一个 tab
+     *  内部退到根,不需要把子页面存起来给谁恢复(`saveState = false`)。 */
     @Test fun `子页面点回自己所在tab时根在栈上就退回根`() {
         val stackViaLibraryRoot = listOf(Routes.HOME, Routes.LIBRARY, Routes.SERIES_DETAIL_PATTERN)
         assertEquals(
-            TabNavAction.PopToTabRoot(Routes.LIBRARY),
+            TabNavAction.PopToTabRoot(Routes.LIBRARY, saveState = false),
             tabNavAction(Routes.SERIES_DETAIL_PATTERN, Routes.LIBRARY, stackViaLibraryRoot),
         )
         assertEquals(
-            TabNavAction.PopToTabRoot(Routes.LIBRARY),
+            TabNavAction.PopToTabRoot(Routes.LIBRARY, saveState = false),
             tabNavAction(
                 Routes.COLLECTION_DETAIL_PATTERN,
                 Routes.LIBRARY,
@@ -53,7 +55,7 @@ class TabNavActionTest {
             ),
         )
         assertEquals(
-            TabNavAction.PopToTabRoot(Routes.LIBRARY),
+            TabNavAction.PopToTabRoot(Routes.LIBRARY, saveState = false),
             tabNavAction(
                 Routes.LIBRARY_VIEW_PATTERN,
                 Routes.LIBRARY,
@@ -93,25 +95,46 @@ class TabNavActionTest {
     }
 
     /**
-     * **Critical 1 的回归用例。** `HOME` 永远在栈底,子页面点「在听」必须走跨 tab 切换
-     * (`SwitchTab`,带 `saveState=true`),不能被误判成"属于 home 的子页面"从而退回根——
-     * `HOME` 根本没有任何子路由,`popBackStack("home", ...)` 对它之上的一切都会"成功"但那不代表
-     * 归属关系。
+     * **Fix round 4 的回归用例。** `HOME` 永远在栈底(`inclusive = false` 的 pop 从不把它算在被
+     * 弹的范围内),点「在听」必须无条件走 [TabNavAction.PopToTabRoot]`(saveState = true)`,
+     * **不能**走 [TabNavAction.SwitchTab]——那条路径会调用
+     * `navigate(HOME){popUpTo(HOME){saveState=true};restoreState=true}`,而
+     * `navigate()`/`restoreState` 这一套在目标就是 `popUpTo` 锚点本身(`HOME`)时会自我循环:
+     * 刚存下的那段被同一次调用的 `restoreState` 立刻恢复回去,点击变成 no-op——复审在真实路由表
+     * 上实测过(`home → library/view/lib1` 点『在听』,返回栈点击前后逐字节不变,entry id 都
+     * 没变)。改用 `popBackStack(HOME, inclusive=false, saveState=true)`,不经过
+     * `navigate()`/`restoreState`,天然不会有这个问题(同样实测过,见
+     * `ListScrollRestoreTest`)。
+     *
+     * 覆盖三种不同的"当前站在哪":经过 `library` 根的详情页、从首页库卡片直连的
+     * `library/view/{id}`(中途未经过 `library`)、以及 `settings`。三种情形下点「在听」
+     * 都应该得到同一个结论。
      */
-    @Test fun `在库详情页点在听是跨tab切换不是退回home根`() {
-        val stack = listOf(Routes.HOME, Routes.LIBRARY, Routes.SERIES_DETAIL_PATTERN)
-        assertEquals(TabNavAction.SwitchTab(Routes.HOME), tabNavAction(Routes.SERIES_DETAIL_PATTERN, Routes.HOME, stack))
+    @Test fun `点在听时无条件退回home并保存离开的这一段`() {
+        val viaLibraryRoot = listOf(Routes.HOME, Routes.LIBRARY, Routes.SERIES_DETAIL_PATTERN)
         assertEquals(
-            TabNavAction.SwitchTab(Routes.HOME),
+            TabNavAction.PopToTabRoot(Routes.HOME, saveState = true),
+            tabNavAction(Routes.SERIES_DETAIL_PATTERN, Routes.HOME, viaLibraryRoot),
+        )
+        assertEquals(
+            TabNavAction.PopToTabRoot(Routes.HOME, saveState = true),
             tabNavAction(
                 currentRoute = Routes.LIBRARY_VIEW_PATTERN,
                 tabRoute = Routes.HOME,
                 stackRoutes = listOf(Routes.HOME, Routes.LIBRARY_VIEW_PATTERN),
             ),
         )
+        assertEquals(
+            TabNavAction.PopToTabRoot(Routes.HOME, saveState = true),
+            tabNavAction(
+                currentRoute = Routes.SETTINGS,
+                tabRoute = Routes.HOME,
+                stackRoutes = listOf(Routes.HOME, Routes.SETTINGS),
+            ),
+        )
     }
 
-    @Test fun `library的子页面点设置或在听都是跨tab切换`() {
+    @Test fun `library的子页面点设置是跨tab切换`() {
         val stack = listOf(Routes.HOME, Routes.LIBRARY, Routes.SERIES_DETAIL_PATTERN)
         assertEquals(
             TabNavAction.SwitchTab(Routes.SETTINGS),

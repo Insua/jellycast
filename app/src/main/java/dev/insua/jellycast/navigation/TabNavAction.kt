@@ -10,36 +10,60 @@ sealed interface TabNavAction {
     data object None : TabNavAction
 
     /**
-     * 当前路由属于这个 tab(是它的子页面)、**且这个 tab 的根确实在返回栈上**:
-     * `popBackStack(route, inclusive = false)` 退回根——保住的是同一个 `NavBackStackEntry`,
-     * ViewModelStore/SaveableStateHolder 都还在。
+     * 目标 tab 的根**确实在返回栈上**,执行 `popBackStack(route, inclusive = false, saveState =
+     * [saveState])` 退回它——保住的是同一个 `NavBackStackEntry`,ViewModelStore/
+     * SaveableStateHolder 都还在。这个动作只在"根真的在栈里"时才会被返回(见 [tabNavAction]
+     * 的判断条件);根不在栈上时 `popBackStack` 会找不到目标、返回 `false`、不改动任何东西,
+     * 点了没反应,和"点自己所在 tab 是 no-op"是同一种症状。
      *
-     * 后一个条件不是多余的:子页面可以不经过 tab 根就被直接推入栈(比如首页「我的媒体」库卡片
-     * 直连 `library/view/{libraryId}`,从未 push 过 `"library"` 本身)。这种情况下
-     * `popBackStack(route, inclusive = false)` 找不到目标,返回 `false`、不改动任何东西——点了
-     * 没反应,和"点自己所在 tab 是 no-op"是同一种症状,只是换了条路径触发。所以这个动作只在
-     * "根真的在栈里"时才会被返回,不能只按路由字符串前缀判断归属。
+     * [saveState] 为 `true` 时是`HOME`专属的一种情形:`HOME` 是起始目的地,永远在栈底,退回它
+     * 的同时要把它之上的一整段(不管属于哪个 tab)存起来,好让离开的那个 tab 以后被重新点开时能
+     * 恢复——这正是"跨 tab 切换"想要的效果,只是执行方式换成了 `popBackStack` 而不是
+     * `navigate()`(原因见 [tabNavAction] 的 KDoc)。为 `false` 时是同一个 tab 内部"退到根,
+     * 丢弃子页面"的情形,子页面不需要被存起来给谁恢复。
      */
-    data class PopToTabRoot(val route: String) : TabNavAction
+    data class PopToTabRoot(val route: String, val saveState: Boolean) : TabNavAction
 
-    /** 跨 tab 切换,或者子页面所属的 tab 根不在栈上:
-     *  `navigate(route){popUpTo(HOME){saveState=true};restoreState=true}`,保留/恢复目标 tab
-     *  自己的浏览状态(根不在栈上时这是一次全新 push,不是"恢复")。 */
+    /**
+     * 跨 tab 切换,或者子页面所属的 tab 根不在栈上:
+     * `navigate(route){popUpTo(HOME){saveState=true};restoreState=true}`。
+     *
+     * 根不在栈上时这是一次**全新 push**——但"全新"只对**这一次触发路径**成立,不是绝对保证:
+     * `restoreState` 按目的地 id 匹配 `backStackMap`,如果 [route] 这个 tab 根在**更早的某次**
+     * 正常访问里被存过(比如先经过 `library` 根逛过、再切走),这次即便当前分支没经过那个根,
+     * `restoreState` 依然会命中那次更早的存档,恢复出**那次**离开时的子页面(可能是详情页,不是
+     * 列表本身)——用户不会卡住(总能看到点内容),但落地页面取决于历史,不一定是列表。
+     *
+     * 这次弹出的旧分支会带着 `saveState=true` 被存进 `backStackMap`:如果它(比如
+     * `library/view/{libraryId}`)本来就没有任何 tab 根挂在栈上,存下的这段自己也没有出口——
+     * `ViewModelStore` 会一直占着,直到整个 `NavController` 连同它一起被销毁(Activity/进程结束)
+     * 为止。范围有限(单个会话内最多囤积三个 tab 各自最近一次这样的分支),不是无界增长,
+     * 但确实是"存了但可能没人来取"。
+     */
     data class SwitchTab(val route: String) : TabNavAction
 }
 
 /**
- * [tabRoute] 的根是否出现在 [stackRoutes] 里,决定子页面点击能不能走 [TabNavAction.PopToTabRoot]。
- * `HOME` 是起始目的地,永远在栈底——`popBackStack("home", inclusive = false)` 的返回值本身
- * 因此对任何路由都是"成功"的,不能拿它当"当前路由是否属于 HOME"的判断依据(那是自我循环:
- * 拿要验证的东西的执行结果去验证它)。改用路由字符串前缀("属于"关系:等于 tab 根,或以
- * `"$tabRoute/"` 为前缀)决定"应不应该退回根",用 [stackRoutes] 决定"根实际在不在、能不能退",
- * 两者都满足才返回 [TabNavAction.PopToTabRoot]。
+ * `tabRoute == Routes.HOME` 时无条件走 [TabNavAction.PopToTabRoot]`(saveState = true)`——`HOME`
+ * 是起始目的地,`inclusive = false` 的 pop 从不把它算在被弹的范围内,所以它永远在栈上,不需要
+ * `navigate()`/`restoreState` 那一套。这不是随手加的特判:round 2/3 都用
+ * `navigate(HOME){popUpTo(HOME){saveState=true};restoreState=true}` 处理"切到在听 tab",
+ * 而**这次真的实测过**(不是从文档推断)——当被弹出的那段直接压在 `HOME` 上面(比如首页「我的
+ * 媒体」库卡片直连的 `library/view/{libraryId}`,中途未经过 `"library"`)时,`restoreState` 对
+ * `HOME` 自己的这次 `navigate()` 会命中刚存下的同一份东西、原样恢复回去——保存和恢复在同一次
+ * 点击里互相抵消,和缺陷 A 是同一种"自我循环"机制,只是发生在 `HOME` 分支上。
+ * `popBackStack(..., saveState = true)` 不经过 `navigate()`/`restoreState`,天然不会有这个问题
+ * ——已经用 `TestNavRoot` 在真实场景上逐条测过(见 `ListScrollRestoreTest`)。
+ *
+ * 其余情形(目标不是 `HOME`)按路由字符串前缀判断"属于"关系(等于 tab 根,或以
+ * `"$tabRoute/"` 为前缀),用 [stackRoutes] 判断"根实际在不在、能不能退"——两者都满足才走
+ * [TabNavAction.PopToTabRoot]`(saveState = false)`(同一个 tab 内部退到根,不需要存)。
  */
 fun tabNavAction(currentRoute: String?, tabRoute: String, stackRoutes: List<String?>): TabNavAction = when {
     currentRoute == tabRoute -> TabNavAction.None
+    tabRoute == Routes.HOME && tabRoute in stackRoutes -> TabNavAction.PopToTabRoot(tabRoute, saveState = true)
     currentRoute != null && currentRoute.startsWith("$tabRoute/") && tabRoute in stackRoutes ->
-        TabNavAction.PopToTabRoot(tabRoute)
+        TabNavAction.PopToTabRoot(tabRoute, saveState = false)
     else -> TabNavAction.SwitchTab(tabRoute)
 }
 

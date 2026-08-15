@@ -276,7 +276,8 @@ private fun BottomNavBar(currentRoute: String?, navController: NavHostController
                     val stackRoutes = navController.currentBackStack.value.map { it.destination.route }
                     when (val action = tabNavAction(currentRoute, tab.route, stackRoutes)) {
                         TabNavAction.None -> Unit
-                        is TabNavAction.PopToTabRoot -> navController.popBackStack(action.route, inclusive = false)
+                        is TabNavAction.PopToTabRoot ->
+                            navController.popBackStack(action.route, inclusive = false, saveState = action.saveState)
                         is TabNavAction.SwitchTab -> navController.navigate(action.route) {
                             popUpTo(Routes.HOME) { saveState = true }
                             launchSingleTop = true

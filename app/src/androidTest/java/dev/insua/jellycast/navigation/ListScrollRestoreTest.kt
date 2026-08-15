@@ -151,12 +151,13 @@ class ListScrollRestoreTest {
      * 「媒体库」→ `firstVisibleItemIndex=0`,`ViewModelStore` 被清空,列表从第一页重新拉取。
      *
      * 修好之后(`tabNavAction` 按路由前缀判断归属,`HOME` 没有任何 `"home/"` 前缀的子路由):
-     * 从库详情页点「在听」落在 [TabNavAction.SwitchTab] 分支,带 `saveState=true`,「媒体库」的
-     * 状态被保留。切回「媒体库」时,`restoreState` 恢复的是离开时那一整段(`library` +
-     * `library/series/{id}`),**先落在详情页**——这是正常的跨 tab 切换语义(复审明确认可:
-     * "Landing first on the detail screen they were on, with the grid beneath it intact,
-     * satisfies this — that is normal tab behaviour"),退一步才看得到列表本身,验证滚动位置
-     * 没丢。
+     * 从库详情页点「在听」落在 [TabNavAction.PopToTabRoot]`(HOME, saveState=true)` 分支
+     * (Fix round 4 起——原因见 `TabNavAction.kt` 的 KDoc,不再经过 `navigate()`/
+     * `restoreState`),「媒体库」的状态被保留。切回「媒体库」时,`restoreState` 恢复的是离开时
+     * 那一整段(`library` + `library/series/{id}`),**先落在详情页**——这是正常的跨 tab 切换
+     * 语义(复审明确认可:"Landing first on the detail screen they were on, with the grid
+     * beneath it intact, satisfies this — that is normal tab behaviour"),退一步才看得到列表
+     * 本身,验证滚动位置没丢。
      */
     @Test
     fun 从库详情页切到别的tab再切回媒体库时状态不丢() {
@@ -305,6 +306,85 @@ class ListScrollRestoreTest {
             "从首页直连按库浏览页再打开一集后点『媒体库』tab,应当到达媒体库列表" +
                 "(firstVisibleItemIndex >= 0),实际 firstVisibleItemIndex=$after。"
         }
+    }
+
+    /**
+     * **Fix round 4 —— 复审在真实路由表上量出的新 Critical(缺陷 A 同一家族,发生在「在听」
+     * 分支上)。**
+     *
+     * `home → library/view/lib1`(首页「我的媒体」库卡片直连,中途不经过 `"library"`)点「在听」:
+     * `tabNavAction` 在 Fix round 3 里对 `HOME` 走的是 [TabNavAction.SwitchTab],执行方
+     * `navigate(HOME){popUpTo(HOME){saveState=true};restoreState=true}`——`popUpTo` 的锚点和
+     * `navigate` 的目的地都是 `HOME` 自己,被弹出的 `library/view/lib1` 存下去之后,同一次调用的
+     * `restoreState` 立刻把它原样恢复回来:保存和恢复在同一次点击里互相抵消。复审实测:点击前后
+     * `stack` 逐字节不变,连 entry id 都没变——**点了没反应**,是缺陷 A 的原症状在「在听」分支上
+     * 重新出现。
+     *
+     * 修好之后(`tabNavAction` 对 `HOME` 无条件走 [TabNavAction.PopToTabRoot]`(saveState =
+     * true)`,执行方改用 `popBackStack(HOME, inclusive=false, saveState=true)`,不经过
+     * `navigate()`/`restoreState`):同样的点击应当正确落地在首页。
+     */
+    @Test
+    fun 从首页直接进按库浏览页点在听时能到达首页() {
+        var lastBackstack: List<BackStackEntrySnapshot> = emptyList()
+        composeTestRule.setContent {
+            TestNavRoot(onBackstackChanged = { lastBackstack = it })
+        }
+
+        composeTestRule.onNodeWithTag(HOME_OPEN_LIBRARY_VIEW_TAG).performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag(LIBRARY_VIEW_TAG).assertExists()
+        val beforeClick = lastBackstack
+        Log.i(TAG, "[库卡片直连→在听tab] 点击前 backstack=$beforeClick")
+
+        composeTestRule.onNodeWithTag(BOTTOM_NAV_HOME_TAG).performClick()
+        composeTestRule.waitForIdle()
+        val afterClick = lastBackstack
+        Log.i(TAG, "[库卡片直连→在听tab] 点击后 backstack=$afterClick")
+
+        assert(afterClick != beforeClick) {
+            "点『在听』应当有实际效果(返回栈应当变化),实际点击前后 backstack 完全相同:" +
+                "$beforeClick —— 说明保存和恢复在同一次点击里互相抵消了(缺陷 A 同一家族)。"
+        }
+        composeTestRule.onNodeWithTag(HOME_TAG).assertExists()
+        composeTestRule.onNodeWithTag(LIBRARY_VIEW_TAG).assertDoesNotExist()
+    }
+
+    /**
+     * **Fix round 4 —— 复审点名的三步序列,验证不是"单次点击凑巧躲过",而是这条路径本身正确。**
+     *
+     * `home → library/view/lib1 → 媒体库 → 在听`:第二步(点『媒体库』)本身是 Fix round 3
+     * 修好的场景(`library` 不在栈上,`SwitchTab` 全新 push,落地在列表),第三步在 Fix round 3
+     * 的代码上会"传送回 library/view"(复审原话)——因为那时「在听」仍然走 `SwitchTab`,
+     * `restoreState` 命中的是**这次**（`媒体库` 那步）弹出并存下的 `library/view/lib1`,不是
+     * `library` 列表。修好之后,「在听」不再经过 `restoreState`,这一步应该正确落地在首页,
+     * 首页此后应当能通过 tab 栏重新到达(不是"这个会话里再也回不去了")。
+     */
+    @Test
+    fun 库卡片直连再切到媒体库再点在听时能到达首页() {
+        composeTestRule.setContent { TestNavRoot() }
+
+        composeTestRule.onNodeWithTag(HOME_OPEN_LIBRARY_VIEW_TAG).performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag(LIBRARY_VIEW_TAG).assertExists()
+
+        composeTestRule.onNodeWithTag(BOTTOM_NAV_TAG).performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.waitForLibraryContentSettled()
+        composeTestRule.onNodeWithTag(LIBRARY_VIEW_TAG).assertDoesNotExist()
+
+        composeTestRule.onNodeWithTag(BOTTOM_NAV_HOME_TAG).performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag(HOME_TAG).assertExists()
+        composeTestRule.onNodeWithTag(LIBRARY_VIEW_TAG).assertDoesNotExist()
+
+        // 首页此后仍然可以通过 tab 栏正常到达——不是"这个会话里在听 tab 从此失灵"。
+        composeTestRule.onNodeWithTag(BOTTOM_NAV_TAG).performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.waitForLibraryContentSettled()
+        composeTestRule.onNodeWithTag(BOTTOM_NAV_HOME_TAG).performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag(HOME_TAG).assertExists()
     }
 
     /**
@@ -589,8 +669,11 @@ internal fun TestNavRoot(onBackstackChanged: (List<BackStackEntrySnapshot>) -> U
                                     navController.currentBackStack.value.map { it.destination.route }
                                 when (val action = tabNavAction(currentRoute, route, stackRoutes)) {
                                     TabNavAction.None -> Unit
-                                    is TabNavAction.PopToTabRoot ->
-                                        navController.popBackStack(action.route, inclusive = false)
+                                    is TabNavAction.PopToTabRoot -> navController.popBackStack(
+                                        action.route,
+                                        inclusive = false,
+                                        saveState = action.saveState,
+                                    )
                                     is TabNavAction.SwitchTab -> navController.navigate(action.route) {
                                         popUpTo(Routes.HOME) { saveState = true }
                                         launchSingleTop = true
