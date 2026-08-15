@@ -225,24 +225,36 @@ class HighBitrateSourceE2eTest {
      * 动态挑一个 MPEG-TS 容器的剧集。**不写死任何条目 id / 剧名**——见类 KDoc。
      *
      * 挑不到就让测试失败,不是跳过:见类 KDoc「挑片源」一节。
+     *
+     * `limit` 起初照抄 `PlaybackE2eTest.pickPlayableItems` 的 50——`PlaybackInfo` 虽然是纯元数据
+     * 往返、不起转码,但在 J4125 上仍然是真实的 HTTP 请求量,`setUp()` 没有理由比既有先例多扫
+     * 4 倍。**实测证明 50 不够**:这台服务器按 `SortName` 排到第一个 MPEG-TS 容器的剧集是第
+     * 56 个,`limit=50` 会在扫完全部 50 个候选后一无所获、测试直接失败(真实复现过,见
+     * task-4-report.md 的「Fix round 1」一节)。改成 [CANDIDATE_SCAN_LIMIT] = 100——刚好在
+     * 实测命中位置(56)之上留出安全边际,而不是像最初那样直接搬 200。走到匹配为止实际扫了
+     * 多少个候选,打进日志(不含条目 id)。
      */
     private suspend fun pickMpegTsEpisode(userId: String): PickedEpisode {
-        val episodes = runCatching { api.items(userId = userId, types = "Episode", limit = 200).items }
+        val episodes = runCatching { api.items(userId = userId, types = "Episode", limit = CANDIDATE_SCAN_LIMIT).items }
             .getOrElse { emptyList() }
             .mapNotNull { it.toMediaItem() }
         if (episodes.isEmpty()) {
             throw AssertionError("服务器上找不到任何 Episode 条目,无法验证高码率片源回归。")
         }
-        for (candidate in episodes) {
-            val info = runCatching { api.playbackInfo(candidate.id, userId) }.getOrNull() ?: continue
-            val ms = info.mediaSources.firstOrNull() ?: continue
+        episodes.forEachIndexed { index, candidate ->
+            val info = runCatching { api.playbackInfo(candidate.id, userId) }.getOrNull() ?: return@forEachIndexed
+            val ms = info.mediaSources.firstOrNull() ?: return@forEachIndexed
             val container = ms.container
             if (container?.contains("ts", ignoreCase = true) == true) {
                 val codec = ms.mediaStreams.firstOrNull { it.type == "Video" }?.codec
+                Log.i(TAG, "挑片源:扫了 ${index + 1}/${episodes.size} 个候选(limit=$CANDIDATE_SCAN_LIMIT)命中 MPEG-TS 容器")
                 return PickedEpisode(candidate, container, codec)
             }
         }
-        throw AssertionError("服务器上找不到 MPEG-TS 容器的剧集,无法验证高码率片源回归。")
+        throw AssertionError(
+            "服务器上找不到 MPEG-TS 容器的剧集,无法验证高码率片源回归" +
+                "(扫了 ${episodes.size} 个候选,limit=$CANDIDATE_SCAN_LIMIT)。",
+        )
     }
 
     /**
@@ -298,6 +310,9 @@ class HighBitrateSourceE2eTest {
     private companion object {
         const val TAG = "HighBitrateSourceE2e"
         const val E2E_SERVER_ID = "e2e-server"
+
+        /** 候选扫描上限,和 `PlaybackE2eTest.pickPlayableItems` 一致——见 [pickMpegTsEpisode] 的 KDoc。 */
+        const val CANDIDATE_SCAN_LIMIT = 100
 
         /** 拿到第一条流并出声的宽限。4K `.ts` 片源实测响应头要 6–46s,留足余量。 */
         const val STARTUP_TIMEOUT_MS = 90_000L
