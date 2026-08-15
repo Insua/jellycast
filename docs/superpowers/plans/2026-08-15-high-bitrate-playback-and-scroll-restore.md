@@ -779,18 +779,185 @@ git commit -m "✅ (navigation): add failing test reproducing list scroll reset 
 
 ---
 
-## Task 6: 列表滚动位置 —— 修复
+## Task 6: 修复两个导航缺陷
 
-**⚠️ 这个任务的内容由编排者在 Task 5 交付之后补全。**
+**本任务由编排者在 Task 5 交付之后补全(2026-08-15)。** 下面每一条都由 Task 5 的实测与复审的独立探针**观测**支撑,不是推断。
 
-理由:设计文档 §7.4 明确要求"拿到红色测试与真实机制之后再定修法,不允许照着猜测直接改代码"。在这里先写一份具体修法,就是把猜测伪装成计划 —— 本仓库已经因为"计划里写错的一条指令"返过一次工(音频缓存 Task 4)。
+**Files:**
+- Modify: `app/src/main/java/dev/insua/jellycast/navigation/JellyCastNavHost.kt`(`BottomNavBar` 的 `onClick`,约 264-271 行;`returnToHome` 的 `LaunchedEffect`,约 105-108 行)
+- Modify: `app/src/androidTest/java/dev/insua/jellycast/navigation/ListScrollRestoreTest.kt`(缺陷 A 的用例语义要翻转,见 Step 5)
 
-**已经定下、Task 5 的结论不会改变的约束:**
+**Interfaces:** 无新增公开 API。
 
-- 修法方向是**让列表在返回时不为空**(保住数据),不是"把滚动索引再存一份"。后者是绕过症状:数据还没回来时把索引强行设回去,只会滚到一个尚未加载的位置。
-- 范围:媒体库(剧集/电影/合集三个 Tab 各自独立的滚动位置)、按库浏览、合集详情、剧集详情。**搜索结果不算** —— 搜索结果本来就不缓存(见 `LibraryViewModel` 类 KDoc)。
-- Task 5 那两条用例必须由红转绿,且要做变异验证。
-- 既有的 `LibraryScreenTest` / `LibraryContentsScreenTest` / `LibraryPullToRefreshTest` / `LibraryViewModelTest` 必须保持绿。
+### 已证实的两个缺陷
+
+**缺陷 A —— 在本 tab 的子页面上点该 tab,`navigate` 自我抵消,什么都不会发生。**
+
+`BottomNavBar` 用的是:
+
+```kotlin
+navController.navigate(tab.route) {
+    popUpTo(Routes.HOME) { saveState = true }
+    launchSingleTop = true
+    restoreState = true
+}
+```
+
+Navigation-Compose 2.9.8 里 `navigate` **先**执行 `popBackStackInternal(saveState = true)`,把弹出的那段栈按**最深被弹出的目的地**为键存起来 —— 而在这个扁平图里,那个键正是 `library` 自己;**然后**才检查 `restoreState && backStackMap.containsKey(node.id)`,此时已经命中。于是它把刚存下去的东西原样恢复回来。
+
+实测(复审用真实路由表跑的探针):详情页上栈是
+`[home, library#6df7, library/series/{id}#a520]`,点「媒体库」之后**逐字节相同,entry id 都没变**。
+
+用户看到的就是"点了没反应"。
+
+**缺陷 B —— `returnToHome` 直接销毁媒体库页面。**
+
+```kotlin
+navController.navigate(Routes.HOME) {
+    popUpTo(Routes.HOME) { inclusive = true }   // ← 没有 saveState
+    launchSingleTop = true
+}
+```
+
+播放序列结束后触发,把 `library` 及其子页面**整个销毁** —— `ViewModelStore` 被清空(logcat 观测到 `FakeLibraryViewModel#1 cleared` 正好发生在这次跳转上),`SaveableStateHolder` 的槽位一并消失。下一次进「媒体库」是一次全新 push,列表从第一页重新拉,滚动位置自然在顶部。
+
+**这就是用户报的"回到顶部"的可复现真因。**
+
+### 🔴 不要照着修的那个机制
+
+Task 5 的第 0 轮和设计文档 §7.3 都猜测是「恢复出来的滚动索引在首次测量时被夹到 0」。
+**任何地方都没有观测到这个现象。** 缺陷 B 复现出来的是"一个从未滚动过的全新列表",不是"恢复了 40 又被夹成 0"。
+不要去写"数据到货后把索引再设回去"这类补偿逻辑 —— 那是为一个没有证据的机制打补丁。
+**修的是条目与状态的存活,不是索引的恢复。**
+
+### Steps
+
+- [ ] **Step 1: 读代码,确认现状**
+
+打开 `app/src/main/java/dev/insua/jellycast/navigation/JellyCastNavHost.kt`,读 `BottomNavBar`(约 258-278 行)、`returnToHome` 的 `LaunchedEffect`(约 100-110 行)、`BOTTOM_TABS`、`Routes`。
+再读 `app/src/androidTest/java/dev/insua/jellycast/navigation/ListScrollRestoreTest.kt` —— 它现在有三条用例,其中
+`播放序列结束返回首页后再次进入媒体库滚动位置丢失` 是**红**的,
+`从详情页点回自己所在tab时navigate是no_op_已确认缺陷` 是**绿**的(它断言缺陷存在)。
+
+- [ ] **Step 2: 跑一遍,确认红绿分布和上面写的一致**
+
+```bash
+./gradlew :app:connectedDebugAndroidTest \
+  -Pandroid.testInstrumentationRunnerArguments.class=dev.insua.jellycast.navigation.ListScrollRestoreTest
+```
+
+预期:3 条里 1 条失败(`firstVisibleItemIndex=0`)。**把真实输出记下来。**
+
+- [ ] **Step 3: 修缺陷 A**
+
+`BottomNavBar` 的 `onClick` 改成:
+
+```kotlin
+onClick = {
+    when {
+        // 已经站在这个 tab 的根上:什么都不做。
+        currentRoute == tab.route -> Unit
+
+        // 已经在这个 tab 的子页面里(该 tab 的根还在返回栈上):退回它的根。
+        //
+        // 🔴 这里**不能**走下面那条 navigate 分支。Navigation-Compose 2.9.8 的 navigate 先做
+        // popBackStackInternal(saveState = true),把弹出的那段按「最深被弹出的目的地」为键存起来
+        // —— 在这个扁平图里那个键就是 tab 自己 —— 然后 restoreState 又把它原样恢复回来,
+        // 净效果是零。实测:详情页上点「媒体库」,返回栈逐字节不变,entry id 都没变。
+        //
+        // popBackStack 保住的是**同一个** NavBackStackEntry,因此 ViewModelStore 和
+        // SaveableStateHolder 槽位都还在,滚动位置随之保住 —— 这正是我们要的。
+        // 目的地不在栈上时它返回 false 且**不改动栈**,所以可以安全地当条件用。
+        navController.popBackStack(tab.route, inclusive = false) -> Unit
+
+        // 真正的跨 tab 切换:保留原有的 save/restore 语义(切走再切回来,回到你离开时的位置)。
+        else -> navController.navigate(tab.route) {
+            popUpTo(Routes.HOME) { saveState = true }
+            launchSingleTop = true
+            restoreState = true
+        }
+    }
+}
+```
+
+外层原有的 `if (currentRoute != tab.route)` 判断由 `when` 的第一条分支取代,**删掉它**,不要两层都留。
+
+- [ ] **Step 4: 修缺陷 B**
+
+`returnToHome` 的 `navigate` 改成:
+
+```kotlin
+navController.navigate(Routes.HOME) {
+    // saveState:播放序列结束回首页,不该把用户在「媒体库」里的浏览位置一并销毁。
+    // 少了它,library 条目连同它的 ViewModelStore / SaveableStateHolder 槽位被整个销毁,
+    // 下次进媒体库是一次全新 push,列表从第一页重拉、滚动回到顶部(实测)。
+    // inclusive 保留:首页自己仍然要重置。
+    popUpTo(Routes.HOME) { inclusive = true; saveState = true }
+    launchSingleTop = true
+    restoreState = true
+}
+```
+
+⚠️ `inclusive = true` + `saveState = true` 会把 **HOME 自己**也存进 `backStackMap`,再配上 `restoreState = true`,
+**有可能**把首页也恢复成离开前的样子,而不是重置。**这一点必须实测验证**:
+如果实测发现首页被恢复而不是重置(与现有行为不符),改用不带 `inclusive` 的写法:
+
+```kotlin
+    popUpTo(Routes.HOME) { saveState = true }
+    launchSingleTop = true
+    restoreState = true
+```
+
+两种写法都要跑一遍,选实测正确的那个,并在报告里写清楚你选了哪个、依据是什么实测。
+**不要凭 API 文档推断,要看 logcat 里的返回栈。**
+
+- [ ] **Step 5: 翻转缺陷 A 那条用例的语义**
+
+`从详情页点回自己所在tab时navigate是no_op_已确认缺陷` 现在断言的是"缺陷存在"。缺陷修好之后它必然失败。
+把它改写成断言**正确行为**:从详情页点该 tab,返回栈应当**回到该 tab 的根**(详情页被弹出),
+并且该 tab 的 `NavBackStackEntry` **id 不变**(证明保住的是同一个条目,而不是重新 push 了一个)。
+用例名也要跟着改,不要留着 `已确认缺陷` 这种和现状对不上的名字。
+
+entry id 的取法沿用该文件里已有的 `onBackstackChanged` 观测钩子,不要新造一套。
+
+- [ ] **Step 6: 跑测试,确认全绿**
+
+```bash
+./gradlew :app:connectedDebugAndroidTest \
+  -Pandroid.testInstrumentationRunnerArguments.class=dev.insua.jellycast.navigation.ListScrollRestoreTest
+```
+
+预期:3 条全 PASS。
+
+- [ ] **Step 7: 变异验证(两条都要做)**
+
+1. 把 Step 3 的 `popBackStack` 分支删掉(退回单一 navigate)→ 重跑 → Step 5 那条改写后的用例必须 **FAIL**。
+2. 把 Step 4 加的 `saveState = true` 删掉 → 重跑 → `播放序列结束返回首页后再次进入媒体库滚动位置丢失` 必须 **FAIL**。
+
+两处都改回,重跑确认全绿。**逐条贴真实输出。**
+
+- [ ] **Step 8: 跑 `:app` 全部设备测试,确认没打破既有导航行为**
+
+```bash
+./gradlew :app:connectedDebugAndroidTest
+```
+
+这一步会把端到端也跑上(需要 `testing.properties`,已配好)。既有的
+`SystemBarsAppearanceTest` 与 `e2e/` 下各条必须保持绿。**任何一条变红都必须查清楚,不许当成 flaky 放过。**
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add app/src/main/java/dev/insua/jellycast/navigation/JellyCastNavHost.kt \
+        app/src/androidTest/java/dev/insua/jellycast/navigation/ListScrollRestoreTest.kt
+git commit -m "🐛 (navigation): keep tab state alive so returning to a list preserves scroll position"
+```
+
+### 范围说明
+
+- 本任务修的是**导航层的条目存活**,四个列表页(媒体库三个 Tab、按库浏览、合集详情、剧集详情)都因此受益 —— 它们的滚动状态本来就是 `rememberSaveable` 支撑的,只要条目活着就能恢复。
+- **搜索结果不在范围内**:搜索结果本来就不缓存(见 `LibraryViewModel` 类 KDoc)。
+- 既有的 `LibraryScreenTest` / `LibraryContentsScreenTest` / `LibraryPullToRefreshTest` / `LibraryViewModelTest` 必须保持绿(它们不碰导航,不该受影响 —— 若受影响,说明改动溢出了)。
 
 ---
 
